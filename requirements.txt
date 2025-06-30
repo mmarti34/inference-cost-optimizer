@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-supabase
+supabase-py
 openai
 anthropic
 mistralai
