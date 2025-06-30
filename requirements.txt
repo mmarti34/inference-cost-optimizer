@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+supabase
+openai
+anthropic
+mistralai
+cohere
+google-generativeai
+python-dotenv
+pydantic
+cryptography
