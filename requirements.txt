@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-supabase-py
+supabase
 openai
 anthropic
 mistralai
@@ -9,3 +9,4 @@ google-generativeai
 python-dotenv
 pydantic
 cryptography
+pycryptodome
