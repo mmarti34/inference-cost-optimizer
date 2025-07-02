@@ -259,9 +259,27 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
         print("Prompt template not found")
         raise HTTPException(status_code=404, detail="Prompt template not found.")
     prompt_template = prompt_result.data
-    if prompt_template["user_id"] != user_id:
-        print("User does not have access to this prompt")
-        raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
+    # Allow if user is the prompt owner
+    if prompt_template["user_id"] == user_id:
+        pass  # allow
+    else:
+        # Check if both user and prompt are in the same org
+        prompt_org_id = prompt_template.get("org_id")
+        if not prompt_org_id:
+            print("Prompt has no org_id, access denied")
+            raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
+
+        # Check if user is a member of the org
+        org_member_result = supabase.table("organization_members") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .eq("org_id", prompt_org_id) \
+            .eq("status", "active") \
+            .execute()
+        if not org_member_result.data:
+            print("User is not a member of the prompt's org, access denied")
+            raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
+        # else: allow
 
     # 4. Prepare prompt
     prompt_text = prompt_template["prompt"].replace("{input}", user_input) if prompt_template["prompt"] else user_input
