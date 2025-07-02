@@ -38,6 +38,7 @@ class APIKeyPayload(BaseModel):
 
 class PromptPayload(BaseModel):
     user_id: str
+    org_id: str
     provider: str
     model: str
     prompt: str
@@ -290,6 +291,7 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
     # 5. Call the correct LLM router
     payload_obj = PromptPayload(
         user_id=user_id,
+        org_id=prompt_template["org_id"],
         provider=provider,
         model=model,
         prompt=prompt_text

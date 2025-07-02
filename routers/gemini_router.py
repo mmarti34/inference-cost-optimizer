@@ -9,23 +9,37 @@ router = APIRouter()
 
 class PromptPayload(BaseModel):
     user_id: str
+    org_id: str
     provider: str
     model: str
     prompt: str
 
 def handle_prompt(payload: PromptPayload):
-    # 1. Look up API key from Supabase
+    print(f"[Gemini Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}, org_id={payload.org_id}")
+    # First, try to find a key for this user
     result = supabase.table("api_keys") \
         .select("*") \
         .eq("user_id", payload.user_id) \
         .eq("provider", payload.provider) \
         .execute()
 
-    if not result.data:
-        raise HTTPException(status_code=404, detail="API key not found.")
+    keys = result.data
+    if not keys and getattr(payload, "org_id", None):
+        # If not found, try to find a key for the same org
+        org_result = supabase.table("api_keys") \
+            .select("*") \
+            .eq("org_id", payload.org_id) \
+            .eq("provider", payload.provider) \
+            .execute()
+        keys = org_result.data
+
+    print(f"[Gemini Router] API key query result: {keys}")
+    if not keys:
+        print("[Gemini Router] No API key found for user/provider/org.")
+        raise HTTPException(status_code=404, detail="API key not found for user/provider/org.")
 
     # 2. Configure Gemini client
-    genai.configure(api_key=result.data[0]["api_key"])
+    genai.configure(api_key=keys[0]["api_key"])
     model = genai.GenerativeModel(payload.model)
 
     try:
