@@ -8,6 +8,32 @@ from utils.pricing import get_pricing, suggest_model
 
 from routers import openai_router, anthropic_router, mistral_router, cohere_router, gemini_router
 
+# Model definitions
+class APIKeyPayload(BaseModel):
+    user_id: str
+    provider: str
+    api_key: str
+
+class PromptPayload(BaseModel):
+    user_id: str
+    org_id: str
+    provider: str
+    model: str
+    prompt: str
+    project_id: str
+
+class OptimizePayload(BaseModel):
+    prompt_id: str
+    estimated_input_tokens: int
+    estimated_output_tokens: int
+    project_id: str
+    org_id: str
+    user_id: str
+
+class DeleteKeyPayload(BaseModel):
+    user_id: str
+    provider: str
+
 app = FastAPI()
 
 # CORS setup
@@ -176,31 +202,6 @@ Return your recommendation as a JSON object with the following structure:
     except Exception as e:
         print(f"Error in optimize endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
-
-class APIKeyPayload(BaseModel):
-    user_id: str
-    provider: str
-    api_key: str
-
-class PromptPayload(BaseModel):
-    user_id: str
-    org_id: str
-    provider: str
-    model: str
-    prompt: str
-    project_id: str
-
-class OptimizePayload(BaseModel):
-    prompt_id: str
-    estimated_input_tokens: int
-    estimated_output_tokens: int
-    project_id: str
-    org_id: str
-    user_id: str
-
-class DeleteKeyPayload(BaseModel):
-    user_id: str
-    provider: str
 
 @app.get("/get-keys/{user_id}")
 def get_keys(user_id: str):
