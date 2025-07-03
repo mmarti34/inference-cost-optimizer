@@ -11,14 +11,14 @@ router = APIRouter()
 
 class PromptPayload(BaseModel):
     user_id: str
-    org_id: str
     provider: str
     model: str
     prompt: str
+    org_id: str
+    project_id: str
 
 def handle_prompt(payload: PromptPayload):
-    print(f"[OpenAI Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}, org_id={payload.org_id}")
-    # First, try to find a key for this user
+    print(f"[OpenAI Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}")
     result = supabase.table("api_keys") \
         .select("*") \
         .eq("user_id", payload.user_id) \
@@ -26,19 +26,10 @@ def handle_prompt(payload: PromptPayload):
         .execute()
 
     keys = result.data
-    if not keys and getattr(payload, "org_id", None):
-        # If not found, try to find a key for the same org
-        org_result = supabase.table("api_keys") \
-            .select("*") \
-            .eq("org_id", payload.org_id) \
-            .eq("provider", payload.provider) \
-            .execute()
-        keys = org_result.data
-
     print(f"[OpenAI Router] API key query result: {keys}")
     if not keys:
-        print("[OpenAI Router] No API key found for user/provider/org.")
-        raise HTTPException(status_code=404, detail="API key not found for user/provider/org.")
+        print("[OpenAI Router] No API key found for user/provider.")
+        raise HTTPException(status_code=404, detail="API key not found for user/provider.")
 
     # Decrypt the API key
     try:
@@ -82,7 +73,9 @@ def handle_prompt(payload: PromptPayload):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd
+            cost_usd=cost_usd,
+            project_id=getattr(payload, 'project_id', None),
+            org_id=payload.org_id
         )
 
         return {

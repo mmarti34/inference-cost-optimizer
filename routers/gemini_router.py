@@ -13,6 +13,7 @@ class PromptPayload(BaseModel):
     provider: str
     model: str
     prompt: str
+    project_id: str
 
 def handle_prompt(payload: PromptPayload):
     print(f"[Gemini Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}, org_id={payload.org_id}")
@@ -66,7 +67,9 @@ def handle_prompt(payload: PromptPayload):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd
+            cost_usd=cost_usd,
+            project_id=payload.project_id,
+            org_id=payload.org_id
         )
 
         return {

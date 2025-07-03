@@ -31,6 +31,152 @@ app.include_router(gemini_router.router, prefix="/gemini")
 def health_check():
     return {"status": "healthy", "message": "API is running"}
 
+@app.post("/optimize")
+def optimize_prompt(payload: OptimizePayload):
+    """
+    Optimize prompt by analyzing recent usage and budget constraints
+    """
+    try:
+        # 1. Get the two most recent prompts for this prompt_id
+        prompt_result = supabase.table("prompt_templates") \
+            .select("*") \
+            .eq("id", payload.prompt_id) \
+            .order("created_at", desc=True) \
+            .limit(2) \
+            .execute()
+        
+        if not prompt_result.data:
+            raise HTTPException(status_code=404, detail="Prompt template not found.")
+        
+        prompts = prompt_result.data
+        
+        # 2. Check if the most recent prompt differs from the previous one
+        if len(prompts) >= 2:
+            latest_prompt = prompts[0]["prompt"]
+            previous_prompt = prompts[1]["prompt"]
+            
+            if latest_prompt == previous_prompt:
+                return {
+                    "status": "unchanged",
+                    "message": "Prompt has not changed. Skipping optimizer call."
+                }
+        
+        # 3. Fetch the project's monthly_budget_usd
+        project_result = supabase.table("projects") \
+            .select("monthly_budget") \
+            .eq("id", payload.project_id) \
+            .single() \
+            .execute()
+        
+        if not project_result.data:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        
+        monthly_budget_usd = project_result.data.get("monthly_budget", 0.0)
+        
+        # 4. Calculate how much budget the project has used so far this month
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        usage_result = supabase.table("usage_logs") \
+            .select("cost_usd") \
+            .eq("project_id", payload.project_id) \
+            .gte("created_at", start_of_month.isoformat()) \
+            .execute()
+        
+        budget_used_usd = sum(log.get("cost_usd", 0) for log in usage_result.data or [])
+        
+        # 5. Get the current prompt text
+        current_prompt = prompts[0]["prompt"]
+        
+        # 6. Call OpenAI for optimization recommendation
+        import os
+        from openai import OpenAI
+        
+        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        system_prompt = f"""
+You are an AI cost optimization expert. Analyze the following prompt and provide a recommendation for the best provider/model combination that balances cost, latency, and quality while staying within budget constraints.
+
+CURRENT PROMPT:
+{current_prompt}
+
+ESTIMATED TOKENS:
+- Input tokens: {payload.estimated_input_tokens}
+- Output tokens: {payload.estimated_output_tokens}
+
+BUDGET INFORMATION:
+- Monthly budget: ${monthly_budget_usd}
+- Budget used this month: ${budget_used_usd}
+- Budget remaining: ${monthly_budget_usd - budget_used_usd}
+
+AVAILABLE PROVIDERS AND MODELS:
+- OpenAI: gpt-4, gpt-3.5-turbo, gpt-4-turbo
+- Anthropic: claude-3-opus-20240229, claude-3-sonnet-20240229, claude-3-haiku-20240307
+- Mistral: mistral-large-latest, mistral-medium-latest, mistral-small-latest
+- Cohere: command, command-light
+- Gemini: gemini-pro, gemini-flash
+
+Consider the following factors:
+1. Cost efficiency (tokens per dollar)
+2. Quality requirements for the task
+3. Latency requirements
+4. Budget constraints
+5. Model capabilities for the specific prompt type
+
+Return your recommendation as a JSON object with the following structure:
+{{
+  "recommended_provider": "provider_name",
+  "recommended_model": "model_name", 
+  "estimated_cost_usd": 0.00,
+  "reasoning": "detailed explanation of your recommendation"
+}}
+"""
+        
+        completion = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Please provide a cost optimization recommendation for this prompt."}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        recommendation = completion.choices[0].message.content
+        import json
+        if recommendation:
+            recommendation_data = json.loads(recommendation)
+        else:
+            raise HTTPException(status_code=500, detail="Failed to get recommendation from OpenAI")
+        
+        # 7. Insert recommendation into optimizer_recommendations table
+        recommendation_record = {
+            "prompt_id": payload.prompt_id,
+            "project_id": payload.project_id,
+            "org_id": payload.org_id,
+            "user_id": payload.user_id,
+            "recommended_provider": recommendation_data["recommended_provider"],
+            "recommended_model": recommendation_data["recommended_model"],
+            "estimated_cost_usd": recommendation_data["estimated_cost_usd"],
+            "estimated_input_tokens": payload.estimated_input_tokens,
+            "estimated_output_tokens": payload.estimated_output_tokens,
+            "full_prompt_text": current_prompt,
+            "budget_used_usd": budget_used_usd,
+            "monthly_budget_usd": monthly_budget_usd,
+            "reasoning": recommendation_data["reasoning"]
+        }
+        
+        supabase.table("optimizer_recommendations").insert(recommendation_record).execute()
+        
+        return {
+            "status": "success",
+            "recommendation": recommendation_data
+        }
+        
+    except Exception as e:
+        print(f"Error in optimize endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
+
 class APIKeyPayload(BaseModel):
     user_id: str
     provider: str
@@ -42,6 +188,15 @@ class PromptPayload(BaseModel):
     provider: str
     model: str
     prompt: str
+    project_id: str
+
+class OptimizePayload(BaseModel):
+    prompt_id: str
+    estimated_input_tokens: int
+    estimated_output_tokens: int
+    project_id: str
+    org_id: str
+    user_id: str
 
 class DeleteKeyPayload(BaseModel):
     user_id: str
@@ -294,7 +449,8 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
         org_id=prompt_template["org_id"],
         provider=provider,
         model=model,
-        prompt=prompt_text
+        prompt=prompt_text,
+        project_id=prompt_template.get("project_id")
     )
     print("Calling LLM router with:", payload_obj)
     try:
