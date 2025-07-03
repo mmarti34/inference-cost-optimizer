@@ -17,33 +17,19 @@ class PromptPayload(BaseModel):
     prompt_id: str
 
 def handle_prompt(payload: PromptPayload):
-    print(f"[Cohere Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}, org_id={payload.org_id}")
-    
-    # First, try to get user-specific API key
+    print(f"[Cohere Router] Looking up API key for org_id={payload.org_id}, provider={payload.provider}")
     result = supabase.table("api_keys") \
         .select("*") \
-        .eq("user_id", payload.user_id) \
+        .eq("org_id", payload.org_id) \
         .eq("provider", payload.provider) \
         .execute()
 
     keys = result.data
-    print(f"[Cohere Router] User API key query result: {keys}")
-    
-    # If no user-specific key, try organization-level key
-    if not keys and payload.org_id:
-        print(f"[Cohere Router] No user API key found, checking org_id={payload.org_id}")
-        result = supabase.table("api_keys") \
-            .select("*") \
-            .eq("org_id", payload.org_id) \
-            .eq("provider", payload.provider) \
-            .execute()
-        
-        keys = result.data
-        print(f"[Cohere Router] Org API key query result: {keys}")
+    print(f"[Cohere Router] Org API key query result: {keys}")
     
     if not keys:
-        print("[Cohere Router] No API key found for user/provider or org/provider.")
-        raise HTTPException(status_code=404, detail="API key not found for user/provider.")
+        print("[Cohere Router] No API key found for org/provider.")
+        raise HTTPException(status_code=404, detail="API key not found for org/provider.")
 
     client = cohere.Client(keys[0]["api_key"])
 
