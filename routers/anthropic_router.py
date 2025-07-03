@@ -10,12 +10,10 @@ router = APIRouter()
 
 class PromptPayload(BaseModel):
     user_id: str
+    org_id: str
     provider: str
     model: str
     prompt: str
-    org_id: str
-    project_id: str
-    prompt_id: str
 
 def handle_prompt(payload: PromptPayload):
     print(f"[Anthropic Router] Looking up API key for org_id={payload.org_id}, provider={payload.provider}")
@@ -25,7 +23,7 @@ def handle_prompt(payload: PromptPayload):
         .eq("provider", payload.provider) \
         .execute()
     
-    print(f"[Anthropic Router] API key query result: {result.data}")
+    print(f"[Anthropic Router] Org API key query result: {result.data}")
     if not result.data:
         print("[Anthropic Router] No API key found for org/provider.")
         raise HTTPException(status_code=404, detail="API key not found for org/provider.")
@@ -67,10 +65,7 @@ def handle_prompt(payload: PromptPayload):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
-            project_id=getattr(payload, 'project_id', None),
-            org_id=payload.org_id,
-            prompt_id=getattr(payload, 'prompt_id', None)
+            cost_usd=cost_usd
         )
 
         return {

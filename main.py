@@ -11,16 +11,18 @@ from routers import openai_router, anthropic_router, mistral_router, cohere_rout
 # Model definitions
 class APIKeyPayload(BaseModel):
     user_id: str
+    org_id: str
     provider: str
     api_key: str
 
 class PromptPayload(BaseModel):
     user_id: str
-    org_id: str
     provider: str
     model: str
     prompt: str
-    project_id: str
+    prompt_id: str
+    org_id: str | None = None
+    project_id: str | None = None
 
 class OptimizePayload(BaseModel):
     prompt_id: str
@@ -31,7 +33,7 @@ class OptimizePayload(BaseModel):
     user_id: str
 
 class DeleteKeyPayload(BaseModel):
-    user_id: str
+    org_id: str
     provider: str
 
 app = FastAPI()
@@ -203,10 +205,10 @@ Return your recommendation as a JSON object with the following structure:
         print(f"Error in optimize endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
 
-@app.get("/get-keys/{user_id}")
-def get_keys(user_id: str):
+@app.get("/get-keys/{org_id}")
+def get_keys(org_id: str):
     try:
-        result = supabase.table("api_keys").select("*").eq("user_id", user_id).execute()
+        result = supabase.table("api_keys").select("*").eq("org_id", org_id).execute()
         
         # Decrypt API keys before returning
         decrypted_keys = []
@@ -231,16 +233,17 @@ def store_api_key(payload: APIKeyPayload):
         
         data = {
             "user_id": payload.user_id,
+            "org_id": payload.org_id,
             "provider": payload.provider,
             "api_key": encrypted_api_key,
         }
         
-        # First check if a key for this user/provider already exists
-        existing = supabase.table("api_keys").select("*").eq("user_id", payload.user_id).eq("provider", payload.provider).execute()
+        # First check if a key for this org/provider already exists
+        existing = supabase.table("api_keys").select("*").eq("org_id", payload.org_id).eq("provider", payload.provider).execute()
         
         if existing.data:
             # Update existing key
-            result = supabase.table("api_keys").update({"api_key": encrypted_api_key}).eq("user_id", payload.user_id).eq("provider", payload.provider).execute()
+            result = supabase.table("api_keys").update({"api_key": encrypted_api_key}).eq("org_id", payload.org_id).eq("provider", payload.provider).execute()
             return {"status": "success", "updated": result.data}
         else:
             # Insert new key
@@ -287,13 +290,13 @@ def test_openai_call(payload: PromptPayload):
     
     result = supabase.table("api_keys") \
         .select("*") \
-        .eq("user_id", payload.user_id) \
+        .eq("org_id", payload.org_id) \
         .eq("provider", payload.provider) \
         .execute()
 
     keys = result.data
     if not keys:
-        raise HTTPException(status_code=404, detail="API key not found for user/provider.")
+        raise HTTPException(status_code=404, detail="API key not found for org/provider.")
 
     # Decrypt the API key
     try:
@@ -332,12 +335,12 @@ def test_anthropic_call(payload: PromptPayload):
     
     result = supabase.table("api_keys") \
         .select("*") \
-        .eq("user_id", payload.user_id) \
+        .eq("org_id", payload.org_id) \
         .eq("provider", payload.provider) \
         .execute()
     
     if not result.data:
-        raise HTTPException(status_code=404, detail="API key not found.")
+        raise HTTPException(status_code=404, detail="API key not found for org/provider.")
 
     # Decrypt the API key
     try:
@@ -416,27 +419,22 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
         print("Prompt template not found")
         raise HTTPException(status_code=404, detail="Prompt template not found.")
     prompt_template = prompt_result.data
-    # Allow if user is the prompt owner
-    if prompt_template["user_id"] == user_id:
-        pass  # allow
-    else:
-        # Check if both user and prompt are in the same org
-        prompt_org_id = prompt_template.get("org_id")
-        if not prompt_org_id:
-            print("Prompt has no org_id, access denied")
-            raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
+    # Only check if user is a member of the prompt's org
+    prompt_org_id = prompt_template.get("org_id")
+    if not prompt_org_id:
+        print("Prompt has no org_id, access denied")
+        raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
 
-        # Check if user is a member of the org
-        org_member_result = supabase.table("organization_members") \
-            .select("*") \
-            .eq("user_id", user_id) \
-            .eq("org_id", prompt_org_id) \
-            .eq("status", "active") \
-            .execute()
-        if not org_member_result.data:
-            print("User is not a member of the prompt's org, access denied")
-            raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
-        # else: allow
+    org_member_result = supabase.table("organization_members") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .eq("org_id", prompt_org_id) \
+        .eq("status", "active") \
+        .execute()
+    if not org_member_result.data:
+        print("User is not a member of the prompt's org, access denied")
+        raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
+    # else: allow
 
     # 4. Prepare prompt
     prompt_text = prompt_template["prompt"].replace("{input}", user_input) if prompt_template["prompt"] else user_input
@@ -447,11 +445,11 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
     # 5. Call the correct LLM router
     payload_obj = PromptPayload(
         user_id=user_id,
-        org_id=prompt_template["org_id"],
         provider=provider,
         model=model,
         prompt=prompt_text,
-        project_id=prompt_template.get("project_id")
+        prompt_id=prompt_id,
+        org_id=prompt_org_id
     )
     print("Calling LLM router with:", payload_obj)
     try:
@@ -521,10 +519,10 @@ def delete_service_api_key(key_id: str):
 @app.delete("/delete-key")
 def delete_api_key(payload: DeleteKeyPayload):
     try:
-        # Delete the API key for the user and provider
+        # Delete the API key for the org and provider
         result = supabase.table("api_keys") \
             .delete() \
-            .eq("user_id", payload.user_id) \
+            .eq("org_id", payload.org_id) \
             .eq("provider", payload.provider) \
             .execute()
         # result.data will be a list of deleted rows (or empty if nothing deleted)

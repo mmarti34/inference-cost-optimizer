@@ -1,9 +1,22 @@
 from supabase_client import supabase
 from utils.pricing import get_pricing, suggest_model
 
-def log_usage(user_id, provider, model, prompt, response,
-              input_tokens=None, output_tokens=None, total_tokens=None, cost_usd=None,
-              project_id=None, org_id=None, prompt_id=None):
+def log_usage(user_id, provider, model, prompt, response, prompt_id,
+              input_tokens=None, output_tokens=None, total_tokens=None, cost_usd=None, project_id=None, org_id=None):
+    # If project_id is not provided, look it up from prompt_templates
+    if not project_id or not org_id:
+        prompt_template = supabase.table("prompt_templates").select("project_id, org_id").eq("id", prompt_id).single().execute()
+        if not prompt_template.data:
+            raise ValueError("project_id and org_id could not be determined from prompt_id")
+        if not project_id:
+            project_id = prompt_template.data.get("project_id")
+        if not org_id:
+            org_id = prompt_template.data.get("org_id")
+        if not project_id or not org_id:
+            raise ValueError("project_id and org_id could not be determined from prompt_id")
+
+    if not all([project_id, org_id, prompt_id]):
+        raise ValueError("project_id, org_id, and prompt_id are required for usage logging and optimizer recommendations.")
     data = {
         "user_id": user_id,
         "provider": provider,
@@ -22,9 +35,8 @@ def log_usage(user_id, provider, model, prompt, response,
     # Insert usage log
     result = supabase.table("usage_logs").insert(data).execute()
     
-    # Update optimizer recommendations if we have project_id, org_id, and prompt_id
-    if project_id and org_id and prompt_id:
-        update_optimizer_recommendations(user_id, org_id, project_id, prompt_id, prompt, input_tokens, output_tokens, cost_usd)
+    # Always update optimizer recommendations
+    update_optimizer_recommendations(user_id, org_id, project_id, prompt_id, prompt, input_tokens, output_tokens, cost_usd)
 
 def update_optimizer_recommendations(user_id, org_id, project_id, prompt_id, prompt, input_tokens, output_tokens, cost_usd):
     """

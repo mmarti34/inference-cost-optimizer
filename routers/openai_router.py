@@ -10,12 +10,10 @@ from utils.encryption import decrypt_api_key
 router = APIRouter()
 
 class PromptPayload(BaseModel):
-    user_id: str
+    org_id: str
     provider: str
     model: str
     prompt: str
-    org_id: str
-    project_id: str
     prompt_id: str
 
 def handle_prompt(payload: PromptPayload):
@@ -66,18 +64,16 @@ def handle_prompt(payload: PromptPayload):
         cost_usd = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1000
 
         log_usage(
-            user_id=payload.user_id,
-            provider="OpenAI",
-            model=payload.model,
-            prompt=payload.prompt,
-            response=reply,
+            payload.org_id,
+            "OpenAI",
+            payload.model,
+            payload.prompt,
+            reply,
+            payload.prompt_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
-            project_id=getattr(payload, 'project_id', None),
-            org_id=payload.org_id,
-            prompt_id=getattr(payload, 'prompt_id', None)
+            cost_usd=cost_usd
         )
 
         return {
