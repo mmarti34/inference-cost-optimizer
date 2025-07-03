@@ -15,10 +15,11 @@ class PromptPayload(BaseModel):
     model: str
     prompt: str
     org_id: str
-    project_id: str
 
 def handle_prompt(payload: PromptPayload):
-    print(f"[OpenAI Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}")
+    print(f"[OpenAI Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}, org_id={payload.org_id}")
+    
+    # First, try to get user-specific API key
     result = supabase.table("api_keys") \
         .select("*") \
         .eq("user_id", payload.user_id) \
@@ -26,9 +27,22 @@ def handle_prompt(payload: PromptPayload):
         .execute()
 
     keys = result.data
-    print(f"[OpenAI Router] API key query result: {keys}")
+    print(f"[OpenAI Router] User API key query result: {keys}")
+    
+    # If no user-specific key, try organization-level key
+    if not keys and payload.org_id:
+        print(f"[OpenAI Router] No user API key found, checking org_id={payload.org_id}")
+        result = supabase.table("api_keys") \
+            .select("*") \
+            .eq("org_id", payload.org_id) \
+            .eq("provider", payload.provider) \
+            .execute()
+        
+        keys = result.data
+        print(f"[OpenAI Router] Org API key query result: {keys}")
+    
     if not keys:
-        print("[OpenAI Router] No API key found for user/provider.")
+        print("[OpenAI Router] No API key found for user/provider or org/provider.")
         raise HTTPException(status_code=404, detail="API key not found for user/provider.")
 
     # Decrypt the API key
@@ -73,9 +87,7 @@ def handle_prompt(payload: PromptPayload):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
-            project_id=getattr(payload, 'project_id', None),
-            org_id=payload.org_id
+            cost_usd=cost_usd
         )
 
         return {

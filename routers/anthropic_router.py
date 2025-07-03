@@ -13,25 +13,40 @@ class PromptPayload(BaseModel):
     provider: str
     model: str
     prompt: str
-    project_id: str
     org_id: str
 
 def handle_prompt(payload: PromptPayload):
-    print(f"[Anthropic Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}")
+    print(f"[Anthropic Router] Looking up API key for user_id={payload.user_id}, provider={payload.provider}, org_id={payload.org_id}")
+    
+    # First, try to get user-specific API key
     result = supabase.table("api_keys") \
         .select("*") \
         .eq("user_id", payload.user_id) \
         .eq("provider", payload.provider) \
         .execute()
+
+    keys = result.data
+    print(f"[Anthropic Router] User API key query result: {keys}")
     
-    print(f"[Anthropic Router] API key query result: {result.data}")
-    if not result.data:
-        print("[Anthropic Router] No API key found for user/provider.")
-        raise HTTPException(status_code=404, detail="API key not found.")
+    # If no user-specific key, try organization-level key
+    if not keys and payload.org_id:
+        print(f"[Anthropic Router] No user API key found, checking org_id={payload.org_id}")
+        result = supabase.table("api_keys") \
+            .select("*") \
+            .eq("org_id", payload.org_id) \
+            .eq("provider", payload.provider) \
+            .execute()
+        
+        keys = result.data
+        print(f"[Anthropic Router] Org API key query result: {keys}")
+    
+    if not keys:
+        print("[Anthropic Router] No API key found for user/provider or org/provider.")
+        raise HTTPException(status_code=404, detail="API key not found for user/provider.")
 
     # Decrypt the API key
     try:
-        encrypted_api_key = result.data[0]["api_key"]
+        encrypted_api_key = keys[0]["api_key"]
         print("[Anthropic Router] Encrypted API key from DB:", encrypted_api_key)
         api_key = decrypt_api_key(encrypted_api_key)
         print("[Anthropic Router] Decrypted API key:", api_key)
@@ -66,9 +81,7 @@ def handle_prompt(payload: PromptPayload):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
-            project_id=payload.project_id,
-            org_id=payload.org_id
+            cost_usd=cost_usd
         )
 
         return {
