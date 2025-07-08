@@ -7,6 +7,7 @@ import secrets
 from utils.pricing import get_pricing, suggest_model
 
 from routers import openai_router, anthropic_router, mistral_router, cohere_router, gemini_router
+from org_access_control import router as org_access_router
 
 # Model definitions
 class APIKeyPayload(BaseModel):
@@ -53,6 +54,7 @@ app.include_router(anthropic_router.router, prefix="/anthropic")
 app.include_router(mistral_router.router, prefix="/mistral")
 app.include_router(cohere_router.router, prefix="/cohere")
 app.include_router(gemini_router.router, prefix="/gemini")
+app.include_router(org_access_router, prefix="/org-access")
 
 # Health check endpoint for Railway
 @app.get("/health")
