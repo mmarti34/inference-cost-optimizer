@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Request, Body
+from fastapi import FastAPI, HTTPException, Header, Request, Body, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase_client import supabase
@@ -59,7 +59,7 @@ app.include_router(org_access_router, prefix="/org-access")
 # Health check endpoint for Railway
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "message": "API is running"}
+    return Response(content='{"status": "healthy", "message": "API is running"}', media_type="application/json")
 
 @app.post("/optimize")
 def optimize_prompt(payload: OptimizePayload):

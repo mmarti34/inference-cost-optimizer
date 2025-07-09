@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Body
-from .supabase_client import supabase
+from supabase_client import supabase
 
 router = APIRouter()
 
