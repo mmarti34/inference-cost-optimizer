@@ -43,4 +43,5 @@ def invite_member(org_id: str = Body(...), email: str = Body(...)):
         raise HTTPException(status_code=403, detail=f'Member limit reached for your plan ({plan}).')
     # 2. Add member
     new_member = supabase.table('organization_members').insert({'org_id': org_id, 'invited_email': email, 'status': 'pending'}).execute()
-    return new_member.data 
+    return new_member.data
+
