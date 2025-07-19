@@ -241,3 +241,31 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
     except Exception as e:
         print(f"Error in join_organization: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@router.delete("/api/organizations/members/{org_id}/{user_id}")
+def remove_member(org_id: str, user_id: str):
+    """Remove a member from an organization and clean up related data"""
+    try:
+        print(f"Removing user {user_id} from organization {org_id}")
+        
+        # 1. Check if the requesting user is an admin
+        # (This would typically come from authentication middleware)
+        # For now, we'll assume the request is authorized
+        
+        # 2. Remove the user from organization_members
+        member_result = supabase.table("organization_members").delete().eq("org_id", org_id).eq("user_id", user_id).execute()
+        print(f"Member removal result: {member_result}")
+        
+        # 3. Clean up any pending join requests for this user and org
+        join_request_result = supabase.table("join_requests").delete().eq("org_id", org_id).eq("user_id", user_id).execute()
+        print(f"Join request cleanup result: {join_request_result}")
+        
+        # 4. Clean up any pending invitations for this user and org
+        invite_result = supabase.table("organization_members").delete().eq("org_id", org_id).eq("invited_email", user_id).eq("status", "invited").execute()
+        print(f"Invitation cleanup result: {invite_result}")
+        
+        return {"message": "Member removed successfully", "data": member_result.data}
+        
+    except Exception as e:
+        print(f"Error in remove_member: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
