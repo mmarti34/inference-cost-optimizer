@@ -269,3 +269,124 @@ def remove_member(org_id: str, user_id: str):
     except Exception as e:
         print(f"Error in remove_member: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+def check_org_access_permission(user_plan: str, org_plan: str) -> bool:
+    """Check if user can access an organization based on their current plan"""
+    # Plan priority (higher number = higher tier)
+    plan_priority = {"free": 0, "starter": 1, "team": 2, "pro": 3, "enterprise": 4}
+    
+    user_priority = plan_priority.get(user_plan, 0)
+    org_priority = plan_priority.get(org_plan, 0)
+    
+    # User can access orgs of their plan level or lower
+    # But cannot access orgs created with a higher plan than their current plan
+    return user_priority >= org_priority
+
+@router.get("/api/organizations/check-access/{org_id}")
+def check_organization_access(org_id: str, user_id: str):
+    """Check if a user can access an organization based on their current plan"""
+    try:
+        print(f"Checking access for user {user_id} to organization {org_id}")
+        
+        # 1. Get user's current plan
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_plan = "free"
+        if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
+            user_plan = user_profile_result.data["subscription_tier"]
+        print(f"User's current plan: {user_plan}")
+        
+        # 2. Get organization details
+        org_result = supabase.table("organizations").select("*").eq("id", org_id).single().execute()
+        if not org_result.data:
+            raise HTTPException(status_code=404, detail="Organization not found.")
+        
+        org = org_result.data
+        org_plan = get_org_plan(org)
+        print(f"Organization plan: {org_plan}")
+        
+        # 3. Check if user is a member of this org
+        membership_result = supabase.table("organization_members").select("*").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").single().execute()
+        if not membership_result.data:
+            raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+        
+        # 4. Check access permission based on plan
+        can_access = check_org_access_permission(user_plan, org_plan)
+        
+        if not can_access:
+            upgrade_msg = get_upgrade_suggestion(user_plan)
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Access denied. This organization requires a {org_plan} plan or higher. Your current plan is {user_plan}.{upgrade_msg}"
+            )
+        
+        return {
+            "can_access": True,
+            "user_plan": user_plan,
+            "org_plan": org_plan,
+            "message": "Access granted"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in check_organization_access: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@router.get("/api/organizations/user-accessible")
+def get_user_accessible_organizations(user_id: str):
+    """Get all organizations that a user can access based on their current plan"""
+    try:
+        print(f"Getting accessible organizations for user {user_id}")
+        
+        # 1. Get user's current plan
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_plan = "free"
+        if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
+            user_plan = user_profile_result.data["subscription_tier"]
+        print(f"User's current plan: {user_plan}")
+        
+        # 2. Get all organizations where user is a member
+        memberships_result = supabase.table("organization_members").select("""
+            org_id,
+            role,
+            status,
+            organizations (*)
+        """).eq("user_id", user_id).eq("status", "active").execute()
+        
+        if not memberships_result.data:
+            return {"accessible_orgs": [], "inaccessible_orgs": []}
+        
+        accessible_orgs = []
+        inaccessible_orgs = []
+        
+        for membership in memberships_result.data:
+            if membership.organizations:
+                org = membership.organizations
+                org_plan = get_org_plan(org)
+                
+                # Check if user can access this org based on their plan
+                can_access = check_org_access_permission(user_plan, org_plan)
+                
+                org_data = {
+                    "id": org["id"],
+                    "name": org["name"],
+                    "type": org.get("type", "Organization"),
+                    "plan": org_plan,
+                    "role": membership["role"],
+                    "can_access": can_access
+                }
+                
+                if can_access:
+                    accessible_orgs.append(org_data)
+                else:
+                    inaccessible_orgs.append(org_data)
+        
+        return {
+            "accessible_orgs": accessible_orgs,
+            "inaccessible_orgs": inaccessible_orgs,
+            "user_plan": user_plan
+        }
+        
+    except Exception as e:
+        print(f"Error in get_user_accessible_organizations: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
