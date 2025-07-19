@@ -46,33 +46,59 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
             print(f"Database connection test failed: {db_error}")
             raise HTTPException(status_code=500, detail=f"Database connection failed: {str(db_error)}")
         
-        # 1. Fetch user's orgs (only count Organization type, not Personal)
+        # 1. Get user's actual plan from user_profiles table
+        print("Fetching user's actual plan...")
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_actual_plan = "free"
+        if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
+            user_actual_plan = user_profile_result.data["subscription_tier"]
+        print(f"User's actual plan: {user_actual_plan}")
+        
+        # Use the provided plan or user's actual plan, whichever is higher
+        plan_priority = {"free": 0, "starter": 1, "team": 2, "pro": 3, "enterprise": 4}
+        effective_plan = max([plan, user_actual_plan], key=lambda p: plan_priority.get(p, 0))
+        print(f"Effective plan for organization: {effective_plan}")
+        
+        # 2. Fetch user's orgs (only count Organization type, not Personal)
         print("Fetching user's organizations...")
         orgs_result = supabase.table("organizations").select("*").eq("created_by", user_id).eq("type", "Organization").execute()
         orgs = orgs_result.data if orgs_result.data else []
         print(f"Found {len(orgs)} existing Organization type organizations")
         
-        # Use the highest plan among user's orgs, or the provided plan
-        user_plan = plan
-        if orgs:
-            user_plan = max([get_org_plan(o) for o in orgs] + [plan])
-        
-        org_limit = PLAN_LIMITS.get(user_plan, PLAN_LIMITS["free"])["orgs"]
+        org_limit = PLAN_LIMITS.get(effective_plan, PLAN_LIMITS["free"])["orgs"]
         if len(orgs) >= org_limit:
-            raise HTTPException(status_code=403, detail=f"Your plan ({user_plan}) only allows {org_limit} organization(s).")
+            raise HTTPException(status_code=403, detail=f"Your plan ({effective_plan}) only allows {org_limit} organization(s).")
         
-        # 2. Create org
+        # 3. Create org
         print("Creating new organization...")
         new_org_result = supabase.table("organizations").insert({
             "name": org_name, 
             "created_by": user_id, 
-            "plan": user_plan,
+            "plan": effective_plan,
             "type": "Organization"
         }).execute()
         
         if not new_org_result.data:
             print("Error: No data returned from organization creation")
             raise HTTPException(status_code=500, detail="Failed to create organization")
+        
+        new_org = new_org_result.data[0] if isinstance(new_org_result.data, list) else new_org_result.data
+        org_id = new_org["id"]
+        
+        # 4. Add user as admin member
+        print("Adding user as admin member...")
+        member_result = supabase.table("organization_members").insert({
+            "org_id": org_id,
+            "user_id": user_id,
+            "role": "admin",
+            "status": "active"
+        }).execute()
+        
+        if not member_result.data:
+            print("Error: Failed to add user as admin member")
+            # Clean up the created org
+            supabase.table("organizations").delete().eq("id", org_id).execute()
+            raise HTTPException(status_code=500, detail="Failed to add user as admin member")
         
         print(f"Organization created successfully: {new_org_result.data}")
         return new_org_result.data
@@ -98,3 +124,56 @@ def invite_member(org_id: str = Body(...), email: str = Body(...)):
     # 2. Add member
     new_member = supabase.table("organization_members").insert({"org_id": org_id, "invited_email": email, "status": "pending"}).execute()
     return new_member.data
+
+@router.post("/api/organizations/join")
+def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
+    """Join an organization - check plan limits before allowing"""
+    try:
+        print(f"User {user_id} attempting to join organization {org_id}")
+        
+        # 1. Get user's actual plan
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_plan = "free"
+        if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
+            user_plan = user_profile_result.data["subscription_tier"]
+        print(f"User's plan: {user_plan}")
+        
+        # 2. Check if user already has too many org memberships
+        user_orgs_result = supabase.table("organization_members").select("org_id").eq("user_id", user_id).eq("status", "active").execute()
+        user_orgs = user_orgs_result.data if user_orgs_result.data else []
+        
+        # Get the org types for user's current memberships
+        org_types = []
+        for membership in user_orgs:
+            org_result = supabase.table("organizations").select("type").eq("id", membership["org_id"]).single().execute()
+            if org_result.data:
+                org_types.append(org_result.data["type"])
+        
+        # Count only Organization type memberships
+        org_count = org_types.count("Organization")
+        print(f"User currently has {org_count} Organization memberships")
+        
+        org_limit = PLAN_LIMITS.get(user_plan, PLAN_LIMITS["free"])["orgs"]
+        if org_count >= org_limit:
+            raise HTTPException(status_code=403, detail=f"Your plan ({user_plan}) only allows {org_limit} organization(s).")
+        
+        # 3. Check if user is already a member
+        existing_member = supabase.table("organization_members").select("*").eq("user_id", user_id).eq("org_id", org_id).execute()
+        if existing_member.data:
+            raise HTTPException(status_code=400, detail="User is already a member of this organization")
+        
+        # 4. Add user as member
+        member_result = supabase.table("organization_members").insert({
+            "org_id": org_id,
+            "user_id": user_id,
+            "role": "member",
+            "status": "active"
+        }).execute()
+        
+        return member_result.data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in join_organization: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
