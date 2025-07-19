@@ -112,18 +112,49 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
 
 @router.post("/api/organizations/invite")
 def invite_member(org_id: str = Body(...), email: str = Body(...)):
-    # 1. Fetch org and plan
-    org = supabase.table("organizations").select("*").eq("id", org_id).single().execute().data
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found.")
-    plan = get_org_plan(org)
-    members = supabase.table("organization_members").select("*").eq("org_id", org_id).eq("status", "active").execute().data
-    member_limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["members"]
-    if len(members) >= member_limit:
-        raise HTTPException(status_code=403, detail=f"Member limit reached for your plan ({plan}).")
-    # 2. Add member
-    new_member = supabase.table("organization_members").insert({"org_id": org_id, "invited_email": email, "status": "pending"}).execute()
-    return new_member.data
+    try:
+        print(f"Inviting member to org {org_id}: {email}")
+        
+        # 1. Fetch org and plan
+        org = supabase.table("organizations").select("*").eq("id", org_id).single().execute().data
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found.")
+        
+        plan = get_org_plan(org)
+        print(f"Organization plan: {plan}")
+        
+        # 2. Count current active members in this org
+        members = supabase.table("organization_members").select("*").eq("org_id", org_id).eq("status", "active").execute().data
+        current_member_count = len(members) if members else 0
+        print(f"Current member count: {current_member_count}")
+        
+        # 3. Check member limit for this org's plan
+        member_limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["members"]
+        print(f"Member limit for {plan} plan: {member_limit}")
+        
+        if current_member_count >= member_limit:
+            raise HTTPException(status_code=403, detail=f"Member limit reached for your plan ({plan}). You can have up to {member_limit} members.")
+        
+        # 4. Check if email is already invited or a member
+        existing_invite = supabase.table("organization_members").select("*").eq("org_id", org_id).eq("invited_email", email).execute().data
+        if existing_invite:
+            raise HTTPException(status_code=400, detail="This email has already been invited or is already a member.")
+        
+        # 5. Add member invitation
+        new_member = supabase.table("organization_members").insert({
+            "org_id": org_id, 
+            "invited_email": email, 
+            "status": "invited"
+        }).execute()
+        
+        print(f"Invitation sent successfully")
+        return new_member.data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in invite_member: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/join")
 def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
@@ -162,7 +193,20 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
         if existing_member.data:
             raise HTTPException(status_code=400, detail="User is already a member of this organization")
         
-        # 4. Add user as member
+        # 4. Check if org has reached member limit
+        org = supabase.table("organizations").select("*").eq("id", org_id).single().execute().data
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found.")
+        
+        plan = get_org_plan(org)
+        current_members = supabase.table("organization_members").select("*").eq("org_id", org_id).eq("status", "active").execute().data
+        current_member_count = len(current_members) if current_members else 0
+        
+        member_limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["members"]
+        if current_member_count >= member_limit:
+            raise HTTPException(status_code=403, detail=f"Organization has reached its member limit ({member_limit}) for the {plan} plan.")
+        
+        # 5. Add user as member
         member_result = supabase.table("organization_members").insert({
             "org_id": org_id,
             "user_id": user_id,
