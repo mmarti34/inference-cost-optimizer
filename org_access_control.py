@@ -311,8 +311,16 @@ def check_organization_access(org_id: str, user_id: str):
         
         # 3. Check if user is a member of this org
         membership_result = supabase.table("organization_members").select("*").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").single().execute()
-        if not membership_result.data:
-            raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+        
+        # If user is already a member, they can access it regardless of plan
+        if membership_result.data:
+            print(f"User is existing member - granting access")
+            return {
+                "can_access": True,
+                "user_plan": user_plan,
+                "org_plan": org_plan,
+                "message": "Access granted (existing member)"
+            }
         
         # 4. Check access permission based on plan
         can_access = check_org_access_permission(user_plan, org_plan, org.get("type", "Organization"))
