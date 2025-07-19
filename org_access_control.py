@@ -270,8 +270,13 @@ def remove_member(org_id: str, user_id: str):
         print(f"Error in remove_member: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-def check_org_access_permission(user_plan: str, org_plan: str) -> bool:
+def check_org_access_permission(user_plan: str, org_plan: str, org_type: str = "Organization") -> bool:
     """Check if user can access an organization based on their current plan"""
+    # Personal organizations are always accessible
+    if org_type == "Personal":
+        return True
+
+    # For Organization type, check if user's plan can access this org's plan
     # Plan priority (higher number = higher tier)
     plan_priority = {"free": 0, "starter": 1, "team": 2, "pro": 3, "enterprise": 4}
     
@@ -279,7 +284,7 @@ def check_org_access_permission(user_plan: str, org_plan: str) -> bool:
     org_priority = plan_priority.get(org_plan, 0)
     
     # User can access orgs of their plan level or lower
-    # But cannot access orgs created with a higher plan than their current plan
+    # Users can access organizations of their plan level or lower
     return user_priority >= org_priority
 
 @router.get("/api/organizations/check-access/{org_id}")
@@ -310,7 +315,7 @@ def check_organization_access(org_id: str, user_id: str):
             raise HTTPException(status_code=403, detail="You are not a member of this organization.")
         
         # 4. Check access permission based on plan
-        can_access = check_org_access_permission(user_plan, org_plan)
+        can_access = check_org_access_permission(user_plan, org_plan, org.get("type", "Organization"))
         
         if not can_access:
             upgrade_msg = get_upgrade_suggestion(user_plan)
@@ -365,7 +370,7 @@ def get_user_accessible_organizations(user_id: str):
                 org_plan = get_org_plan(org)
                 
                 # Check if user can access this org based on their plan
-                can_access = check_org_access_permission(user_plan, org_plan)
+                can_access = check_org_access_permission(user_plan, org_plan, org.get("type", "Organization"))
                 
                 org_data = {
                     "id": org["id"],
