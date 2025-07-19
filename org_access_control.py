@@ -46,11 +46,11 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
             print(f"Database connection test failed: {db_error}")
             raise HTTPException(status_code=500, detail=f"Database connection failed: {str(db_error)}")
         
-        # 1. Fetch user's orgs
+        # 1. Fetch user's orgs (only count Organization type, not Personal)
         print("Fetching user's organizations...")
-        orgs_result = supabase.table("organizations").select("*").eq("created_by", user_id).execute()
+        orgs_result = supabase.table("organizations").select("*").eq("created_by", user_id).eq("type", "Organization").execute()
         orgs = orgs_result.data if orgs_result.data else []
-        print(f"Found {len(orgs)} existing organizations")
+        print(f"Found {len(orgs)} existing Organization type organizations")
         
         # Use the highest plan among user's orgs, or the provided plan
         user_plan = plan
