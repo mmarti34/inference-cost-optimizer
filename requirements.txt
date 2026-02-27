@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+supabase
+httpx
+openai
+anthropic
+mistralai
+cohere
+google-generativeai
+google-genai
+python-dotenv
+pydantic
+cryptography
+pycryptodome
+stripe
+psycopg2-binary
