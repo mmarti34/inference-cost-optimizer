@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS routing_latency_facts (
     workflow_run_id UUID,
     workflow_id     UUID,
     node_id         TEXT NOT NULL,
-    node_type       TEXT NOT NULL,               -- 'model', 'ai-step', 'optimizer'
+    node_type       TEXT NOT NULL,               -- 'model', 'ai-step', 'optimizer', 'vision_step', 'image_gen_step', 'tts_step', 'stt_step', 'embedding_step'
 
     -- Model target metadata
     target_type     TEXT,                         -- 'provider_model' | 'openai_compatible_endpoint' | null

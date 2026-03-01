@@ -31,8 +31,10 @@ _logger = logging.getLogger(__name__)
 
 
 # ── Internal latency instrumentation ────────────────────────────────────────
-# Writes one row per model/ai-step execution into routing_latency_facts.
-# Best-effort: failures are logged but never propagate to the caller.
+# Writes one row per provider call into routing_latency_facts.
+# Covers: model, ai-step, optimizer, vision_step, image_gen_step, tts_step,
+# stt_step, embedding_step.
+# Best-effort: failures are logged (WARNING) but never propagate to the caller.
 
 def _record_latency_fact(
     *,
@@ -966,6 +968,7 @@ def execute_workflow(
             model = str(data.get("model") or data.get("modelName") or "").strip()
             if not model:
                 model = {"openai": "gpt-4o-mini", "anthropic": "claude-sonnet-4-5-20250929", "gemini": "gemini-2.5-flash", "mistral": "mistral-small-3.2", "cohere": "command-a-vision-07-2025", "groq": "llama-3.2-90b-vision-preview", "together": "meta/llama-3.2-90b-vision-instruct-turbo", "deepseek": "deepseek-chat", "fireworks": "accounts/fireworks/models/llama-v3p2-11b-vision-instruct"}.get(provider, "gpt-4o-mini")
+            _t0_vision = time.perf_counter()
             try:
                 if provider == "openai":
                     v_result = openai_router.handle_vision(openai_router.VisionPayload(org_id=org_id, provider=provider, model=model, prompt=prompt, image_url=image_url, prompt_id=f"workflow-{node_id}"))
@@ -988,16 +991,42 @@ def execute_workflow(
                 else:
                     raise HTTPException(status_code=400, detail=f"Vision not supported for provider: {provider}. Use openai, anthropic, gemini, mistral, cohere, groq, together, deepseek, or fireworks.")
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_vision) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="vision_step",
+                    target_type=None, provider_label=provider,
+                    model_name=model, endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(status_code=404, detail=f"No API key for {provider}. Add in Settings → Integrations. (node_id={node_id})") from e
                 raise
+            _total_vision_ms = int((time.perf_counter() - _t0_vision) * 1000)
+            _prov_vision_ms = v_result.get("provider_latency_ms") or v_result.get("latency_ms")
+            _oh_vision_ms = max(_total_vision_ms - _prov_vision_ms, 0) if _prov_vision_ms is not None else None
             out_text = v_result.get("response") or v_result.get("output") or ""
-            result = {"output": out_text, "content_type": "text", "cost": v_result.get("cost_usd") or 0.0, "latency_ms": v_result.get("latency_ms") or 0}
+            result = {"output": out_text, "content_type": "text", "cost": v_result.get("cost_usd") or 0.0, "latency_ms": _total_vision_ms}
             context[node_id] = {"output": result["output"], "content_type": "text"}
             last_content_type = "text"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
+            _v_in_tok = v_result.get("input_tokens") or None
+            _v_out_tok = v_result.get("output_tokens") or None
             node_results.append({"node_id": node_id, "type": "vision_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (out_text or "")[:200], "content_type": "text", "model": model, "provider": provider})
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="vision_step",
+                target_type=None, provider_label=provider,
+                model_name=model, endpoint_id=None, resolved_base_url=None,
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=_total_vision_ms, provider_latency_ms=_prov_vision_ms,
+                gateway_overhead_ms=_oh_vision_ms,
+                input_tokens=_v_in_tok, output_tokens=_v_out_tok, success=True,
+            )
         elif node_type == "image_gen_step":
             prompt_source = (data.get("prompt_source") or data.get("promptSource") or "static").strip().lower()
             if prompt_source == "previous_step" and from_node_id:
@@ -1015,6 +1044,7 @@ def execute_workflow(
             if not model:
                 model = "dall-e-3" if provider == "openai" else "imagen-3.0-generate-002" if provider == "gemini" else "accounts/fireworks/models/flux-1-schnell"
             negative_prompt = (data.get("negative_prompt") or "").strip() or None
+            _t0_imggen = time.perf_counter()
             try:
                 if provider == "openai":
                     img_result = openai_router.handle_image_generation(openai_router.ImageGenerationPayload(
@@ -1030,14 +1060,28 @@ def execute_workflow(
                     ))
                 else:
                     raise HTTPException(status_code=400, detail=f"Image generation not supported for provider: {provider}. Use openai, gemini, or fireworks.")
+                _total_imggen_ms = int((time.perf_counter() - _t0_imggen) * 1000)
+                _prov_imggen_ms = img_result.get("provider_latency_ms") or img_result.get("latency_ms")
+                _oh_imggen_ms = max(_total_imggen_ms - _prov_imggen_ms, 0) if _prov_imggen_ms is not None else None
                 image_url = img_result.get("url") or ""
                 result = {
                     "output": image_url,
                     "content_type": "image_url",
                     "cost": img_result.get("cost_usd") or 0.0,
-                    "latency_ms": img_result.get("latency_ms") or 0,
+                    "latency_ms": _total_imggen_ms,
                 }
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_imggen) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="image_gen_step",
+                    target_type=None, provider_label=provider,
+                    model_name=model, endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(
                         status_code=404,
@@ -1052,6 +1096,16 @@ def execute_workflow(
                 "node_id": node_id, "type": "image_gen_step", "latency_ms": result["latency_ms"], "cost": result["cost"],
                 "output": (result["output"] or "")[:200], "content_type": "image_url", "model": model, "provider": provider,
             })
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="image_gen_step",
+                target_type=None, provider_label=provider,
+                model_name=model, endpoint_id=None, resolved_base_url=None,
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=_total_imggen_ms, provider_latency_ms=_prov_imggen_ms,
+                gateway_overhead_ms=_oh_imggen_ms,
+                input_tokens=None, output_tokens=None, success=True,
+            )
         elif node_type == "tts_step":
             text_source = (data.get("text_source") or data.get("textSource") or data.get("input_source") or "previous_step").strip().lower()
             if text_source == "previous_step" and from_node_id:
@@ -1071,6 +1125,7 @@ def execute_workflow(
                 voice = str(data.get("voice") or "austin").strip().lower() or "austin"
             if provider not in ("openai", "groq"):
                 raise HTTPException(status_code=400, detail=f"TTS supported for OpenAI or Groq. (node_id={node_id})")
+            _t0_tts = time.perf_counter()
             try:
                 if provider == "openai":
                     tts_result = openai_router.handle_tts(openai_router.TTSPayload(
@@ -1081,15 +1136,39 @@ def execute_workflow(
                         org_id=org_id, text=text, model=model, voice=voice, prompt_id=f"workflow-{node_id}",
                     ))
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_tts) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="tts_step",
+                    target_type=None, provider_label=provider,
+                    model_name=model, endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(status_code=404, detail=f"No {provider} API key. Add in Settings → Integrations. (node_id={node_id})") from e
                 raise
-            result = {"output": tts_result.get("output") or "", "content_type": "audio_url", "cost": tts_result.get("cost_usd") or 0.0, "latency_ms": tts_result.get("latency_ms") or 0}
+            _total_tts_ms = int((time.perf_counter() - _t0_tts) * 1000)
+            _prov_tts_ms = tts_result.get("provider_latency_ms") or tts_result.get("latency_ms")
+            _oh_tts_ms = max(_total_tts_ms - _prov_tts_ms, 0) if _prov_tts_ms is not None else None
+            result = {"output": tts_result.get("output") or "", "content_type": "audio_url", "cost": tts_result.get("cost_usd") or 0.0, "latency_ms": _total_tts_ms}
             context[node_id] = {"output": result["output"], "content_type": "audio_url"}
             last_content_type = "audio_url"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
             node_results.append({"node_id": node_id, "type": "tts_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": "[audio]", "content_type": "audio_url", "model": model, "provider": provider})
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="tts_step",
+                target_type=None, provider_label=provider,
+                model_name=model, endpoint_id=None, resolved_base_url=None,
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=_total_tts_ms, provider_latency_ms=_prov_tts_ms,
+                gateway_overhead_ms=_oh_tts_ms,
+                input_tokens=None, output_tokens=None, success=True,
+            )
         elif node_type == "stt_step":
             audio_var = str(data.get("audio_variable") or "audio_file").strip()
             audio_input = variables.get(audio_var)
@@ -1118,21 +1197,46 @@ def execute_workflow(
             if provider not in ("openai", "fireworks"):
                 raise HTTPException(status_code=400, detail=f"STT supported for OpenAI or Fireworks. (node_id={node_id})")
             stt_prompt = (data.get("prompt") or "").strip() or None
+            _t0_stt = time.perf_counter()
             try:
                 if provider == "openai":
                     stt_result = openai_router.handle_stt(openai_router.STTPayload(org_id=org_id, audio_base64=audio_base64, model=model, prompt_id=f"workflow-{node_id}", prompt=stt_prompt))
                 else:
                     stt_result = fireworks_router.handle_stt(fireworks_router.STTPayload(org_id=org_id, audio_base64=audio_base64, model=model, prompt_id=f"workflow-{node_id}", prompt=stt_prompt))
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_stt) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="stt_step",
+                    target_type=None, provider_label=provider,
+                    model_name=model, endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(status_code=404, detail=f"No {provider} API key. Add in Settings → Integrations. (node_id={node_id})") from e
                 raise
-            result = {"output": stt_result.get("output") or "", "content_type": "text", "cost": stt_result.get("cost_usd") or 0.0, "latency_ms": stt_result.get("latency_ms") or 0}
+            _total_stt_ms = int((time.perf_counter() - _t0_stt) * 1000)
+            _prov_stt_ms = stt_result.get("provider_latency_ms") or stt_result.get("latency_ms")
+            _oh_stt_ms = max(_total_stt_ms - _prov_stt_ms, 0) if _prov_stt_ms is not None else None
+            result = {"output": stt_result.get("output") or "", "content_type": "text", "cost": stt_result.get("cost_usd") or 0.0, "latency_ms": _total_stt_ms}
             context[node_id] = {"output": result["output"], "content_type": "text"}
             last_content_type = "text"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
             node_results.append({"node_id": node_id, "type": "stt_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (result["output"] or "")[:200], "content_type": "text", "model": model, "provider": provider})
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="stt_step",
+                target_type=None, provider_label=provider,
+                model_name=model, endpoint_id=None, resolved_base_url=None,
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=_total_stt_ms, provider_latency_ms=_prov_stt_ms,
+                gateway_overhead_ms=_oh_stt_ms,
+                input_tokens=None, output_tokens=None, success=True,
+            )
         elif node_type == "embedding_step":
             text_source = (data.get("text_source") or data.get("textSource") or "previous_step").strip().lower()
             if text_source == "previous_step" and from_node_id:
@@ -1145,6 +1249,7 @@ def execute_workflow(
             model = str(data.get("model") or data.get("modelName") or "").strip() or _emb_defaults.get(provider, "text-embedding-3-small")
             if provider not in ("openai", "gemini", "mistral", "cohere", "together", "deepseek", "fireworks"):
                 raise HTTPException(status_code=400, detail=f"Embedding supported for openai, gemini, mistral, cohere, together, deepseek, fireworks. (node_id={node_id})")
+            _t0_emb = time.perf_counter()
             try:
                 if provider == "openai":
                     emb_result = openai_router.handle_embedding(openai_router.EmbeddingPayload(org_id=org_id, text=text, model=model, prompt_id=f"workflow-{node_id}"))
@@ -1161,16 +1266,41 @@ def execute_workflow(
                 else:
                     emb_result = fireworks_router.handle_embedding(fireworks_router.EmbeddingPayload(org_id=org_id, text=text, model=model, prompt_id=f"workflow-{node_id}"))
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_emb) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="embedding_step",
+                    target_type=None, provider_label=provider,
+                    model_name=model, endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(status_code=404, detail=f"No {provider} API key. Add in Settings → Integrations. (node_id={node_id})") from e
                 raise
+            _total_emb_ms = int((time.perf_counter() - _t0_emb) * 1000)
+            _prov_emb_ms = emb_result.get("provider_latency_ms") or emb_result.get("latency_ms")
+            _oh_emb_ms = max(_total_emb_ms - _prov_emb_ms, 0) if _prov_emb_ms is not None else None
+            _emb_in_tok = emb_result.get("input_tokens") or None
             out_str = emb_result.get("output") or "[]"
-            result = {"output": out_str, "content_type": "embedding", "cost": emb_result.get("cost_usd") or 0.0, "latency_ms": emb_result.get("latency_ms") or 0}
+            result = {"output": out_str, "content_type": "embedding", "cost": emb_result.get("cost_usd") or 0.0, "latency_ms": _total_emb_ms}
             context[node_id] = {"output": result["output"], "content_type": "embedding"}
             last_content_type = "embedding"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
             node_results.append({"node_id": node_id, "type": "embedding_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": f"[{len(emb_result.get('embedding') or [])}d]", "content_type": "embedding", "model": model, "provider": provider})
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="embedding_step",
+                target_type=None, provider_label=provider,
+                model_name=model, endpoint_id=None, resolved_base_url=None,
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=_total_emb_ms, provider_latency_ms=_prov_emb_ms,
+                gateway_overhead_ms=_oh_emb_ms,
+                input_tokens=_emb_in_tok, output_tokens=None, success=True,
+            )
         elif node_type == "optimizer":
             prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
             prompt = (data.get("prompt") or data.get("taskDescription") or "Respond to the user.").strip()
