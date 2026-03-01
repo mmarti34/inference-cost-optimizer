@@ -33,9 +33,11 @@ def call_openai_compatible(
     }
 
     url = f"{api_base.rstrip('/')}/chat/completions"
+    _t0_provider = time.perf_counter()
     with httpx.Client(timeout=timeout) as client:
         response = client.post(url, headers=headers, json=payload)
         response.raise_for_status()
+    _provider_latency_ms = int((time.perf_counter() - _t0_provider) * 1000)
 
     latency_ms = int((time.perf_counter() - start) * 1000)
     data = response.json()
@@ -60,6 +62,7 @@ def call_openai_compatible(
         "total_tokens": prompt_tokens + completion_tokens,
         "cost_usd": cost_usd,
         "latency_ms": latency_ms,
+        "provider_latency_ms": _provider_latency_ms,
         "status": "success",
     }
 

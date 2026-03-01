@@ -221,6 +221,7 @@ async def stream_workflow_async(
                     node_results.append({
                         "node_id": node_id, "type": "ai-step", "latency_ms": latency_ms, "cost": cost_usd,
                         "output": full_output[:200], "tokens": out_tok, "input_tokens": in_tok,
+                        "model": model, "provider": "openai",
                     })
                 elif ntype == "output":
                     prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")

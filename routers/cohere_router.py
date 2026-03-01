@@ -1,3 +1,4 @@
+import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import cohere
@@ -90,10 +91,13 @@ def handle_prompt(payload: PromptPayload):
 
     try:
         # 2. Send prompt
+        _t0_provider = time.perf_counter()
         response = client.chat(
             model=payload.model,
             message=payload.prompt
         )
+        _provider_latency_ms = int((time.perf_counter() - _t0_provider) * 1000)
+
         reply = response.text
 
         # 3. Extract token usage (Cohere returns token_count and generation_token_count)
@@ -125,7 +129,8 @@ def handle_prompt(payload: PromptPayload):
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cost_usd": cost_usd
+            "cost_usd": cost_usd,
+            "provider_latency_ms": _provider_latency_ms,
         }
 
     except Exception as e:

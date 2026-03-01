@@ -82,11 +82,13 @@ def handle_prompt(payload: PromptPayload):
     client = Anthropic(api_key=api_key)
 
     try:
+        _t0_provider = time.perf_counter()
         response = client.messages.create(
             model=payload.model,
             max_tokens=1024,
             messages=[{"role": "user", "content": payload.prompt}]
         )
+        _provider_latency_ms = int((time.perf_counter() - _t0_provider) * 1000)
 
         reply = response.content[0].text
 
@@ -115,7 +117,8 @@ def handle_prompt(payload: PromptPayload):
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cost_usd": cost_usd
+            "cost_usd": cost_usd,
+            "provider_latency_ms": _provider_latency_ms,
         }
 
     except Exception as e:

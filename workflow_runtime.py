@@ -5,6 +5,7 @@ passes outputs via context, supports branching (condition) and routing (router).
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 from fastapi import HTTPException
@@ -23,7 +24,86 @@ from routers import (
 from utils.pricing import get_pricing, suggest_model
 from supabase_client import supabase
 from custom_model_management import get_custom_model_by_id
+from model_target import ModelTarget
 from provider_resilience import call_with_resilience
+
+_logger = logging.getLogger(__name__)
+
+
+# ── Internal latency instrumentation ────────────────────────────────────────
+# Writes one row per model/ai-step execution into routing_latency_facts.
+# Best-effort: failures are logged but never propagate to the caller.
+
+def _record_latency_fact(
+    *,
+    org_id: str | None,
+    workflow_run_id: str | None,
+    workflow_id: str | None,
+    node_id: str,
+    node_type: str,
+    target_type: str | None,
+    provider_label: str,
+    model_name: str | None,
+    endpoint_id: str | None,
+    resolved_base_url: str | None,
+    endpoint_slug: str | None,
+    version: int | None,
+    execution_mode: str | None,
+    total_latency_ms: int,
+    provider_latency_ms: int | None,
+    gateway_overhead_ms: int | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    success: bool,
+    error_type: str | None = None,
+    http_status: int | None = None,
+) -> None:
+    """Insert a row into routing_latency_facts. Best-effort; never raises."""
+    try:
+        row: dict[str, Any] = {
+            "org_id": org_id,
+            "workflow_run_id": workflow_run_id,
+            "workflow_id": workflow_id,
+            "node_id": node_id,
+            "node_type": node_type,
+            "target_type": target_type,
+            "provider_label": provider_label,
+            "model_name": model_name,
+            "endpoint_id": endpoint_id,
+            "resolved_base_url": resolved_base_url,
+            "endpoint_slug": endpoint_slug,
+            "version": version,
+            "execution_mode": execution_mode,
+            "total_latency_ms": total_latency_ms,
+            "provider_latency_ms": provider_latency_ms,
+            "gateway_overhead_ms": gateway_overhead_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "success": success,
+            "error_type": error_type,
+            "http_status": http_status,
+        }
+        supabase.table("routing_latency_facts").insert(row).execute()
+    except Exception:
+        _logger.debug("routing_latency_facts insert failed", exc_info=True)
+
+
+def _classify_error(exc: Exception | None, detail: str | None = None) -> str | None:
+    """Classify an exception into a short error_type label for the latency table."""
+    if exc is None and not detail:
+        return None
+    text = (detail or str(exc or "")).lower()
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "rate" in text and "limit" in text:
+        return "rate_limit"
+    if "api key" in text or "auth" in text or "401" in text or "403" in text:
+        return "auth"
+    if "404" in text or "not found" in text:
+        return "not_found"
+    if "connection" in text or "connect" in text:
+        return "connection"
+    return "provider_error"
 
 
 def _nodes_by_id(graph: dict) -> dict[str, dict]:
@@ -92,43 +172,95 @@ _ROUTER_MAP = {
 }
 
 
-def _execute_model_node(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
-    data = node.get("data") or {}
+def _resolve_model_target(data: dict, org_id: str, prompt_text: str) -> tuple[ModelTarget | None, str, str, str]:
+    """
+    Resolve node data into (ModelTarget | None, provider, model, updated_prompt_text).
+
+    Resolution priority:
+      1. model_registry_id → full ModelTarget from DB (custom endpoints or registered provider models)
+      2. customModelId → legacy custom_models table (preset configs on known providers)
+      3. provider + modelName → direct provider_model (backwards-compatible default)
+
+    Returns (target, provider, model, prompt_text).
+    target is None for cases 2 and 3 (legacy paths that don't need custom routing).
+    """
+    # Path 1: model_registry_id (new system)
+    # IMPORTANT: if registry ID is present but resolution fails, raise immediately.
+    # Never silently fall back to provider+modelName — that makes debugging miserable.
+    registry_id = data.get("modelRegistryId") or data.get("model_registry_id")
+    if registry_id:
+        from model_registry_management import resolve_model_target as _resolve_from_db
+        try:
+            target = _resolve_from_db(str(registry_id), org_id)
+        except HTTPException:
+            raise  # preserve the 404 with its detail message
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to resolve model registry entry {registry_id}: {exc}",
+            ) from exc
+        return target, target.provider, target.model_name, prompt_text
+
+    # Path 2: customModelId (legacy preset configs)
     custom_model_id = data.get("customModelId") or data.get("custom_model_id")
     if custom_model_id:
         custom = get_custom_model_by_id(str(custom_model_id), org_id)
         if not custom:
             raise HTTPException(
                 status_code=404,
-                detail=f"Custom model not found. (node_id={node_id})",
+                detail=f"Custom model not found. (custom_model_id={custom_model_id})",
             )
         provider = (custom.get("provider") or "OpenAI").strip() or "OpenAI"
         model = (custom.get("base_model") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
         system_prefix = (custom.get("system_prefix") or "").strip()
         if system_prefix:
             prompt_text = system_prefix + "\n\n" + prompt_text
-    else:
-        provider = (data.get("provider") or "OpenAI").strip() or "OpenAI"
-        model = (data.get("modelName") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
+        return None, provider, model, prompt_text
+
+    # Path 3: direct provider + modelName (backwards-compatible)
+    provider = (data.get("provider") or "OpenAI").strip() or "OpenAI"
+    model = (data.get("modelName") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
+    return None, provider, model, prompt_text
+
+
+def _execute_model_node(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
+    data = node.get("data") or {}
+    target, provider, model, prompt_text = _resolve_model_target(data, org_id, prompt_text)
+
     provider_lower = provider.lower()
     payload = _PromptPayload(org_id=org_id, provider=provider_lower, model=model, prompt=prompt_text, prompt_id=f"workflow-{node_id}")
 
-    router = _ROUTER_MAP.get(provider_lower)
-    if not router:
-        raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
-
     start = time.perf_counter()
-    # call_with_resilience adds retry (exponential backoff on 429/5xx/timeouts)
-    # and per-attempt timeout (120s default). Non-retryable errors (400/401/403/404)
-    # are raised immediately without retry.
-    result = call_with_resilience(
-        lambda: router.handle_prompt(payload),
-        context_label=f"{provider_lower}/{model} (node {node_id})",
-    )
+
+    if target and target.target_type == "openai_compatible_endpoint":
+        # Route through openai_router with target (base_url + auth injected inside)
+        result = call_with_resilience(
+            lambda: openai_router.handle_prompt(payload, target=target),
+            context_label=f"custom-endpoint/{model} (node {node_id})",
+        )
+    else:
+        # Standard provider routing (covers both registered provider_model and legacy paths)
+        router = _ROUTER_MAP.get(provider_lower)
+        if not router:
+            raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+        # call_with_resilience adds retry (exponential backoff on 429/5xx/timeouts)
+        # and per-attempt timeout (120s default). Non-retryable errors (400/401/403/404)
+        # are raised immediately without retry.
+        result = call_with_resilience(
+            lambda: router.handle_prompt(payload),
+            context_label=f"{provider_lower}/{model} (node {node_id})",
+        )
 
     latency_ms = int((time.perf_counter() - start) * 1000)
     out_text = result.get("response") or result.get("output") or ""
-    return {
+
+    # Provider latency: populated by instrumented routers (openai_router first)
+    provider_latency_ms = result.get("provider_latency_ms")  # int | None
+    gateway_overhead_ms = None
+    if provider_latency_ms is not None:
+        gateway_overhead_ms = max(latency_ms - provider_latency_ms, 0)
+
+    out = {
         "output": out_text,
         "latency_ms": latency_ms,
         "tokens": result.get("output_tokens") or result.get("total_tokens") or 0,
@@ -136,7 +268,18 @@ def _execute_model_node(node_id: str, node: dict, prompt_text: str, org_id: str)
         "cost": float(result.get("cost_usd") or 0),
         "model": model,
         "provider": provider,
+        "provider_latency_ms": provider_latency_ms,
+        "gateway_overhead_ms": gateway_overhead_ms,
     }
+    # Observability: add target provenance when resolved from model_registry
+    if target:
+        out["target_type"] = target.target_type
+        out["model_registry_id"] = target.model_registry_id
+        if target.endpoint_id:
+            out["endpoint_id"] = target.endpoint_id
+        if target.base_url:
+            out["resolved_base_url"] = target.base_url
+    return out
 
 
 def _execute_model_node_safe(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
@@ -147,8 +290,12 @@ def _execute_model_node_safe(node_id: str, node: dict, prompt_text: str, org_id:
     rather than silently lost.
     """
     data = node.get("data") or {}
-    provider = (data.get("provider") or "OpenAI").strip() or "OpenAI"
-    model = (data.get("modelName") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
+    # Pre-resolve for error-path metadata (provider/model may come from registry)
+    try:
+        _, provider, model, _ = _resolve_model_target(data, org_id, "")
+    except Exception:
+        provider = (data.get("provider") or "OpenAI").strip() or "OpenAI"
+        model = (data.get("modelName") or "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
     start = time.perf_counter()
     try:
         return _execute_model_node(node_id, node, prompt_text, org_id)
@@ -649,9 +796,21 @@ def execute_workflow(
                 sys_instructions = _apply_variables(sys_instructions, variables)
                 prompt_text = sys_instructions + "\n\n" + prompt_text
             model_node = {"id": node_id, "type": "model", "data": {**data, "modelName": data.get("modelName") or "gpt-3.5-turbo", "provider": data.get("provider") or "OpenAI"}}
+            _t0_ai_step = time.perf_counter()
             try:
                 result = _execute_model_node(node_id, model_node, prompt_text, org_id)
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_ai_step) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="ai-step",
+                    target_type=None, provider_label=(data.get("provider") or "unknown").strip().lower(),
+                    model_name=data.get("modelName"), endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(
                         status_code=404,
@@ -664,7 +823,7 @@ def execute_workflow(
             total_latency += result["latency_ms"]
             out_tok = result.get("tokens") or 0
             in_tok = result.get("input_tokens") or 0
-            node_results.append({
+            nr_entry = {
                 "node_id": node_id,
                 "type": "ai-step",
                 "latency_ms": result["latency_ms"],
@@ -675,16 +834,49 @@ def execute_workflow(
                 "cost": result["cost"],
                 "cost_usd": result["cost"],
                 "model": result.get("model"),
+                "provider": result.get("provider"),
                 "output": (result.get("output") or "")[:200] + ("..." if len(result.get("output") or "") > 200 else ""),
                 "prompt_after_interpolation": prompt_text[:2000] + ("..." if len(prompt_text) > 2000 else ""),
-            })
+            }
+            # Append model target observability fields if present
+            for _k in ("target_type", "model_registry_id", "endpoint_id", "resolved_base_url"):
+                if result.get(_k):
+                    nr_entry[_k] = result[_k]
+            node_results.append(nr_entry)
+            # Internal latency instrumentation (best-effort, never raises)
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="ai-step",
+                target_type=result.get("target_type"), provider_label=(result.get("provider") or "unknown").lower(),
+                model_name=result.get("model"), endpoint_id=result.get("endpoint_id"),
+                resolved_base_url=result.get("resolved_base_url"),
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=result["latency_ms"],
+                provider_latency_ms=result.get("provider_latency_ms"),
+                gateway_overhead_ms=result.get("gateway_overhead_ms"),
+                input_tokens=in_tok or None, output_tokens=out_tok or None,
+                success=True,
+            )
         elif node_type == "model":
             prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
             if conversation_prefix:
                 prev = conversation_prefix + prev
+            _t0_model = time.perf_counter()
             try:
                 result = _execute_model_node(node_id, node, prev, org_id)
             except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_model) * 1000)
+                _m_data = node.get("data") or {}
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="model",
+                    target_type=None, provider_label=(_m_data.get("provider") or "unknown").strip().lower(),
+                    model_name=_m_data.get("modelName"), endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
                 if e.status_code == 404 or "API key" in (e.detail or ""):
                     raise HTTPException(
                         status_code=404,
@@ -697,7 +889,7 @@ def execute_workflow(
             total_latency += result["latency_ms"]
             out_tok = result.get("tokens") or 0
             in_tok = result.get("input_tokens") or 0
-            node_results.append({
+            nr_entry = {
                 "node_id": node_id,
                 "type": "model",
                 "latency_ms": result["latency_ms"],
@@ -708,8 +900,26 @@ def execute_workflow(
                 "cost": result["cost"],
                 "cost_usd": result["cost"],
                 "model": result.get("model"),
+                "provider": result.get("provider"),
                 "output": (result.get("output") or "")[:200] + ("..." if len(result.get("output") or "") > 200 else ""),
-            })
+            }
+            for _k in ("target_type", "model_registry_id", "endpoint_id", "resolved_base_url"):
+                if result.get(_k):
+                    nr_entry[_k] = result[_k]
+            node_results.append(nr_entry)
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="model",
+                target_type=result.get("target_type"), provider_label=(result.get("provider") or "unknown").lower(),
+                model_name=result.get("model"), endpoint_id=result.get("endpoint_id"),
+                resolved_base_url=result.get("resolved_base_url"),
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=result["latency_ms"],
+                provider_latency_ms=result.get("provider_latency_ms"),
+                gateway_overhead_ms=result.get("gateway_overhead_ms"),
+                input_tokens=in_tok or None, output_tokens=out_tok or None,
+                success=True,
+            )
         elif node_type == "vision_step":
             prompt = _apply_variables(str(data.get("prompt") or "Describe this image."), variables)
             image_source = (data.get("image_source") or data.get("imageSource") or "input").strip()
@@ -758,7 +968,7 @@ def execute_workflow(
             last_content_type = "text"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
-            node_results.append({"node_id": node_id, "type": "vision_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (out_text or "")[:200], "content_type": "text"})
+            node_results.append({"node_id": node_id, "type": "vision_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (out_text or "")[:200], "content_type": "text", "model": model, "provider": provider})
         elif node_type == "image_gen_step":
             prompt_source = (data.get("prompt_source") or data.get("promptSource") or "static").strip().lower()
             if prompt_source == "previous_step" and from_node_id:
@@ -811,7 +1021,7 @@ def execute_workflow(
             total_latency += result["latency_ms"]
             node_results.append({
                 "node_id": node_id, "type": "image_gen_step", "latency_ms": result["latency_ms"], "cost": result["cost"],
-                "output": (result["output"] or "")[:200], "content_type": "image_url",
+                "output": (result["output"] or "")[:200], "content_type": "image_url", "model": model, "provider": provider,
             })
         elif node_type == "tts_step":
             text_source = (data.get("text_source") or data.get("textSource") or data.get("input_source") or "previous_step").strip().lower()
@@ -850,7 +1060,7 @@ def execute_workflow(
             last_content_type = "audio_url"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
-            node_results.append({"node_id": node_id, "type": "tts_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": "[audio]", "content_type": "audio_url"})
+            node_results.append({"node_id": node_id, "type": "tts_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": "[audio]", "content_type": "audio_url", "model": model, "provider": provider})
         elif node_type == "stt_step":
             audio_var = str(data.get("audio_variable") or "audio_file").strip()
             audio_input = variables.get(audio_var)
@@ -893,7 +1103,7 @@ def execute_workflow(
             last_content_type = "text"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
-            node_results.append({"node_id": node_id, "type": "stt_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (result["output"] or "")[:200], "content_type": "text"})
+            node_results.append({"node_id": node_id, "type": "stt_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (result["output"] or "")[:200], "content_type": "text", "model": model, "provider": provider})
         elif node_type == "embedding_step":
             text_source = (data.get("text_source") or data.get("textSource") or "previous_step").strip().lower()
             if text_source == "previous_step" and from_node_id:
@@ -931,7 +1141,7 @@ def execute_workflow(
             last_content_type = "embedding"
             total_cost += result["cost"]
             total_latency += result["latency_ms"]
-            node_results.append({"node_id": node_id, "type": "embedding_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": f"[{len(emb_result.get('embedding') or [])}d]", "content_type": "embedding"})
+            node_results.append({"node_id": node_id, "type": "embedding_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": f"[{len(emb_result.get('embedding') or [])}d]", "content_type": "embedding", "model": model, "provider": provider})
         elif node_type == "optimizer":
             prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
             prompt = (data.get("prompt") or data.get("taskDescription") or "Respond to the user.").strip()
@@ -1007,6 +1217,21 @@ def execute_workflow(
                     "priority": priority,
                     "candidates_evaluated": candidates_evaluated,
                 })
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="optimizer",
+                    target_type=result.get("target_type"), provider_label=selected_provider.lower(),
+                    model_name=selected_model, endpoint_id=result.get("endpoint_id"),
+                    resolved_base_url=result.get("resolved_base_url"),
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=result["latency_ms"],
+                    provider_latency_ms=result.get("provider_latency_ms"),
+                    gateway_overhead_ms=result.get("gateway_overhead_ms"),
+                    input_tokens=None, output_tokens=None,
+                    success=False,
+                    error_type=_classify_error(None, result.get("error_detail")),
+                    http_status=result.get("error_status"),
+                )
                 # Still persist the run with the error node_results so history captures the failure
                 if workflow_id:
                     try:
@@ -1066,6 +1291,19 @@ def execute_workflow(
                 "priority": priority,
                 "candidates_evaluated": candidates_evaluated,
             })
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="optimizer",
+                target_type=result.get("target_type"), provider_label=selected_provider.lower(),
+                model_name=selected_model, endpoint_id=result.get("endpoint_id"),
+                resolved_base_url=result.get("resolved_base_url"),
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=result["latency_ms"],
+                provider_latency_ms=result.get("provider_latency_ms"),
+                gateway_overhead_ms=result.get("gateway_overhead_ms"),
+                input_tokens=in_tok or None, output_tokens=out_tok or None,
+                success=True,
+            )
         elif node_type == "condition":
             prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
             operator = (data.get("operator") or "contains").lower()
@@ -1198,8 +1436,7 @@ def execute_workflow(
                     if first and first.get("id") is not None:
                         out["run_id"] = str(first["id"])
                 except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).warning("workflow_runs insert failed: %s", e, exc_info=True)
+                    _logger.warning("workflow_runs insert failed: %s", e, exc_info=True)
             return out
 
         out_edges = edges_out.get(node_id) or []

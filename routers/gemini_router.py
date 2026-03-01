@@ -172,7 +172,10 @@ def handle_prompt(payload: PromptPayload):
 
     try:
         # 3. Generate content
+        _t0_provider = time.perf_counter()
         response = model.generate_content(payload.prompt)
+        _provider_latency_ms = int((time.perf_counter() - _t0_provider) * 1000)
+
         reply = response.text
 
         # 4. Get token usage (may be None depending on model/version)
@@ -204,7 +207,8 @@ def handle_prompt(payload: PromptPayload):
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cost_usd": cost_usd
+            "cost_usd": cost_usd,
+            "provider_latency_ms": _provider_latency_ms,
         }
 
     except Exception as e:

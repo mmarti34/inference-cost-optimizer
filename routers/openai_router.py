@@ -79,10 +79,23 @@ class VisionPayload(BaseModel):
     prompt_id: str
 
 
-def _get_openai_client(org_id: str) -> OpenAI:
+def _get_openai_client(org_id: str, *, base_url: str | None = None, api_key_override: str | None = None, default_headers: dict[str, str] | None = None) -> OpenAI:
+    """
+    Create an OpenAI client.
+
+    For standard provider usage, only org_id is needed (key fetched from cache).
+    For custom endpoints (openai_compatible_endpoint), pass base_url +
+    api_key_override + optional default_headers to point at a different server.
+    """
     from api_key_cache import get_provider_api_key
-    api_key = get_provider_api_key(org_id, "openai")
-    return OpenAI(api_key=api_key)
+
+    api_key = api_key_override or get_provider_api_key(org_id, "openai")
+    kwargs: dict = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if default_headers:
+        kwargs["default_headers"] = default_headers
+    return OpenAI(**kwargs)
 
 
 def handle_image_generation(payload: ImageGenerationPayload) -> dict:
@@ -229,14 +242,67 @@ def handle_vision(payload: VisionPayload) -> dict:
     return {"response": reply, "output": reply, "input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
 
-def handle_prompt(payload: PromptPayload):
-    from api_key_cache import get_provider_api_key
-    api_key = get_provider_api_key(payload.org_id, payload.provider)
+def handle_prompt(payload: PromptPayload, *, target=None):
+    """
+    Unified prompt handler.  Works for both:
+      1. Standard provider calls  (target is None) — uses api_key_cache as before.
+      2. Custom endpoint calls    (target is a ModelTarget with base_url/auth) — uses
+         the OpenAI SDK pointed at the custom server.
 
+    The ``target`` parameter is optional so every existing call site that does
+    ``openai_router.handle_prompt(payload)`` keeps working unchanged.
+
+    Header merge precedence (highest wins):
+      1. SDK-required headers (Content-Type, etc.)
+      2. Endpoint default_headers from custom_endpoints table
+      3. Auth header (either SDK api_key or custom header)
+    We never send duplicate Authorization headers.
+    """
+    from api_key_cache import get_provider_api_key
+
+    # ── Build client kwargs ──────────────────────────────────────────────
+    is_custom = target is not None and target.base_url is not None
+    client_kwargs: dict = {}
+
+    if is_custom:
+        client_kwargs["base_url"] = target.base_url
+
+        # Merge endpoint default_headers first (lower precedence)
+        extra_headers: dict[str, str] = dict(target.default_headers or {})
+
+        auth_name = target.auth_header_name or "Authorization"
+        auth_value = target.auth_header_value or ""
+
+        if auth_name == "Authorization":
+            # Auth goes through SDK's api_key parameter.
+            # "Bearer " prefix is stripped because the SDK adds its own.
+            raw_key = auth_value
+            if raw_key.lower().startswith("bearer "):
+                raw_key = raw_key[7:]
+            client_kwargs["api_key"] = raw_key
+            # Ensure we don't ALSO send Authorization via default_headers
+            extra_headers.pop("Authorization", None)
+            extra_headers.pop("authorization", None)
+        else:
+            # Custom header (e.g. X-Api-Key).
+            # SDK still requires a non-empty api_key; use a placeholder.
+            client_kwargs["api_key"] = "custom-endpoint-placeholder"
+            extra_headers[auth_name] = auth_value
+            # Remove any accidental Authorization in default_headers
+            extra_headers.pop("Authorization", None)
+            extra_headers.pop("authorization", None)
+
+        if extra_headers:
+            client_kwargs["default_headers"] = extra_headers
+    else:
+        client_kwargs["api_key"] = get_provider_api_key(payload.org_id, payload.provider)
+
+    # ── Create client & call ─────────────────────────────────────────────
     try:
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(**client_kwargs)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize OpenAI client: {e}")
+        label = f"custom endpoint ({target.base_url})" if is_custom else "OpenAI"
+        raise HTTPException(status_code=500, detail=f"Failed to initialize {label} client: {e}")
 
     messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -244,24 +310,44 @@ def handle_prompt(payload: PromptPayload):
     ]
 
     try:
+        # ── Provider latency: measure only the outbound SDK request ───────
+        _t0_provider = time.perf_counter()
         completion = client.chat.completions.create(
             model=payload.model,
             messages=messages
         )
+        _provider_latency_ms = int((time.perf_counter() - _t0_provider) * 1000)
+
         reply = completion.choices[0].message.content
-        input_tokens = getattr(completion.usage, "prompt_tokens", 0)
-        output_tokens = getattr(completion.usage, "completion_tokens", 0)
+        usage = getattr(completion, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
         total_tokens = input_tokens + output_tokens
 
-        pricing = get_pricing("openai", payload.model)
+        # Pricing: best-effort fallback for custom endpoints
+        try:
+            pricing = get_pricing("openai", payload.model)
+        except Exception:
+            pricing = {"input": 0, "output": 0}
         cost_usd = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1000
+
+        # Log provider label — "custom:<host>" for custom endpoints so dashboards distinguish
+        if is_custom:
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(target.base_url).hostname or target.base_url
+            except Exception:
+                host = target.base_url
+            provider_label = f"custom:{host}"
+        else:
+            provider_label = "OpenAI"
 
         log_usage(
             payload.org_id,
-            "OpenAI",
+            provider_label,
             payload.model,
-            payload.prompt,
-            reply,
+            payload.prompt[:200],
+            (reply or "")[:200],
             payload.prompt_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -275,8 +361,10 @@ def handle_prompt(payload: PromptPayload):
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "cost_usd": cost_usd
+            "cost_usd": cost_usd,
+            "provider_latency_ms": _provider_latency_ms,
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
+        label = f"custom endpoint ({target.base_url})" if is_custom else "OpenAI"
+        raise HTTPException(status_code=500, detail=f"{label} call failed: {e}")
