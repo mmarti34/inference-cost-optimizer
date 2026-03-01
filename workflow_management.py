@@ -989,12 +989,21 @@ async def get_workflow_observability_summary(org_id: str):
     by_slug: dict[str, dict] = {}
     version_dist_map: dict[tuple[str, int | None], int] = {}
 
+    total_errors = 0
     for r in rows:
         slug = (r.get("endpoint_slug") or "").strip() or "_draft"
         if slug not in by_slug:
-            by_slug[slug] = {"request_count": 0, "total_cost": 0.0, "latency_sum": 0, "latency_count": 0}
+            by_slug[slug] = {"request_count": 0, "total_cost": 0.0, "latency_sum": 0, "latency_count": 0, "error_count": 0}
         by_slug[slug]["request_count"] += 1
         by_slug[slug]["total_cost"] += float(r.get("total_cost") or 0)
+        # Check if any node_result has an error (status=="error" or error==True)
+        _nr_list = r.get("node_results") or []
+        if isinstance(_nr_list, list) and any(
+            (isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error")))
+            for nr in _nr_list
+        ):
+            by_slug[slug]["error_count"] += 1
+            total_errors += 1
         lat = r.get("total_latency_ms")
         if lat is not None:
             by_slug[slug]["latency_sum"] += int(lat)
@@ -1030,12 +1039,17 @@ async def get_workflow_observability_summary(org_id: str):
         {"endpoint_slug": k, "avg_latency_ms": round(v["latency_sum"] / v["latency_count"], 0) if v["latency_count"] else None}
         for k, v in by_slug.items()
     ]
+    error_count_by_endpoint = [{"endpoint_slug": k, "error_count": v["error_count"]} for k, v in by_slug.items()]
+    total_requests = total_production + total_draft
     return {
         "total_production_requests": total_production,
         "total_draft_requests": total_draft,
+        "total_error_count": total_errors,
+        "error_rate": round(total_errors / total_requests * 100, 2) if total_requests > 0 else 0,
         "cost_by_endpoint_slug": cost_by_endpoint,
         "request_count_by_endpoint_slug": request_count_by_endpoint,
         "avg_latency_by_endpoint_slug": avg_latency_by_endpoint,
+        "error_count_by_endpoint_slug": error_count_by_endpoint,
         "version_distribution": version_dist,
         "latest_promoted_per_endpoint": latest_promoted_per_endpoint,
         "current_minute_count_by_slug": current_minute_by_slug,

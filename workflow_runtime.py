@@ -743,7 +743,14 @@ def execute_workflow(
     queue: list[tuple[str, str | None]] = [(nid, None) for nid in entry_points]
     variables = variables or {}
 
-    while queue:
+    # Track what's currently executing so we can record it in error node_results
+    _cur_node_id: str = ""
+    _cur_node_type: str = ""
+    _cur_provider: str = ""
+    _cur_model: str = ""
+
+    try:
+     while queue:
         node_id, from_node_id = queue.pop(0)
         if node_id in context:
             continue
@@ -754,6 +761,12 @@ def execute_workflow(
 
         node_type = (node.get("type") or "").lower()
         data = node.get("data") or {}
+
+        # Update tracking for error recording
+        _cur_node_id = node_id
+        _cur_node_type = node_type
+        _cur_provider = (data.get("provider") or "").strip()
+        _cur_model = (data.get("modelName") or data.get("model") or "").strip()
 
         if from_node_id is not None:
             executed_edges.add((from_node_id, node_id))
@@ -1232,31 +1245,8 @@ def execute_workflow(
                     error_type=_classify_error(None, result.get("error_detail")),
                     http_status=result.get("error_status"),
                 )
-                # Still persist the run with the error node_results so history captures the failure
-                if workflow_id:
-                    try:
-                        _row = {
-                            "workflow_id": workflow_id,
-                            "org_id": org_id,
-                            "user_id": user_id or None,
-                            "input_text": (input_text[:5000] if input_text else None),
-                            "final_output": None,
-                            "node_results": node_results,
-                            "total_cost": round(total_cost, 6),
-                            "total_latency_ms": total_latency + result["latency_ms"],
-                            "endpoint_slug": endpoint_slug,
-                            "version": version,
-                            "execution_mode": (execution_mode or "draft").strip() or "draft",
-                        }
-                        if experiment_id is not None:
-                            _row["experiment_id"] = experiment_id
-                        if variant_name is not None:
-                            _row["variant_name"] = variant_name
-                        if served_version is not None:
-                            _row["served_version"] = served_version
-                        supabase.table("workflow_runs").insert(_row).execute()
-                    except Exception:
-                        pass  # best-effort — don't mask the real error
+                # Run persistence is now handled by the top-level except handler
+                # around the while loop — no need to duplicate it here.
 
                 error_status = result.get("error_status", 500)
                 error_detail = result.get("error_detail", "Provider call failed")
@@ -1445,4 +1435,62 @@ def execute_workflow(
             if tid:
                 queue.append((tid, node_id))
 
-    raise HTTPException(status_code=400, detail="Workflow did not reach an output node")
+     raise HTTPException(status_code=400, detail="Workflow did not reach an output node")
+    except HTTPException as _exec_err:
+        # ── Persist failed runs so they appear in error-rate calculations ──
+        # Without this, failed model/ai-step/vision/tts/stt/embedding runs
+        # simply vanish — the workflow_run is never inserted and the error
+        # is invisible to observability, experiments, and rollback monitoring.
+        _err_detail = getattr(_exec_err, "detail", str(_exec_err))
+        _err_status = getattr(_exec_err, "status_code", 500)
+        # Only append an error entry if the failing node didn't already add one
+        # (the optimizer node appends its own detailed error entry before raising).
+        _already_recorded = (
+            node_results
+            and node_results[-1].get("status") == "error"
+            and node_results[-1].get("node_id") == _cur_node_id
+        )
+        if not _already_recorded:
+            node_results.append({
+                "node_id": _cur_node_id or "unknown",
+                "type": _cur_node_type or "unknown",
+                "latency_ms": 0,
+                "tokens": 0,
+                "cost": 0,
+                "cost_usd": 0,
+                "output": "",
+                "model": _cur_model or None,
+                "provider": _cur_provider or None,
+                "error": True,
+                "status": "error",
+                "error_detail": str(_err_detail)[:500],
+                "error_status": _err_status,
+            })
+        if workflow_id:
+            try:
+                _mode = (execution_mode or "draft").strip() or "draft"
+                if _mode not in ("draft", "production", "eval"):
+                    _mode = "draft"
+                _fail_row: dict[str, Any] = {
+                    "workflow_id": workflow_id,
+                    "org_id": org_id,
+                    "user_id": user_id or None,
+                    "input_text": (input_text[:5000] if input_text else None),
+                    "final_output": None,
+                    "node_results": node_results,
+                    "total_cost": round(total_cost, 6),
+                    "total_latency_ms": total_latency,
+                    "endpoint_slug": endpoint_slug if endpoint_slug else None,
+                    "version": version,
+                    "execution_mode": _mode,
+                }
+                if experiment_id is not None:
+                    _fail_row["experiment_id"] = experiment_id
+                if variant_name is not None:
+                    _fail_row["variant_name"] = variant_name
+                if served_version is not None:
+                    _fail_row["served_version"] = served_version
+                supabase.table("workflow_runs").insert(_fail_row).execute()
+            except Exception:
+                _logger.debug("workflow_runs insert (error path) failed", exc_info=True)
+        raise
