@@ -59,3 +59,18 @@ CREATE INDEX IF NOT EXISTS idx_rlf_workflow_ts       ON routing_latency_facts (w
 CREATE INDEX IF NOT EXISTS idx_rlf_model_ts          ON routing_latency_facts (model_name, ts);
 
 COMMENT ON TABLE routing_latency_facts IS 'Internal-only latency instrumentation. One row per model/ai-step node execution. Not exposed via API.';
+
+-- ── RLS: backend inserts via service_role (bypasses RLS), but disable it
+-- entirely for this internal-only table to avoid any policy surprises.
+ALTER TABLE routing_latency_facts DISABLE ROW LEVEL SECURITY;
+
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- DIAGNOSTIC: run this after deploying to verify inserts are working.
+-- ════════════════════════════════════════════════════════════════════════════
+-- SELECT count(*) AS total_rows,
+--        count(gateway_overhead_ms) AS rows_with_overhead,
+--        count(provider_latency_ms) AS rows_with_provider_latency,
+--        min(ts) AS earliest,
+--        max(ts) AS latest
+-- FROM routing_latency_facts;

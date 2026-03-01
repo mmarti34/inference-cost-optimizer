@@ -59,6 +59,9 @@ def _record_latency_fact(
     http_status: int | None = None,
 ) -> None:
     """Insert a row into routing_latency_facts. Best-effort; never raises."""
+    if supabase is None:
+        _logger.warning("routing_latency_facts: skipped — supabase client is None")
+        return
     try:
         row: dict[str, Any] = {
             "org_id": org_id,
@@ -83,9 +86,22 @@ def _record_latency_fact(
             "error_type": error_type,
             "http_status": http_status,
         }
+        # Strip None-valued keys so PostgREST uses column defaults (e.g. gen_random_uuid())
+        row = {k: v for k, v in row.items() if v is not None}
+        _logger.info(
+            "routing_latency_facts: inserting node_type=%s provider=%s model=%s total=%dms provider=%s overhead=%s success=%s",
+            node_type, provider_label, model_name, total_latency_ms,
+            f"{provider_latency_ms}ms" if provider_latency_ms is not None else "n/a",
+            f"{gateway_overhead_ms}ms" if gateway_overhead_ms is not None else "n/a",
+            success,
+        )
         supabase.table("routing_latency_facts").insert(row).execute()
-    except Exception:
-        _logger.debug("routing_latency_facts insert failed", exc_info=True)
+        _logger.info("routing_latency_facts: insert OK")
+    except Exception as exc:
+        _logger.warning(
+            "routing_latency_facts: INSERT FAILED — %s: %s (node_type=%s, provider=%s, model=%s)",
+            type(exc).__name__, str(exc)[:500], node_type, provider_label, model_name,
+        )
 
 
 def _classify_error(exc: Exception | None, detail: str | None = None) -> str | None:
