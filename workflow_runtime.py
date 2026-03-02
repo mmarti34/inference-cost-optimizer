@@ -272,6 +272,22 @@ def _execute_model_node(node_id: str, node: dict, prompt_text: str, org_id: str)
     latency_ms = int((time.perf_counter() - start) * 1000)
     out_text = result.get("response") or result.get("output") or ""
 
+    # ── Output quality validation ──────────────────────────────────
+    # Detect empty, refusal, or truncated outputs and flag them so
+    # they surface in error-rate calculations and the trace viewer.
+    _output_warning: str | None = None
+    _stripped = (out_text or "").strip()
+    if not _stripped:
+        _output_warning = "empty_output"
+    elif len(_stripped) < 4 and not any(c.isalnum() for c in _stripped):
+        # Pure punctuation / whitespace-like responses (e.g. "..." or "—")
+        _output_warning = "empty_output"
+    elif _stripped.lower().startswith(("i'm sorry", "i cannot", "i can't", "as an ai")):
+        _output_warning = "refusal"
+    # Check for provider-level error signals that didn't raise an exception
+    if result.get("status") == "error" or result.get("error"):
+        _output_warning = _output_warning or "provider_error"
+
     # Provider latency: populated by instrumented routers (openai_router first)
     provider_latency_ms = result.get("provider_latency_ms")  # int | None
     gateway_overhead_ms = None
@@ -289,6 +305,8 @@ def _execute_model_node(node_id: str, node: dict, prompt_text: str, org_id: str)
         "provider_latency_ms": provider_latency_ms,
         "gateway_overhead_ms": gateway_overhead_ms,
     }
+    if _output_warning:
+        out["output_warning"] = _output_warning
     # Observability: add target provenance when resolved from model_registry
     if target:
         out["target_type"] = target.target_type
@@ -873,6 +891,10 @@ def execute_workflow(
             for _k in ("target_type", "model_registry_id", "endpoint_id", "resolved_base_url"):
                 if result.get(_k):
                     nr_entry[_k] = result[_k]
+            # Output quality: propagate warning as soft error
+            if result.get("output_warning"):
+                nr_entry["output_warning"] = result["output_warning"]
+                nr_entry["status"] = "warning"
             node_results.append(nr_entry)
             # Internal latency instrumentation (best-effort, never raises)
             _record_latency_fact(
@@ -937,6 +959,10 @@ def execute_workflow(
             for _k in ("target_type", "model_registry_id", "endpoint_id", "resolved_base_url"):
                 if result.get(_k):
                     nr_entry[_k] = result[_k]
+            # Output quality: propagate warning as soft error
+            if result.get("output_warning"):
+                nr_entry["output_warning"] = result["output_warning"]
+                nr_entry["status"] = "warning"
             node_results.append(nr_entry)
             _record_latency_fact(
                 org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
@@ -1009,6 +1035,13 @@ def execute_workflow(
             _prov_vision_ms = v_result.get("provider_latency_ms") or v_result.get("latency_ms")
             _oh_vision_ms = max(_total_vision_ms - _prov_vision_ms, 0) if _prov_vision_ms is not None else None
             out_text = v_result.get("response") or v_result.get("output") or ""
+            # Output quality check for vision
+            _v_warning: str | None = None
+            _v_stripped = (out_text or "").strip()
+            if not _v_stripped:
+                _v_warning = "empty_output"
+            elif _v_stripped.lower().startswith(("i'm sorry", "i cannot", "i can't", "as an ai")):
+                _v_warning = "refusal"
             result = {"output": out_text, "content_type": "text", "cost": v_result.get("cost_usd") or 0.0, "latency_ms": _total_vision_ms}
             context[node_id] = {"output": result["output"], "content_type": "text"}
             last_content_type = "text"
@@ -1016,7 +1049,11 @@ def execute_workflow(
             total_latency += result["latency_ms"]
             _v_in_tok = v_result.get("input_tokens") or None
             _v_out_tok = v_result.get("output_tokens") or None
-            node_results.append({"node_id": node_id, "type": "vision_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (out_text or "")[:200], "content_type": "text", "model": model, "provider": provider})
+            _v_nr = {"node_id": node_id, "type": "vision_step", "latency_ms": result["latency_ms"], "cost": result["cost"], "output": (out_text or "")[:200], "content_type": "text", "model": model, "provider": provider}
+            if _v_warning:
+                _v_nr["output_warning"] = _v_warning
+                _v_nr["status"] = "warning"
+            node_results.append(_v_nr)
             _record_latency_fact(
                 org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
                 node_id=node_id, node_type="vision_step",

@@ -18,6 +18,27 @@ from routing.resolver import get_promoted_deployment_by_version, get_latest_prom
 router = APIRouter()
 
 
+def _nr_has_error(nr: Any) -> bool:
+    """Return True if a node_result entry indicates an error or output quality warning.
+
+    Centralised check used by all observability / experiment / rollback queries.
+    Covers:
+      - explicit errors:  status == "error"  or  error == True
+      - output quality:   status == "warning"  (empty output, refusal, provider_error)
+      - output_warning:   output_warning field is non-empty
+    """
+    if not isinstance(nr, dict):
+        return False
+    _st = nr.get("status")
+    if _st == "error" or _st == "warning":
+        return True
+    if nr.get("error"):
+        return True
+    if nr.get("output_warning"):
+        return True
+    return False
+
+
 def _sse_line(data: Any) -> str:
     """One SSE data line (JSON) plus newline. Send two newlines after for event boundary."""
     payload = json.dumps(data) if not isinstance(data, str) else data
@@ -988,8 +1009,7 @@ async def get_workflow_observability_summary(org_id: str):
     _error_runs = [
         r for r in rows
         if isinstance(r.get("node_results"), list) and any(
-            isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error"))
-            for nr in r["node_results"]
+            _nr_has_error(nr) for nr in r["node_results"]
         )
     ]
     if _error_runs:
@@ -1011,12 +1031,9 @@ async def get_workflow_observability_summary(org_id: str):
             by_slug[slug] = {"request_count": 0, "total_cost": 0.0, "latency_sum": 0, "latency_count": 0, "error_count": 0}
         by_slug[slug]["request_count"] += 1
         by_slug[slug]["total_cost"] += float(r.get("total_cost") or 0)
-        # Check if any node_result has an error (status=="error" or error==True)
+        # Check if any node_result has an error or output quality warning
         _nr_list = r.get("node_results") or []
-        if isinstance(_nr_list, list) and any(
-            (isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error")))
-            for nr in _nr_list
-        ):
+        if isinstance(_nr_list, list) and any(_nr_has_error(nr) for nr in _nr_list):
             by_slug[slug]["error_count"] += 1
             total_errors += 1
         lat = r.get("total_latency_ms")
@@ -2075,10 +2092,7 @@ async def get_metrics_by_version(
                 by_version[key] = {"requests": 0, "errors": 0, "latencies": [], "costs": []}
             by_version[key]["requests"] += 1
             node_results = r.get("node_results") or []
-            has_error = any(
-                (isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error")))
-                for nr in node_results
-            )
+            has_error = any(_nr_has_error(nr) for nr in node_results)
             if has_error:
                 by_version[key]["errors"] += 1
             lat = r.get("total_latency_ms")
@@ -2255,8 +2269,7 @@ def _compute_experiment_results(
     for name, variant_runs in by_variant.items():
         n = len(variant_runs)
         errors = sum(1 for r in variant_runs if any(
-            (isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error")))
-            for nr in (r.get("node_results") or [])
+            _nr_has_error(nr) for nr in (r.get("node_results") or [])
         ))
         latencies = [r["total_latency_ms"] for r in variant_runs if r.get("total_latency_ms") is not None]
         costs = [float(r["total_cost"]) for r in variant_runs if r.get("total_cost") is not None]
@@ -3021,8 +3034,7 @@ async def get_experiment_timeseries(
                 if n == 0:
                     return {"requests": 0, "error_rate": 0, "avg_latency_ms": 0, "avg_cost": 0}
                 errs = sum(1 for r in run_list if any(
-                    (isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error")))
-                    for nr in (r.get("node_results") or [])
+                    _nr_has_error(nr) for nr in (r.get("node_results") or [])
                 ))
                 lats = [r["total_latency_ms"] for r in run_list if r.get("total_latency_ms") is not None]
                 costs = [float(r["total_cost"]) for r in run_list if r.get("total_cost") is not None]
@@ -3495,10 +3507,7 @@ def _get_metrics_for_version_in_window_sync(
     costs = []
     for r in filtered:
         node_results = r.get("node_results") or []
-        if any(
-            (isinstance(nr, dict) and (nr.get("status") == "error" or nr.get("error")))
-            for nr in node_results
-        ):
+        if any(_nr_has_error(nr) for nr in node_results):
             errors += 1
         lat = r.get("total_latency_ms")
         if lat is not None:

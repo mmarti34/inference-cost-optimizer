@@ -179,6 +179,16 @@ async def public_execute(
         "workflow_run_id": None,
     }
 
+    # Track workflow context so error handlers can persist failed runs.
+    # These are set after deployment resolution; remain None for early errors.
+    _wf_id: str | None = None
+    _dep_slug: str | None = None
+    _dep_version: int | None = None
+    _resolved_version: int | None = None
+    _experiment_id: str | None = None
+    _variant_name: str | None = None
+    _execution_started = False  # True once execute_workflow() is called (it handles its own persistence)
+
     try:
         if not org_slug or not org_slug.strip():
             raise HTTPException(status_code=400, detail="Invalid org slug.")
@@ -227,6 +237,14 @@ async def public_execute(
         workflow_id = deployment.get("workflow_id")
         dep_version = deployment.get("version")
         dep_slug = (deployment.get("endpoint_slug") or "").strip() or slug_clean
+
+        # Capture for error-handler persistence
+        _wf_id = workflow_id
+        _dep_slug = dep_slug
+        _dep_version = dep_version
+        _resolved_version = resolved_version
+        _experiment_id = str(experiment_id) if experiment_id else None
+        _variant_name = variant_name
 
         # 6. Rate limit
         check_and_increment_usage(ctx.org_id, dep_slug, ctx.rate_limit_per_minute)
@@ -310,6 +328,7 @@ async def public_execute(
         # 9. Execute (non-streaming)
         # Run synchronous workflow in a thread so we don't block the event loop
         # (provider calls can take seconds; blocking would stall all other requests).
+        _execution_started = True
         result = await asyncio.to_thread(
             execute_workflow,
             graph_json,
@@ -372,11 +391,71 @@ async def public_execute(
                 log_entry["error_type"] = "rate_limit"
             else:
                 log_entry["error_type"] = "execution"
+        # ── Persist failed workflow_run so error appears in observability ──
+        # Only if we resolved the workflow (have _wf_id) and the error is not
+        # an auth/routing issue (those aren't workflow execution failures).
+        _err_status = e.status_code
+        if _wf_id and not _execution_started and _err_status not in (401, 403, 404, 429):
+            try:
+                _err_detail_str = (e.detail if isinstance(e.detail, str) else str(e.detail or ""))[:500]
+                supabase.table("workflow_runs").insert({
+                    "workflow_id": _wf_id,
+                    "org_id": log_entry.get("org_id"),
+                    "user_id": None,
+                    "input_text": ((body.input_text or "")[:5000] if body.input_text else None),
+                    "final_output": None,
+                    "node_results": [{
+                        "node_id": "pre_execution",
+                        "type": "gateway",
+                        "latency_ms": int((time.time() - request_start) * 1000),
+                        "tokens": 0, "cost": 0, "cost_usd": 0,
+                        "output": "",
+                        "error": True,
+                        "status": "error",
+                        "error_detail": _err_detail_str,
+                        "error_status": _err_status,
+                    }],
+                    "total_cost": 0,
+                    "total_latency_ms": int((time.time() - request_start) * 1000),
+                    "endpoint_slug": _dep_slug,
+                    "version": _dep_version,
+                    "execution_mode": "production",
+                }).execute()
+            except Exception:
+                pass  # best-effort; api_request_log is the primary record
         raise
     except Exception as e:
         log_entry["http_status"] = 500
         log_entry["error_type"] = "execution"
         log_entry["error_message"] = str(e)[:500]
+        # ── Persist failed workflow_run for non-HTTP errors too ──
+        if _wf_id and not _execution_started:
+            try:
+                supabase.table("workflow_runs").insert({
+                    "workflow_id": _wf_id,
+                    "org_id": log_entry.get("org_id"),
+                    "user_id": None,
+                    "input_text": ((body.input_text or "")[:5000] if body.input_text else None),
+                    "final_output": None,
+                    "node_results": [{
+                        "node_id": "pre_execution",
+                        "type": "gateway",
+                        "latency_ms": int((time.time() - request_start) * 1000),
+                        "tokens": 0, "cost": 0, "cost_usd": 0,
+                        "output": "",
+                        "error": True,
+                        "status": "error",
+                        "error_detail": str(e)[:500],
+                        "error_status": 500,
+                    }],
+                    "total_cost": 0,
+                    "total_latency_ms": int((time.time() - request_start) * 1000),
+                    "endpoint_slug": _dep_slug,
+                    "version": _dep_version,
+                    "execution_mode": "production",
+                }).execute()
+            except Exception:
+                pass  # best-effort
         raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         # Streaming requests handle their own logging in _streaming_wrapper.
