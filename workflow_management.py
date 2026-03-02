@@ -988,13 +988,16 @@ def _current_minute_count_by_slug(org_id: str) -> list[dict]:
 async def get_workflow_observability_summary(org_id: str):
     """
     Summary: total production/draft requests, cost and request count by endpoint_slug,
-    avg latency by endpoint_slug, version distribution, current_minute_count per slug. Explicit columns only.
+    avg latency by endpoint_slug, version distribution, current_minute_count per slug.
+    Scoped to the last 7 days so the numbers match the "Production health (7d)" UI label.
     """
     try:
+        _since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
         result = (
             supabase.table("workflow_runs")
             .select(_run_cols)
             .eq("org_id", org_id)
+            .gte("created_at", _since)
             .order("created_at", desc=True)
             .limit(5000)
             .execute()
@@ -1019,13 +1022,19 @@ async def get_workflow_observability_summary(org_id: str):
             [r.get("id") for r in _error_runs[:10]],
         )
 
-    total_production = sum(1 for r in rows if (r.get("execution_mode") or "").strip() == "production")
-    total_draft = sum(1 for r in rows if (r.get("execution_mode") or "").strip() != "production")
+    total_production = 0
+    total_draft = 0
     by_slug: dict[str, dict] = {}
     version_dist_map: dict[tuple[str, int | None], int] = {}
 
-    total_errors = 0
+    total_errors = 0          # errors across all runs (draft + production)
+    total_production_errors = 0  # errors in production runs only
     for r in rows:
+        _is_prod = (r.get("execution_mode") or "").strip() == "production"
+        if _is_prod:
+            total_production += 1
+        else:
+            total_draft += 1
         slug = (r.get("endpoint_slug") or "").strip() or "_draft"
         if slug not in by_slug:
             by_slug[slug] = {"request_count": 0, "total_cost": 0.0, "latency_sum": 0, "latency_count": 0, "error_count": 0}
@@ -1033,14 +1042,17 @@ async def get_workflow_observability_summary(org_id: str):
         by_slug[slug]["total_cost"] += float(r.get("total_cost") or 0)
         # Check if any node_result has an error or output quality warning
         _nr_list = r.get("node_results") or []
-        if isinstance(_nr_list, list) and any(_nr_has_error(nr) for nr in _nr_list):
+        _run_has_error = isinstance(_nr_list, list) and any(_nr_has_error(nr) for nr in _nr_list)
+        if _run_has_error:
             by_slug[slug]["error_count"] += 1
             total_errors += 1
+            if _is_prod:
+                total_production_errors += 1
         lat = r.get("total_latency_ms")
         if lat is not None:
             by_slug[slug]["latency_sum"] += int(lat)
             by_slug[slug]["latency_count"] += 1
-        if (r.get("execution_mode") or "").strip() == "production":
+        if _is_prod:
             ver = r.get("version")
             key = (slug, ver)
             version_dist_map[key] = version_dist_map.get(key, 0) + 1
@@ -1072,12 +1084,13 @@ async def get_workflow_observability_summary(org_id: str):
         for k, v in by_slug.items()
     ]
     error_count_by_endpoint = [{"endpoint_slug": k, "error_count": v["error_count"]} for k, v in by_slug.items()]
-    total_requests = total_production + total_draft
     return {
         "total_production_requests": total_production,
         "total_draft_requests": total_draft,
         "total_error_count": total_errors,
-        "error_rate": round(total_errors / total_requests * 100, 2) if total_requests > 0 else 0,
+        "production_error_count": total_production_errors,
+        # error_rate = production errors / production requests (matches "Production health 7d" UI)
+        "error_rate": round(total_production_errors / total_production * 100, 2) if total_production > 0 else 0,
         "cost_by_endpoint_slug": cost_by_endpoint,
         "request_count_by_endpoint_slug": request_count_by_endpoint,
         "avg_latency_by_endpoint_slug": avg_latency_by_endpoint,
