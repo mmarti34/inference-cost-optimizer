@@ -663,12 +663,13 @@ async def promote_deployment_override(deployment_id: str, payload: PromoteOverri
 async def list_workflow_runs(org_id: str, limit: int = 50):
     """List recent workflow runs for an organization (for Logs / observability)."""
     try:
+        cap = max(1, min(limit, 2000))
         result = (
             supabase.table("workflow_runs")
             .select("id, workflow_id, org_id, user_id, input_text, final_output, node_results, total_cost, total_latency_ms, endpoint_slug, version, execution_mode, created_at")
             .eq("org_id", org_id)
             .order("created_at", desc=True)
-            .limit(max(1, min(limit, 200)))
+            .limit(cap)
             .execute()
         )
         return result.data or []
