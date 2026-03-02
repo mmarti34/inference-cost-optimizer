@@ -11,6 +11,7 @@ from utils.encryption import (
     hash_service_api_key,
     verify_service_api_key,
 )
+import os
 import secrets
 import logging
 from utils.pricing import get_pricing, suggest_model
@@ -90,13 +91,19 @@ def startup_validate():
 # Observability middleware (adds request_id and trace_id)
 app.add_middleware(ObservabilityMiddleware)
 
-# CORS setup
-_ALLOWED_ORIGINS = [
+# CORS setup — must include frontend origin (optiml.one) or browser blocks API calls
+_default_origins = [
     "https://optiml.one",
     "https://www.optiml.one",
-    "http://localhost:3000",       # local dev
-    "http://localhost:3001",       # local dev alt
+    "http://localhost:3000",
+    "http://localhost:3001",
 ]
+_ALLOWED_ORIGINS = os.environ.get("OPTIML_CORS_ORIGINS", "").strip()
+if _ALLOWED_ORIGINS:
+    _ALLOWED_ORIGINS = [o.strip() for o in _ALLOWED_ORIGINS.split(",") if o.strip()]
+else:
+    _ALLOWED_ORIGINS = _default_origins
+logger.info("CORS allow_origins: %s", _ALLOWED_ORIGINS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,6 +111,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Mount routers
