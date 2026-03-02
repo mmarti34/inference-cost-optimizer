@@ -20,6 +20,7 @@ from typing import Optional
 from supabase_client import supabase
 from api_key_validation import validate_api_key
 from rate_limiting import check_and_increment_usage
+from plan_enforcement import check_monthly_request_limit, increment_monthly_usage
 from workflow_runtime import execute_workflow, validate_workflow_variables
 from workflow_streaming import stream_workflow_async
 from conversation_service import (
@@ -246,8 +247,12 @@ async def public_execute(
         _experiment_id = str(experiment_id) if experiment_id else None
         _variant_name = variant_name
 
-        # 6. Rate limit
+        # 6. Rate limit (per-minute)
         check_and_increment_usage(ctx.org_id, dep_slug, ctx.rate_limit_per_minute)
+
+        # 6b. Monthly request limit (plan enforcement)
+        check_monthly_request_limit(ctx.org_id)
+        increment_monthly_usage(ctx.org_id)
 
         # 7. Validate variables
         variables = body.variables if isinstance(body.variables, dict) else None

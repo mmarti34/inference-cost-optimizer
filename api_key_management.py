@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from supabase_client import supabase
 from utils.encryption import encrypt_api_key
+from plan_enforcement import check_server_key_limit
 import uuid
 
 router = APIRouter()
@@ -185,6 +186,9 @@ async def get_service_api_keys(org_id: str):
 async def create_service_api_key(api_key_data: ServiceAPIKeyCreate):
     """Create a new service API key"""
     try:
+        # Plan enforcement: check server key limit before creating
+        check_server_key_limit(api_key_data.org_id)
+
         # Generate UUID for the service API key
         key_id = str(uuid.uuid4())
         

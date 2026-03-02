@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Any
 from datetime import datetime, timezone, timedelta
 from supabase_client import supabase
+from plan_enforcement import check_workflow_limit
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,9 @@ async def get_project_workflows(org_id: str, project_id: str):
 async def create_workflow(payload: WorkflowCreate):
     """Create a new workflow. Uses project_id if provided; otherwise uses or creates default project for org."""
     try:
+        # Plan enforcement: check workflow limit before creating
+        check_workflow_limit(payload.org_id)
+
         project_id = payload.project_id
         if not project_id:
             projs = supabase.table("projects").select("id").eq("org_id", payload.org_id).limit(1).execute()

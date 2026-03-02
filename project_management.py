@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from supabase_client import supabase
+from plan_enforcement import check_project_limit
 
 router = APIRouter()
 
@@ -33,6 +34,9 @@ class ProjectResponse(BaseModel):
 async def create_project(project_data: ProjectCreate):
     """Create a new project"""
     try:
+        # Plan enforcement: check project limit before creating
+        check_project_limit(project_data.org_id)
+
         # Generate UUID for the project
         project_id = str(uuid.uuid4())
         
