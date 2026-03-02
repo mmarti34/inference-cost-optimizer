@@ -1636,7 +1636,85 @@ def execute_workflow(
                     _fail_row["variant_name"] = variant_name
                 if served_version is not None:
                     _fail_row["served_version"] = served_version
+                _logger.info(
+                    "workflow_runs INSERT (error path): workflow_id=%s endpoint_slug=%s mode=%s node_results_count=%d error_node=%s",
+                    workflow_id, endpoint_slug, _mode, len(node_results), _cur_node_id,
+                )
                 supabase.table("workflow_runs").insert(_fail_row).execute()
-            except Exception:
-                _logger.debug("workflow_runs insert (error path) failed", exc_info=True)
+                _logger.info("workflow_runs INSERT (error path): OK")
+            except Exception as _ins_err:
+                _logger.warning(
+                    "workflow_runs INSERT (error path) FAILED — %s: %s  (workflow_id=%s, endpoint_slug=%s)",
+                    type(_ins_err).__name__, str(_ins_err)[:500], workflow_id, endpoint_slug,
+                    exc_info=True,
+                )
         raise
+    except Exception as _generic_err:
+        # ── Catch non-HTTP errors (TypeError, KeyError, ConnectionError, etc.) ──
+        # These bypass the HTTPException handler above, so without this block
+        # the workflow_run is never persisted and the error is invisible to
+        # observability dashboards.
+        _err_detail_generic = str(_generic_err)[:500]
+        _logger.warning(
+            "execute_workflow: non-HTTP error caught (%s): %s — persisting as failed run",
+            type(_generic_err).__name__, _err_detail_generic,
+        )
+        _already_recorded_g = (
+            node_results
+            and node_results[-1].get("status") == "error"
+            and node_results[-1].get("node_id") == _cur_node_id
+        )
+        if not _already_recorded_g:
+            node_results.append({
+                "node_id": _cur_node_id or "unknown",
+                "type": _cur_node_type or "unknown",
+                "latency_ms": 0,
+                "tokens": 0,
+                "cost": 0,
+                "cost_usd": 0,
+                "output": "",
+                "model": _cur_model or None,
+                "provider": _cur_provider or None,
+                "error": True,
+                "status": "error",
+                "error_detail": _err_detail_generic,
+                "error_status": 500,
+            })
+        if workflow_id:
+            try:
+                _mode_g = (execution_mode or "draft").strip() or "draft"
+                if _mode_g not in ("draft", "production", "eval"):
+                    _mode_g = "draft"
+                _fail_row_g: dict[str, Any] = {
+                    "workflow_id": workflow_id,
+                    "org_id": org_id,
+                    "user_id": user_id or None,
+                    "input_text": (input_text[:5000] if input_text else None),
+                    "final_output": None,
+                    "node_results": node_results,
+                    "total_cost": round(total_cost, 6),
+                    "total_latency_ms": total_latency,
+                    "endpoint_slug": endpoint_slug if endpoint_slug else None,
+                    "version": version,
+                    "execution_mode": _mode_g,
+                }
+                if experiment_id is not None:
+                    _fail_row_g["experiment_id"] = experiment_id
+                if variant_name is not None:
+                    _fail_row_g["variant_name"] = variant_name
+                if served_version is not None:
+                    _fail_row_g["served_version"] = served_version
+                _logger.info(
+                    "workflow_runs INSERT (generic-error path): workflow_id=%s endpoint_slug=%s error=%s",
+                    workflow_id, endpoint_slug, type(_generic_err).__name__,
+                )
+                supabase.table("workflow_runs").insert(_fail_row_g).execute()
+                _logger.info("workflow_runs INSERT (generic-error path): OK")
+            except Exception as _ins_err2:
+                _logger.warning(
+                    "workflow_runs INSERT (generic-error path) FAILED — %s: %s",
+                    type(_ins_err2).__name__, str(_ins_err2)[:500],
+                    exc_info=True,
+                )
+        # Re-raise as HTTPException so callers get a proper HTTP error response
+        raise HTTPException(status_code=500, detail=_err_detail_generic) from _generic_err
