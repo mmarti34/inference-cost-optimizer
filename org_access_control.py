@@ -96,7 +96,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
             upgrade_msg = get_upgrade_suggestion(effective_plan)
             raise HTTPException(status_code=403, detail=f"Your plan ({effective_plan}) only allows {admin_limit} admin position(s).{upgrade_msg}")
         
-        # 4. Create org (organizations don't have plans - billing is per user). Set slug deterministically.
+        # 4. Create org — inherit the admin's subscription tier as the org plan.
         print("Creating new organization...")
         slug_base = _slugify_org_name(org_name)
         slug = slug_base
@@ -108,6 +108,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
                     "created_by": user_id,
                     "type": "Organization",
                     "slug": slug,
+                    "plan": effective_plan,
                 }).execute()
                 break
             except Exception as e:
@@ -407,16 +408,12 @@ def get_user_accessible_organizations(user_id: str):
             if (hasattr(membership, "organizations") and membership.organizations) or (isinstance(membership, dict) and "organizations" in membership and membership["organizations"]):
                 org = membership.organizations if hasattr(membership, "organizations") else membership["organizations"]
                 org_plan = get_org_plan(org)
-                user_role = membership.get("role", "member") if isinstance(membership, dict) else getattr(membership, "role", "member")                
-                # Check if user can access this org based on their plan
+                user_role = membership.get("role", "member") if isinstance(membership, dict) else getattr(membership, "role", "member")
+                # Existing members always have access to orgs they belong to.
+                # Plan limits only gate *creating/joining* new orgs, not accessing existing ones.
+                # This matches check_organization_access() which also grants access to existing members.
+                can_access = True
                 access_message = "Access granted"
-                
-                # Free users cannot be admins of any organization (except their personal workspace)
-                if user_role == "admin" and user_plan == "free" and org.get("type", "Organization") != "Personal":
-                    can_access = False
-                    access_message = f"Access denied. Your {user_plan} plan doesn't allow admin roles in organizations. You can only access your personal workspace."
-                else:
-                    can_access = check_org_access_permission(user_plan, org_plan, org.get("type", "Organization"))
                 
                 org_data = {
                     "id": org["id"],

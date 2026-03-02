@@ -10,6 +10,38 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 router = APIRouter()
 
+# Price ID → tier mapping (must match STRIPE_PRODUCTS in frontend lib/stripe.ts)
+# When users switch plans via the Stripe Customer Portal, Stripe does NOT update
+# the subscription metadata — only the price changes. So we must resolve the tier
+# from the price ID, not from metadata (which is stale after plan switches).
+PRICE_TO_TIER = {
+    "price_1T6eNiPsb79p0xBWvsNR5v4X": "startup",
+    "price_1T6ePNPsb79p0xBWrw9e6tD0": "team",
+}
+
+
+def _resolve_tier_from_subscription(subscription: dict) -> str | None:
+    """Resolve the plan tier from the subscription's current price ID.
+
+    The price ID is the authoritative source because Stripe updates it on plan
+    switches but leaves metadata unchanged. Falls back to metadata only if the
+    price ID is not recognized (e.g. a new price created in Stripe Dashboard
+    that hasn't been added to PRICE_TO_TIER yet).
+    """
+    try:
+        items = subscription.get("items", {}).get("data", [])
+        if items:
+            price_id = items[0].get("price", {}).get("id")
+            if price_id and price_id in PRICE_TO_TIER:
+                return PRICE_TO_TIER[price_id]
+            if price_id:
+                logger.warning("Unknown price_id=%s in subscription %s — falling back to metadata",
+                               price_id, subscription.get("id"))
+    except (KeyError, IndexError, TypeError):
+        pass
+    # Fallback to metadata (works for first checkout before any plan switch)
+    return subscription.get("metadata", {}).get("tier")
+
 
 def _propagate_tier_to_orgs(user_id: str, tier: str):
     """When a user's subscription tier changes, update the plan on any org where they are admin."""
@@ -69,19 +101,25 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
             tier = session['metadata'].get('tier')
             
             if user_id and tier:
-                result = supabase.table("user_profiles").update({
+                update_data = {
                     "subscription_tier": tier,
                     "subscription_status": "active",
                     "stripe_subscription_id": session.get("subscription"),
-                }).eq("user_id", user_id).execute()
+                }
+                # Save stripe_customer_id from the checkout session
+                customer_id = session.get("customer")
+                if customer_id:
+                    update_data["stripe_customer_id"] = customer_id
+                result = supabase.table("user_profiles").update(update_data).eq("user_id", user_id).execute()
                 _propagate_tier_to_orgs(user_id, tier)
-                logger.info("Stripe checkout.session.completed event_id=%s user_id=%s tier=%s updated=%s", event_id, user_id, tier, bool(result.data))
+                logger.info("Stripe checkout.session.completed event_id=%s user_id=%s tier=%s customer=%s updated=%s", event_id, user_id, tier, customer_id, bool(result.data))
         
         elif event['type'] in ['customer.subscription.created', 'customer.subscription.updated']:
             subscription = event['data']['object']
             user_id = subscription['metadata'].get('user_id')
-            tier = subscription['metadata'].get('tier')
-            
+            # Resolve tier from price ID (authoritative) instead of metadata (stale after plan switches)
+            tier = _resolve_tier_from_subscription(subscription)
+
             if user_id and tier:
                 status = subscription['status']
                 current_period_start = subscription['current_period_start']
@@ -121,7 +159,10 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         elif event['type'] == 'customer.subscription.deleted':
             subscription = event['data']['object']
             user_id = subscription['metadata'].get('user_id')
-            
+            # On deletion we always go to free, but log what tier was resolved for debugging
+            deleted_tier = _resolve_tier_from_subscription(subscription)
+            logger.info("Subscription deletion: resolved tier was %s", deleted_tier)
+
             if user_id:
                 # Downgrade to free plan and clear subscription data
                 result = supabase.table("user_profiles").update({
