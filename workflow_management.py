@@ -659,6 +659,77 @@ async def promote_deployment_override(deployment_id: str, payload: PromoteOverri
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ActivateDeploymentPayload(BaseModel):
+    rolled_back_from_version: Optional[int] = None
+
+    class Config:
+        extra = "ignore"
+
+
+@router.post("/workflow-deployments/{deployment_id}/activate")
+async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPayload):
+    """Re-activate an existing deployment as the live version (rollback without creating a new version).
+
+    Sets the target deployment to status=promoted and demotes any other promoted
+    deployment on the same endpoint so only one version is live at a time.
+    """
+    try:
+        # Fetch the target deployment
+        fetch = supabase.table("workflow_deployments").select("*").eq("id", deployment_id).execute()
+        if not fetch.data or len(fetch.data) == 0:
+            raise HTTPException(status_code=404, detail="Deployment not found")
+        target = fetch.data[0]
+        org_id = str(target.get("org_id", ""))
+        endpoint_slug = (target.get("endpoint_slug") or "").strip()
+
+        # Demote all other promoted deployments on the same endpoint
+        if org_id and endpoint_slug:
+            supabase.table("workflow_deployments").update({
+                "status": "rolled_back",
+            }).eq("org_id", org_id).eq("endpoint_slug", endpoint_slug).eq("status", "promoted").neq("id", deployment_id).execute()
+
+        # Promote the target
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        update_data: dict = {
+            "status": "promoted",
+            "promoted_at": now,
+        }
+        if payload.rolled_back_from_version is not None:
+            update_data["rolled_back_from_version"] = payload.rolled_back_from_version
+        result = supabase.table("workflow_deployments").update(update_data).eq("id", deployment_id).execute()
+        if not result.data or len(result.data) == 0:
+            raise HTTPException(status_code=404, detail="Deployment not found")
+        row = result.data[0]
+
+        # End any running experiments on this endpoint
+        if org_id and endpoint_slug:
+            await asyncio.to_thread(_end_experiments_on_endpoint_sync, org_id, endpoint_slug, "rollback")
+
+        return _deployment_row_to_response(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/workflow-deployments/{deployment_id}")
+async def delete_deployment(deployment_id: str):
+    """Delete a deployment version. Cannot delete the currently promoted (live) deployment."""
+    try:
+        fetch = supabase.table("workflow_deployments").select("id, status").eq("id", deployment_id).execute()
+        if not fetch.data or len(fetch.data) == 0:
+            raise HTTPException(status_code=404, detail="Deployment not found")
+        row = fetch.data[0]
+        if row.get("status") == "promoted":
+            raise HTTPException(status_code=400, detail="Cannot delete the currently live deployment. Rollback first.")
+        supabase.table("workflow_deployments").delete().eq("id", deployment_id).execute()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/workflow-runs")
 async def list_workflow_runs(org_id: str, limit: int = 50):
     """List recent workflow runs for an organization (for Logs / observability)."""
