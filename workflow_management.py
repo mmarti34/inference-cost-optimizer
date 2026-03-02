@@ -4,6 +4,7 @@ Do NOT select updated_at in responses if the column is removed from schema later
 """
 import asyncio
 import json
+import logging
 import math
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Any
 from datetime import datetime, timezone, timedelta
 from supabase_client import supabase
+
+logger = logging.getLogger(__name__)
 
 from workflow_runtime import execute_workflow
 from routing.resolver import get_promoted_deployment_by_version, get_latest_promoted_deployment
