@@ -2896,6 +2896,7 @@ async def create_auto_graded_metric(payload: AutoGradedMetricCreate):
         direction = (payload.direction or "higher_is_better").strip().lower()
         if direction not in ("higher_is_better", "lower_is_better"):
             direction = "higher_is_better"
+        grading_model = (payload.grading_model or "gpt-4o-mini").strip()
         row = {
             "org_id": payload.org_id,
             "name": name,
