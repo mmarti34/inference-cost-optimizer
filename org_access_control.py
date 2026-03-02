@@ -13,26 +13,27 @@ def _slugify_org_name(name: str) -> str:
     s = re.sub(r"[^a-z0-9-]", "", s).strip("-")
     return s or "org"
 
-# Plan limits - based on USER capabilities, not organization billing
+# Plan limits — must stay in sync with frontend lib/planLimits.ts
+# Tiers: free → startup ($49/mo) → team ($149/mo) → enterprise (custom)
 PLAN_LIMITS = {
-    "free": {"orgs": 0, "members": 1, "admins": 0},  # Free users cannot create orgs or be admins
-    "starter": {"orgs": 1, "members": 3, "admins": 1},
-    "team": {"orgs": 5, "members": 20, "admins": 5},
-    "pro": {"orgs": 99999, "members": 99999, "admins": 99999},
-    "enterprise": {"orgs": 99999, "members": 99999, "admins": 99999},
+    "free":       {"orgs": 0,  "members": 1,     "admins": 0,     "projects": 2,  "workflows": 5,   "server_keys": 1,  "requests_per_month": 1_000},
+    "startup":    {"orgs": 1,  "members": 5,     "admins": 1,     "projects": 10, "workflows": 25,  "server_keys": 5,  "requests_per_month": 50_000},
+    "team":       {"orgs": 5,  "members": 20,    "admins": 5,     "projects": -1, "workflows": -1,  "server_keys": 20, "requests_per_month": 500_000},
+    "enterprise": {"orgs": -1, "members": -1,    "admins": -1,    "projects": -1, "workflows": -1,  "server_keys": -1, "requests_per_month": -1},
 }
+# -1 = unlimited
 
 def get_org_plan(org):
     return org.get("plan", "free")
 
 def get_upgrade_suggestion(plan):
-    """Get upgrade suggestion based on current plan"""
+    """Get upgrade suggestion based on current plan."""
     if plan == "free":
-        return " Consider upgrading to Starter plan ($29/mo) for up to 3 team members."
-    elif plan == "starter":
-        return " Consider upgrading to Team plan ($99/mo) for up to 20 team members."
+        return " Upgrade to Startup ($49/mo) for 5 team members, 10 projects, and 50K API requests/mo."
+    elif plan == "startup":
+        return " Upgrade to Team ($149/mo) for unlimited projects, 20 team members, and 500K API requests/mo."
     elif plan == "team":
-        return " Consider upgrading to Pro plan ($299/mo) for unlimited team members."
+        return " Contact us about Enterprise for unlimited everything, SSO, and dedicated support."
     return ""
 
 @router.get("/api/organizations/test")
@@ -75,7 +76,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         print(f"User's actual plan: {user_actual_plan}")
         
         # Use the provided plan or user's actual plan, whichever is higher
-        plan_priority = {"free": 0, "starter": 1, "team": 2, "pro": 3, "enterprise": 4}
+        plan_priority = {"free": 0, "startup": 1, "team": 2, "enterprise": 3}
         effective_plan = max([plan, user_actual_plan], key=lambda p: plan_priority.get(p, 0))
         print(f"Effective plan for organization: {effective_plan}")
         
@@ -308,7 +309,7 @@ def check_org_access_permission(user_plan: str, org_plan: str, org_type: str = "
 
     # For Organization type, check if user's plan can access this org's plan
     # Plan priority (higher number = higher tier)
-    plan_priority = {"free": 0, "starter": 1, "team": 2, "pro": 3, "enterprise": 4}
+    plan_priority = {"free": 0, "startup": 1, "team": 2, "enterprise": 3}
     
     user_priority = plan_priority.get(user_plan, 0)
     org_priority = plan_priority.get(org_plan, 0)

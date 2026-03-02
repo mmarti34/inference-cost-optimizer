@@ -10,6 +10,28 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 router = APIRouter()
 
+
+def _propagate_tier_to_orgs(user_id: str, tier: str):
+    """When a user's subscription tier changes, update the plan on any org where they are admin."""
+    try:
+        admin_orgs = supabase.table("organization_members") \
+            .select("org_id") \
+            .eq("user_id", user_id) \
+            .eq("role", "admin") \
+            .eq("status", "active") \
+            .execute()
+        if admin_orgs.data:
+            for membership in admin_orgs.data:
+                supabase.table("organizations") \
+                    .update({"plan": tier}) \
+                    .eq("id", membership["org_id"]) \
+                    .execute()
+            logger.info("Propagated tier=%s to %d org(s) for user_id=%s", tier, len(admin_orgs.data), user_id)
+    except Exception as e:
+        # Non-critical — log but don't fail the webhook
+        logger.warning("Failed to propagate tier to orgs for user_id=%s: %s", user_id, e)
+
+
 @router.post("/stripe/webhook")
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     """
@@ -52,6 +74,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
                     "subscription_status": "active",
                     "stripe_subscription_id": session.get("subscription"),
                 }).eq("user_id", user_id).execute()
+                _propagate_tier_to_orgs(user_id, tier)
                 logger.info("Stripe checkout.session.completed event_id=%s user_id=%s tier=%s updated=%s", event_id, user_id, tier, bool(result.data))
         
         elif event['type'] in ['customer.subscription.created', 'customer.subscription.updated']:
@@ -92,6 +115,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
                     "cancel_at_period_end": cancel_at_period_end,
                     "trial_end": trial_end_iso
                 }).eq("user_id", user_id).execute()
+                _propagate_tier_to_orgs(user_id, tier)
                 logger.info("Stripe subscription updated event_id=%s user_id=%s tier=%s status=%s", event_id, user_id, tier, status)
         
         elif event['type'] == 'customer.subscription.deleted':
@@ -110,6 +134,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
                     "cancel_at_period_end": False,
                     "trial_end": None
                 }).eq("user_id", user_id).execute()
+                _propagate_tier_to_orgs(user_id, "free")
                 logger.info("Stripe subscription deleted event_id=%s user_id=%s", event_id, user_id)
         
         elif event['type'] == 'invoice.payment_failed':
