@@ -3380,8 +3380,14 @@ class RollbackRuleCreate(BaseModel):
     org_id: str
     endpoint_slug: str
     enabled: bool = True
-    conditions: List[dict]  # list of {metric, operator, threshold, window_minutes}
+    conditions: Optional[List[dict]] = None  # list of {metric, operator, threshold, window_minutes}
     action: str = "rollback"  # rollback | alert_only | pause_traffic
+    # New schema (single metric per rule): frontend sends these instead of conditions
+    metric: Optional[str] = None  # error_rate | p95_latency | latency_p95 | avg_cost | cost_per_request | quality_score
+    direction: Optional[str] = None  # above | below
+    threshold: Optional[float] = None
+    window_minutes: Optional[int] = None
+    min_requests: Optional[int] = None
 
     class Config:
         extra = "ignore"
@@ -3433,18 +3439,52 @@ async def get_rollback_rule(rule_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _build_rollback_conditions_from_payload(payload: RollbackRuleCreate) -> list:
+    """Build conditions list from new schema (metric, direction, threshold, window_minutes, min_requests)."""
+    # Map frontend metric names to backend condition metric names
+    metric_map = {
+        "error_rate": "error_rate",
+        "p95_latency": "latency_p95",
+        "latency_p95": "latency_p95",
+        "avg_cost": "cost_per_request",
+        "cost_per_request": "cost_per_request",
+        "quality_score": "quality_score",  # backend may not support yet; store for future
+    }
+    backend_metric = metric_map.get((payload.metric or "").strip(), payload.metric or "error_rate")
+    direction = (payload.direction or "above").strip().lower()
+    op = "lt" if direction == "below" else "gt"
+    window = max(1, min(60, payload.window_minutes or 60))
+    conditions = [
+        {"metric": backend_metric, "operator": op, "threshold": float(payload.threshold or 0), "window_minutes": window}
+    ]
+    if (payload.min_requests or 0) > 0:
+        # Require at least N requests before evaluating; stored as special marker for evaluator
+        conditions.append({"type": "min_sample", "threshold": int(payload.min_requests)})
+    return conditions
+
+
 @router.post("/rollback-rules")
 async def create_rollback_rule(payload: RollbackRuleCreate):
-    """Create a rollback rule."""
+    """Create a rollback rule. Accepts either conditions array or new schema (metric, direction, threshold, window_minutes, min_requests)."""
     try:
-        if not payload.conditions:
-            raise HTTPException(status_code=400, detail="At least one condition is required")
+        if payload.metric is not None and (payload.metric or "").strip():
+            conditions = _build_rollback_conditions_from_payload(payload)
+            action = (payload.action or "rollback").strip().lower()
+            if action == "alert":
+                action = "alert_only"
+            elif action == "pause":
+                action = "pause_traffic"
+        else:
+            if not payload.conditions:
+                raise HTTPException(status_code=400, detail="At least one condition is required, or provide metric/direction/threshold")
+            conditions = payload.conditions
+            action = payload.action or "rollback"
         data = {
             "org_id": payload.org_id,
             "endpoint_slug": payload.endpoint_slug.strip(),
             "enabled": payload.enabled,
-            "conditions": payload.conditions,
-            "action": payload.action or "rollback",
+            "conditions": conditions,
+            "action": action,
         }
         result = supabase.table("rollback_rules").insert(data).execute()
         if not result.data:
@@ -3553,6 +3593,11 @@ def _evaluate_rollback_conditions_sync(rule: dict) -> bool:
     conditions = rule.get("conditions") or []
     if not conditions:
         return False
+    # Min-sample requirements: require sample_size >= threshold before evaluating other conditions
+    min_sample_thresholds = [int(c.get("threshold", 0)) for c in conditions if c.get("type") == "min_sample"]
+    trigger_conditions = [c for c in conditions if c.get("type") != "min_sample"]
+    if not trigger_conditions:
+        return False
     # Current version to evaluate = latest promoted (the one we might roll back from)
     latest = (
         supabase.table("workflow_deployments")
@@ -3568,9 +3613,13 @@ def _evaluate_rollback_conditions_sync(rule: dict) -> bool:
         return False
     current_version = int(latest.data[0]["version"])
     # Use max window from conditions so we have one metric set
-    window_minutes = max((c.get("window_minutes") or 60 for c in conditions), default=60)
+    window_minutes = max((c.get("window_minutes") or 60 for c in trigger_conditions), default=60)
     metrics = _get_metrics_for_version_in_window_sync(org_id, endpoint_slug, current_version, window_minutes)
-    for c in conditions:
+    if min_sample_thresholds:
+        min_required = max(min_sample_thresholds)
+        if (metrics.get("sample_size") or 0) < min_required:
+            return False
+    for c in trigger_conditions:
         metric = (c.get("metric") or "").strip()
         op = (c.get("operator") or "gt").strip()
         threshold = float(c.get("threshold", 0))
@@ -3583,17 +3632,20 @@ def _evaluate_rollback_conditions_sync(rule: dict) -> bool:
             val = metrics["cost_per_request"]
         elif metric == "sample_size":
             val = metrics["sample_size"]
+        elif metric == "quality_score":
+            # TODO: add quality_score to _get_metrics_for_version_in_window_sync when available
+            continue
         else:
             continue
         breached = False
         if op == "gt":
-            breached = val > threshold
+            breached = (val or 0) > threshold
         elif op == "gte":
-            breached = val >= threshold
+            breached = (val or 0) >= threshold
         elif op == "lt":
-            breached = val < threshold
+            breached = (val or 0) < threshold
         elif op == "lte":
-            breached = val <= threshold
+            breached = (val or 0) <= threshold
         if breached:
             return True
     return False
