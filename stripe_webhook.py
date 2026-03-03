@@ -43,6 +43,27 @@ def _resolve_tier_from_subscription(subscription: dict) -> str | None:
     return subscription.get("metadata", {}).get("tier")
 
 
+def _lookup_user_id_by_customer(customer_id: str) -> str | None:
+    """Look up user_id from stripe_customer_id in user_profiles.
+
+    Fallback for when subscription metadata doesn't include user_id
+    (e.g. subscriptions created directly in Stripe Dashboard).
+    """
+    if not customer_id:
+        return None
+    try:
+        result = supabase.table("user_profiles") \
+            .select("user_id") \
+            .eq("stripe_customer_id", customer_id) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            return result.data[0]["user_id"]
+    except Exception as e:
+        logger.warning("Failed to look up user by customer_id=%s: %s", customer_id, e)
+    return None
+
+
 def _propagate_tier_to_orgs(user_id: str, tier: str):
     """When a user's subscription tier changes, update the plan on any org where they are admin."""
     try:
@@ -117,6 +138,12 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         elif event['type'] in ['customer.subscription.created', 'customer.subscription.updated']:
             subscription = event['data']['object']
             user_id = subscription['metadata'].get('user_id')
+            # Fallback: look up user_id from stripe_customer_id if metadata is missing
+            if not user_id:
+                customer_id = subscription.get('customer')
+                user_id = _lookup_user_id_by_customer(customer_id)
+                if user_id:
+                    logger.info("Resolved user_id=%s from customer_id=%s (metadata was empty)", user_id, customer_id)
             # Resolve tier from price ID (authoritative) instead of metadata (stale after plan switches)
             tier = _resolve_tier_from_subscription(subscription)
 
@@ -159,6 +186,8 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         elif event['type'] == 'customer.subscription.deleted':
             subscription = event['data']['object']
             user_id = subscription['metadata'].get('user_id')
+            if not user_id:
+                user_id = _lookup_user_id_by_customer(subscription.get('customer'))
             # On deletion we always go to free, but log what tier was resolved for debugging
             deleted_tier = _resolve_tier_from_subscription(subscription)
             logger.info("Subscription deletion: resolved tier was %s", deleted_tier)
@@ -181,32 +210,39 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         elif event['type'] == 'invoice.payment_failed':
             invoice = event['data']['object']
             subscription_id = invoice.get('subscription')
-            
+
             if subscription_id:
-                # Get subscription details
                 subscription = stripe.Subscription.retrieve(subscription_id)
                 user_id = subscription['metadata'].get('user_id')
-                
+                if not user_id:
+                    user_id = _lookup_user_id_by_customer(subscription.get('customer'))
+
                 if user_id:
                     result = supabase.table("user_profiles").update({
                         "subscription_status": "past_due"
                     }).eq("user_id", user_id).execute()
                     logger.info("Stripe invoice.payment_failed event_id=%s user_id=%s", event_id, user_id)
-        
+
         elif event['type'] == 'invoice.payment_succeeded':
             invoice = event['data']['object']
             subscription_id = invoice.get('subscription')
-            
+
             if subscription_id:
-                # Get subscription details
                 subscription = stripe.Subscription.retrieve(subscription_id)
                 user_id = subscription['metadata'].get('user_id')
-                
+                if not user_id:
+                    user_id = _lookup_user_id_by_customer(subscription.get('customer'))
+
                 if user_id:
-                    result = supabase.table("user_profiles").update({
-                        "subscription_status": "active"
-                    }).eq("user_id", user_id).execute()
-                    logger.info("Stripe invoice.payment_succeeded event_id=%s user_id=%s", event_id, user_id)
+                    # Resolve tier from the subscription's price (it may have changed)
+                    tier = _resolve_tier_from_subscription(subscription)
+                    update_data: dict = {"subscription_status": "active"}
+                    if tier:
+                        update_data["subscription_tier"] = tier
+                    result = supabase.table("user_profiles").update(update_data).eq("user_id", user_id).execute()
+                    if tier:
+                        _propagate_tier_to_orgs(user_id, tier)
+                    logger.info("Stripe invoice.payment_succeeded event_id=%s user_id=%s tier=%s", event_id, user_id, tier)
         
         else:
             logger.info("Stripe webhook unhandled type event_id=%s type=%s", event_id, event_type)
