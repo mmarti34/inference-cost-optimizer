@@ -53,14 +53,14 @@ def send_invite_email(
     html_body = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body style="margin:0;padding:0;background-color:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#0d1117;padding:48px 20px;">
+<body style="margin:0;padding:0;background-color:#f8f9fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f8f9fb;padding:48px 20px;">
     <tr><td align="center">
-      <!-- Main card — dark glass style matching landing page -->
-      <table width="480" cellpadding="0" cellspacing="0" style="background-color:#161b22;border-radius:20px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);box-shadow:0 4px 24px rgba(0,0,0,0.3),0 2px 6px rgba(0,0,0,0.15);">
+      <!-- Main card — light glass style matching landing page -->
+      <table width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:20px;overflow:hidden;border:1px solid rgba(0,0,0,0.06);box-shadow:0 4px 24px rgba(108,130,210,0.08),0 2px 6px rgba(0,0,0,0.04);">
         <!-- Logo -->
         <tr><td style="padding:36px 36px 8px;text-align:center;">
-          <img src="https://optiml.one/optimllogodark.png" alt="OptiML" height="36" style="display:block;margin:0 auto;">
+          <img src="https://optiml.one/optimlwhite.png" alt="OptiML" height="36" style="display:block;margin:0 auto;">
         </td></tr>
         <!-- Gradient accent line -->
         <tr><td style="padding:16px 36px 0;">
@@ -68,23 +68,23 @@ def send_invite_email(
         </td></tr>
         <!-- Content -->
         <tr><td style="padding:24px 36px 32px;">
-          <h1 style="margin:0 0 8px;font-size:22px;font-weight:500;color:#e6edf3;letter-spacing:-0.02em;">
+          <h1 style="margin:0 0 8px;font-size:22px;font-weight:500;color:#18181b;letter-spacing:-0.02em;">
             you've been invited to join {org_name}
           </h1>
-          <p style="margin:0 0 28px;font-size:14px;color:#8b949e;line-height:1.6;">
+          <p style="margin:0 0 28px;font-size:14px;color:#71717a;line-height:1.6;">
             {inviter_email} has invited you to collaborate on optiml. click below to accept and get started.
           </p>
           <a href="{accept_url}"
-             style="display:inline-block;background:linear-gradient(135deg,#6C8EEF,#7B9CF2);color:#ffffff;text-decoration:none;padding:12px 36px;border-radius:12px;font-size:14px;font-weight:500;letter-spacing:-0.01em;box-shadow:0 2px 12px rgba(108,142,239,0.3);">
+             style="display:inline-block;background:linear-gradient(135deg,#6C8EEF,#7B9CF2);color:#ffffff;text-decoration:none;padding:12px 36px;border-radius:12px;font-size:14px;font-weight:500;letter-spacing:-0.01em;box-shadow:0 2px 12px rgba(108,142,239,0.25);">
             accept invitation
           </a>
         </td></tr>
         <!-- Footer -->
-        <tr><td style="padding:20px 36px 28px;border-top:1px solid rgba(255,255,255,0.06);">
-          <p style="margin:0;font-size:12px;color:#6e7681;line-height:1.5;">
+        <tr><td style="padding:20px 36px 28px;border-top:1px solid rgba(0,0,0,0.06);">
+          <p style="margin:0;font-size:12px;color:#a1a1aa;line-height:1.5;">
             this invitation expires in 7 days. if you didn't expect this email, you can safely ignore it.
           </p>
-          <p style="margin:8px 0 0;font-size:11px;color:#6e7681;">
+          <p style="margin:8px 0 0;font-size:11px;color:#a1a1aa;">
             <a href="{accept_url}" style="color:#6C8EEF;word-break:break-all;text-decoration:none;">{accept_url}</a>
           </p>
         </td></tr>
@@ -92,7 +92,7 @@ def send_invite_email(
       <!-- Brand footer -->
       <table width="480" cellpadding="0" cellspacing="0">
         <tr><td style="padding:24px 36px 0;text-align:center;">
-          <p style="margin:0;font-size:11px;color:#484f58;letter-spacing:-0.01em;">
+          <p style="margin:0;font-size:11px;color:#a1a1aa;letter-spacing:-0.01em;">
             &copy; 2026 optiml. all rights reserved.
           </p>
         </td></tr>
