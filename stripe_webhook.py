@@ -1,6 +1,7 @@
 import stripe
 import os
 import logging
+from datetime import datetime, timezone
 from fastapi import APIRouter, Request, HTTPException, Header
 from supabase_client import supabase
 import json
@@ -18,6 +19,22 @@ PRICE_TO_TIER = {
     "price_1T6eNiPsb79p0xBWvsNR5v4X": "startup",
     "price_1T6ePNPsb79p0xBWrw9e6tD0": "team",
 }
+
+
+def _unix_to_iso(ts) -> str | None:
+    """Convert a Unix epoch timestamp (int/float) to an ISO 8601 UTC string.
+
+    Stripe sends timestamps as integer seconds since epoch (e.g. 1740614400).
+    Supabase TIMESTAMP WITH TIME ZONE columns need proper ISO format like
+    '2025-02-27T00:00:00+00:00', NOT '1740614400T00:00:00.000Z'.
+    Returns None if the input is None or invalid.
+    """
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+    except (ValueError, TypeError, OSError):
+        return None
 
 
 def _resolve_tier_from_subscription(subscription: dict) -> str | None:
@@ -106,9 +123,12 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
     except ValueError as e:
         logger.warning("Stripe webhook invalid payload: %s", type(e).__name__)
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
-        logger.warning("Stripe webhook invalid signature: %s", type(e).__name__)
-        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        # stripe.SignatureVerificationError (v6+) or stripe.error.SignatureVerificationError (v5)
+        if "SignatureVerification" in type(e).__name__:
+            logger.warning("Stripe webhook invalid signature: %s", type(e).__name__)
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        raise
 
     event_id = event.get("id", "")
     event_type = event.get("type", "")
@@ -155,30 +175,17 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
                 cancel_at_period_end = subscription.get('cancel_at_period_end', False)
                 trial_end = subscription.get('trial_end')
                 
-                # Convert timestamps to ISO strings
-                period_start_iso = None
-                period_end_iso = None
-                canceled_at_iso = None
-                trial_end_iso = None
-                
-                if current_period_start:
-                    period_start_iso = f"{current_period_start}T00:00:00.000Z"
-                if current_period_end:
-                    period_end_iso = f"{current_period_end}T00:00:00.000Z"
-                if canceled_at:
-                    canceled_at_iso = f"{canceled_at}T00:00:00.000Z"
-                if trial_end:
-                    trial_end_iso = f"{trial_end}T00:00:00.000Z"
-                
+                # Convert Unix timestamps to proper ISO 8601 strings
+                # Stripe sends epoch seconds (e.g. 1740614400), Supabase needs ISO format
                 result = supabase.table("user_profiles").update({
                     "subscription_tier": tier,
                     "subscription_status": status,
                     "stripe_subscription_id": subscription['id'],
-                    "current_period_start": period_start_iso,
-                    "current_period_end": period_end_iso,
-                    "canceled_at": canceled_at_iso,
+                    "current_period_start": _unix_to_iso(current_period_start),
+                    "current_period_end": _unix_to_iso(current_period_end),
+                    "canceled_at": _unix_to_iso(canceled_at),
                     "cancel_at_period_end": cancel_at_period_end,
-                    "trial_end": trial_end_iso
+                    "trial_end": _unix_to_iso(trial_end),
                 }).eq("user_id", user_id).execute()
                 _propagate_tier_to_orgs(user_id, tier)
                 logger.info("Stripe subscription updated event_id=%s user_id=%s tier=%s status=%s", event_id, user_id, tier, status)
@@ -200,7 +207,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
                     "stripe_subscription_id": None,
                     "current_period_start": None,
                     "current_period_end": None,
-                    "canceled_at": f"{subscription['canceled_at']}T00:00:00.000Z" if subscription.get('canceled_at') else None,
+                    "canceled_at": _unix_to_iso(subscription.get('canceled_at')),
                     "cancel_at_period_end": False,
                     "trial_end": None
                 }).eq("user_id", user_id).execute()

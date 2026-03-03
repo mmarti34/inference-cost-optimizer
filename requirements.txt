@@ -12,5 +12,5 @@ python-dotenv
 pydantic
 cryptography
 pycryptodome
-stripe
+stripe>=7.0.0,<10.0.0
 psycopg2-binary
