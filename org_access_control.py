@@ -1,6 +1,12 @@
 import re
-from fastapi import APIRouter, HTTPException, Body
+import uuid
+import logging
+from datetime import datetime, timezone
+from fastapi import APIRouter, HTTPException, Body, Query
 from supabase_client import supabase
+from email_service import send_invite_email
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -154,53 +160,298 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/invite")
-def invite_member(org_id: str = Body(...), email: str = Body(...)):
+def invite_member(org_id: str = Body(...), email: str = Body(...), user_id: str = Body(...)):
+    """Invite a member to an organization. Generates a token and sends an email."""
     try:
-        print(f"Inviting member to org {org_id}: {email}")
-        
-        # 1. Fetch org and plan
-        org = supabase.table("organizations").select("id, name, type, plan, created_by, logo, created_at").eq("id", org_id).single().execute().data
+        logger.info("Inviting %s to org %s by user %s", email, org_id, user_id)
+
+        # 1. Fetch org
+        org = supabase.table("organizations").select("id, name, type, plan").eq("id", org_id).single().execute().data
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found.")
-        
+
+        # Block invites to Personal workspaces
+        if org.get("type") == "Personal":
+            raise HTTPException(status_code=400, detail="Cannot invite members to a personal workspace. Create an organization first.")
+
         plan = get_org_plan(org)
-        print(f"Organization plan: {plan}")
-        
-        # 2. Count current active members in this org
-        members = supabase.table("organization_members").select("id, org_id, user_id, role, status, invited_email, created_at").eq("org_id", org_id).eq("status", "active").execute().data
-        current_member_count = len(members) if members else 0
-        print(f"Current member count: {current_member_count}")
-        
-        # 3. Check member limit for this org's plan
+
+        # 2. Count active + invited members (both count toward limit)
+        members_result = supabase.table("organization_members") \
+            .select("id, status") \
+            .eq("org_id", org_id) \
+            .in_("status", ["active", "invited"]) \
+            .execute()
+        current_count = len(members_result.data) if members_result.data else 0
+
+        # 3. Check member limit
         member_limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["members"]
-        print(f"Member limit for {plan} plan: {member_limit}")
-        
-        if current_member_count >= member_limit:
+        if member_limit != -1 and current_count >= member_limit:
             upgrade_msg = get_upgrade_suggestion(plan)
             raise HTTPException(
-                status_code=403, 
-                detail=f"Member limit reached for your plan ({plan}). You can have up to {member_limit} members.{upgrade_msg}"
+                status_code=403,
+                detail=f"Member limit reached ({current_count}/{member_limit}) for the {plan} plan.{upgrade_msg}"
             )
-        
-        # 4. Check if email is already invited or a member
-        existing_invite = supabase.table("organization_members").select("id").eq("org_id", org_id).eq("invited_email", email).execute().data
-        if existing_invite:
-            raise HTTPException(status_code=400, detail="This email has already been invited or is already a member.")
-        
-        # 5. Add member invitation
+
+        # 4. Check for duplicate invite by email
+        existing = supabase.table("organization_members") \
+            .select("id, status") \
+            .eq("org_id", org_id) \
+            .eq("invited_email", email.lower().strip()) \
+            .execute().data
+        if existing:
+            status = existing[0].get("status")
+            if status == "active":
+                raise HTTPException(status_code=400, detail="This email is already a member.")
+            if status == "invited":
+                raise HTTPException(status_code=400, detail="This email has already been invited.")
+
+        # 5. Create organization_members row
         new_member = supabase.table("organization_members").insert({
-            "org_id": org_id, 
-            "invited_email": email, 
-            "status": "invited"
+            "org_id": org_id,
+            "invited_email": email.lower().strip(),
+            "status": "invited",
+            "role": "member",
         }).execute()
-        
-        print(f"Invitation sent successfully")
-        return new_member.data
-        
+
+        if not new_member.data:
+            raise HTTPException(status_code=500, detail="Failed to create invitation.")
+
+        member_row = new_member.data[0] if isinstance(new_member.data, list) else new_member.data
+
+        # 6. Generate invite token
+        invite_token = str(uuid.uuid4())
+        token_result = supabase.table("invite_tokens").insert({
+            "token": invite_token,
+            "org_id": org_id,
+            "invited_email": email.lower().strip(),
+            "invited_by": user_id,
+            "member_id": member_row["id"],
+            "status": "pending",
+        }).execute()
+
+        if not token_result.data:
+            supabase.table("organization_members").delete().eq("id", member_row["id"]).execute()
+            raise HTTPException(status_code=500, detail="Failed to generate invite token.")
+
+        # 7. Look up inviter's email for the email template
+        inviter_email = "a team admin"
+        try:
+            inviter_profile = supabase.table("user_profiles") \
+                .select("email") \
+                .eq("user_id", user_id) \
+                .single().execute()
+            if inviter_profile.data:
+                inviter_email = inviter_profile.data.get("email", inviter_email)
+        except Exception:
+            pass
+
+        # 8. Send invite email
+        email_sent = send_invite_email(
+            to_email=email.lower().strip(),
+            org_name=org.get("name", "an organization"),
+            inviter_email=inviter_email,
+            invite_token=invite_token,
+        )
+
+        logger.info("Invite created for %s (email_sent=%s)", email, email_sent)
+        return {
+            "member": member_row,
+            "email_sent": email_sent,
+        }
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in invite_member: {str(e)}")
+        logger.exception("Error in invite_member: %s", e)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.post("/api/organizations/accept-invite")
+def accept_invite(token: str = Body(...), user_id: str = Body(...)):
+    """Accept an organization invite by token. Links the user to the org."""
+    try:
+        # 1. Look up the token
+        token_result = supabase.table("invite_tokens") \
+            .select("*") \
+            .eq("token", token) \
+            .single().execute()
+
+        if not token_result.data:
+            raise HTTPException(status_code=404, detail="Invitation not found or has already been used.")
+
+        invite = token_result.data
+
+        # 2. Check token status
+        if invite["status"] == "accepted":
+            raise HTTPException(status_code=400, detail="This invitation has already been accepted.")
+        if invite["status"] == "revoked":
+            raise HTTPException(status_code=400, detail="This invitation has been revoked.")
+        if invite["status"] == "expired":
+            raise HTTPException(status_code=400, detail="This invitation has expired.")
+
+        # 3. Check expiry
+        expires_at_str = invite["expires_at"]
+        if isinstance(expires_at_str, str):
+            expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+        else:
+            expires_at = expires_at_str
+        if datetime.now(timezone.utc) > expires_at:
+            supabase.table("invite_tokens").update({"status": "expired"}).eq("id", invite["id"]).execute()
+            raise HTTPException(status_code=400, detail="This invitation has expired.")
+
+        # 4. Verify email matches the accepting user
+        user_profile = supabase.table("user_profiles") \
+            .select("email") \
+            .eq("user_id", user_id) \
+            .single().execute()
+
+        if not user_profile.data:
+            raise HTTPException(status_code=404, detail="User profile not found.")
+
+        user_email = (user_profile.data.get("email") or "").lower().strip()
+        invited_email = (invite.get("invited_email") or "").lower().strip()
+
+        if user_email != invited_email:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This invitation was sent to {invite['invited_email']}. You are signed in as {user_email}."
+            )
+
+        # 5. Check if user is already an active member
+        existing_member = supabase.table("organization_members") \
+            .select("id, status") \
+            .eq("org_id", invite["org_id"]) \
+            .eq("user_id", user_id) \
+            .execute().data
+        if existing_member:
+            for m in existing_member:
+                if m["status"] == "active":
+                    supabase.table("invite_tokens").update({
+                        "status": "accepted",
+                        "accepted_at": datetime.now(timezone.utc).isoformat(),
+                        "accepted_by": user_id,
+                    }).eq("id", invite["id"]).execute()
+                    return {"message": "You are already a member of this organization.", "org_id": invite["org_id"], "org_name": ""}
+
+        # 6. Activate the membership
+        member_id = invite.get("member_id")
+        if member_id:
+            supabase.table("organization_members").update({
+                "user_id": user_id,
+                "status": "active",
+                "role": "member",
+            }).eq("id", member_id).execute()
+        else:
+            supabase.table("organization_members").insert({
+                "org_id": invite["org_id"],
+                "user_id": user_id,
+                "invited_email": invited_email,
+                "status": "active",
+                "role": "member",
+            }).execute()
+
+        # 7. Mark token as accepted
+        supabase.table("invite_tokens").update({
+            "status": "accepted",
+            "accepted_at": datetime.now(timezone.utc).isoformat(),
+            "accepted_by": user_id,
+        }).eq("id", invite["id"]).execute()
+
+        # 8. Get org name for response
+        org_name = ""
+        try:
+            org_result = supabase.table("organizations").select("name").eq("id", invite["org_id"]).single().execute()
+            if org_result.data:
+                org_name = org_result.data.get("name", "")
+        except Exception:
+            pass
+
+        logger.info("Invite accepted: user=%s org=%s", user_id, invite["org_id"])
+        return {
+            "message": "Invitation accepted successfully.",
+            "org_id": invite["org_id"],
+            "org_name": org_name,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in accept_invite: %s", e)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.post("/api/organizations/revoke-invite")
+def revoke_invite(org_id: str = Body(...), member_id: str = Body(...), user_id: str = Body(...)):
+    """Revoke a pending invite. Admin only."""
+    try:
+        # 1. Verify the requesting user is an admin
+        admin_check = supabase.table("organization_members") \
+            .select("role") \
+            .eq("org_id", org_id) \
+            .eq("user_id", user_id) \
+            .eq("status", "active") \
+            .single().execute()
+
+        if not admin_check.data or admin_check.data.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can revoke invitations.")
+
+        # 2. Revoke invite token(s) for this member
+        supabase.table("invite_tokens") \
+            .update({"status": "revoked"}) \
+            .eq("member_id", member_id) \
+            .eq("status", "pending") \
+            .execute()
+
+        # 3. Delete the organization_members row (only if still invited)
+        supabase.table("organization_members") \
+            .delete() \
+            .eq("id", member_id) \
+            .eq("status", "invited") \
+            .execute()
+
+        logger.info("Invite revoked: member_id=%s org=%s by user=%s", member_id, org_id, user_id)
+        return {"message": "Invitation revoked successfully."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in revoke_invite: %s", e)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/api/organizations/pending-invites")
+def get_pending_invites_for_user(email: str = Query(...)):
+    """Get all pending invite tokens for a given email address."""
+    try:
+        results = supabase.table("invite_tokens") \
+            .select("id, token, org_id, invited_email, expires_at, created_at, organizations(id, name, logo)") \
+            .eq("invited_email", email.lower().strip()) \
+            .eq("status", "pending") \
+            .execute()
+
+        if not results.data:
+            return []
+
+        # Filter out expired ones
+        now = datetime.now(timezone.utc)
+        pending = []
+        for invite in results.data:
+            expires_str = invite.get("expires_at", "")
+            if isinstance(expires_str, str) and expires_str:
+                try:
+                    expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+                    if now > expires_at:
+                        supabase.table("invite_tokens").update({"status": "expired"}).eq("id", invite["id"]).execute()
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            pending.append(invite)
+
+        return pending
+
+    except Exception as e:
+        logger.exception("Error in get_pending_invites_for_user: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/join")
