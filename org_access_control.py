@@ -160,7 +160,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/invite")
-def invite_member(org_id: str = Body(...), email: str = Body(...), user_id: str = Body(...)):
+def invite_member(org_id: str = Body(...), email: str = Body(...), user_id: str = Body(...), inviter_email: str = Body("a team admin")):
     """Invite a member to an organization. Generates a token and sends an email."""
     try:
         logger.info("Inviting %s to org %s by user %s", email, org_id, user_id)
@@ -234,19 +234,7 @@ def invite_member(org_id: str = Body(...), email: str = Body(...), user_id: str 
             supabase.table("organization_members").delete().eq("id", member_row["id"]).execute()
             raise HTTPException(status_code=500, detail="Failed to generate invite token.")
 
-        # 7. Look up inviter's email for the email template
-        inviter_email = "a team admin"
-        try:
-            inviter_profile = supabase.table("user_profiles") \
-                .select("email") \
-                .eq("user_id", user_id) \
-                .single().execute()
-            if inviter_profile.data:
-                inviter_email = inviter_profile.data.get("email", inviter_email)
-        except Exception:
-            pass
-
-        # 8. Send invite email
+        # 7. Send invite email (inviter_email passed from frontend)
         email_sent = send_invite_email(
             to_email=email.lower().strip(),
             org_name=org.get("name", "an organization"),
@@ -300,25 +288,7 @@ def accept_invite(token: str = Body(...), user_id: str = Body(...)):
             supabase.table("invite_tokens").update({"status": "expired"}).eq("id", invite["id"]).execute()
             raise HTTPException(status_code=400, detail="This invitation has expired.")
 
-        # 4. Verify email matches the accepting user
-        user_profile = supabase.table("user_profiles") \
-            .select("email") \
-            .eq("user_id", user_id) \
-            .single().execute()
-
-        if not user_profile.data:
-            raise HTTPException(status_code=404, detail="User profile not found.")
-
-        user_email = (user_profile.data.get("email") or "").lower().strip()
-        invited_email = (invite.get("invited_email") or "").lower().strip()
-
-        if user_email != invited_email:
-            raise HTTPException(
-                status_code=403,
-                detail=f"This invitation was sent to {invite['invited_email']}. You are signed in as {user_email}."
-            )
-
-        # 5. Check if user is already an active member
+        # 4. Check if user is already an active member
         existing_member = supabase.table("organization_members") \
             .select("id, status") \
             .eq("org_id", invite["org_id"]) \
