@@ -8,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-FROM_EMAIL = os.getenv("OPTIML_FROM_EMAIL", "OptiML <noreply@optiml.one>")
+FROM_EMAIL = os.getenv("OPTIML_FROM_EMAIL", "optiml <noreply@optiml.one>")
 FRONTEND_URL = os.getenv("OPTIML_FRONTEND_URL", "https://optiml.one")
 
 # Lazy init: only import and configure resend when actually sending

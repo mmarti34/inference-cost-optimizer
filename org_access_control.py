@@ -316,7 +316,7 @@ def accept_invite(token: str = Body(...), user_id: str = Body(...)):
             supabase.table("organization_members").insert({
                 "org_id": invite["org_id"],
                 "user_id": user_id,
-                "invited_email": invited_email,
+                "invited_email": invite["invited_email"],
                 "status": "active",
                 "role": "member",
             }).execute()
