@@ -138,8 +138,8 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         # Handle the event
         if event['type'] == 'checkout.session.completed':
             session = event['data']['object']
-            user_id = session['metadata'].get('user_id')
-            tier = session['metadata'].get('tier')
+            user_id = session.get('metadata', {}).get('user_id')
+            tier = session.get('metadata', {}).get('tier')
             
             if user_id and tier:
                 update_data = {
@@ -157,7 +157,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         
         elif event['type'] in ['customer.subscription.created', 'customer.subscription.updated']:
             subscription = event['data']['object']
-            user_id = subscription['metadata'].get('user_id')
+            user_id = subscription.get('metadata', {}).get('user_id')
             # Fallback: look up user_id from stripe_customer_id if metadata is missing
             if not user_id:
                 customer_id = subscription.get('customer')
@@ -168,31 +168,28 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
             tier = _resolve_tier_from_subscription(subscription)
 
             if user_id and tier:
-                status = subscription['status']
-                current_period_start = subscription['current_period_start']
-                current_period_end = subscription['current_period_end']
-                canceled_at = subscription.get('canceled_at')
+                status = subscription.get('status', 'active')
                 cancel_at_period_end = subscription.get('cancel_at_period_end', False)
-                trial_end = subscription.get('trial_end')
-                
+
                 # Convert Unix timestamps to proper ISO 8601 strings
-                # Stripe sends epoch seconds (e.g. 1740614400), Supabase needs ISO format
+                # Stripe sends epoch seconds (e.g. 1740614400), Supabase needs ISO format.
+                # Use .get() for all fields — some may be absent depending on the event.
                 result = supabase.table("user_profiles").update({
                     "subscription_tier": tier,
                     "subscription_status": status,
-                    "stripe_subscription_id": subscription['id'],
-                    "current_period_start": _unix_to_iso(current_period_start),
-                    "current_period_end": _unix_to_iso(current_period_end),
-                    "canceled_at": _unix_to_iso(canceled_at),
+                    "stripe_subscription_id": subscription.get('id'),
+                    "current_period_start": _unix_to_iso(subscription.get('current_period_start')),
+                    "current_period_end": _unix_to_iso(subscription.get('current_period_end')),
+                    "canceled_at": _unix_to_iso(subscription.get('canceled_at')),
                     "cancel_at_period_end": cancel_at_period_end,
-                    "trial_end": _unix_to_iso(trial_end),
+                    "trial_end": _unix_to_iso(subscription.get('trial_end')),
                 }).eq("user_id", user_id).execute()
                 _propagate_tier_to_orgs(user_id, tier)
                 logger.info("Stripe subscription updated event_id=%s user_id=%s tier=%s status=%s", event_id, user_id, tier, status)
         
         elif event['type'] == 'customer.subscription.deleted':
             subscription = event['data']['object']
-            user_id = subscription['metadata'].get('user_id')
+            user_id = subscription.get('metadata', {}).get('user_id')
             if not user_id:
                 user_id = _lookup_user_id_by_customer(subscription.get('customer'))
             # On deletion we always go to free, but log what tier was resolved for debugging
@@ -220,7 +217,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
 
             if subscription_id:
                 subscription = stripe.Subscription.retrieve(subscription_id)
-                user_id = subscription['metadata'].get('user_id')
+                user_id = subscription.get('metadata', {}).get('user_id')
                 if not user_id:
                     user_id = _lookup_user_id_by_customer(subscription.get('customer'))
 
@@ -236,7 +233,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
 
             if subscription_id:
                 subscription = stripe.Subscription.retrieve(subscription_id)
-                user_id = subscription['metadata'].get('user_id')
+                user_id = subscription.get('metadata', {}).get('user_id')
                 if not user_id:
                     user_id = _lookup_user_id_by_customer(subscription.get('customer'))
 
