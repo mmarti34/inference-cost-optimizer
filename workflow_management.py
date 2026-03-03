@@ -253,7 +253,7 @@ async def get_workflows(org_id: str, project_id: Optional[str] = None):
 async def get_project_workflows(org_id: str, project_id: str):
     """List workflows for a project. Verifies project belongs to org."""
     try:
-        proj = supabase.table("projects").select("id").eq("id", project_id).eq("org_id", org_id).single().execute()
+        proj = supabase.table("projects").select("id").eq("id", project_id).eq("org_id", org_id).limit(1).execute()
         if not proj.data:
             raise HTTPException(status_code=404, detail="Project not found")
         result = (

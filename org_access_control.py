@@ -2,8 +2,9 @@ import re
 import uuid
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Body, Query
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from supabase_client import supabase
+from auth_dependency import require_org_member, AuthenticatedUser
 from email_service import send_invite_email
 
 logger = logging.getLogger(__name__)
@@ -496,31 +497,41 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.delete("/api/organizations/members/{org_id}/{user_id}")
-def remove_member(org_id: str, user_id: str):
-    """Remove a member from an organization and clean up related data"""
+async def remove_member(
+    org_id: str,
+    user_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Remove a member from an organization. Requires admin role."""
     try:
-        print(f"Removing user {user_id} from organization {org_id}")
-        
-        # 1. Check if the requesting user is an admin
-        # (This would typically come from authentication middleware)
-        # For now, we'll assume the request is authorized
-        
-        # 2. Remove the user from organization_members
+        # 1. Verify the requester is an admin of this org
+        admin_check = supabase.table("organization_members") \
+            .select("role") \
+            .eq("org_id", org_id) \
+            .eq("user_id", auth_user.user_id) \
+            .eq("status", "active") \
+            .limit(1) \
+            .execute()
+        if not admin_check.data or admin_check.data[0].get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can remove members.")
+
+        # 2. Prevent removing yourself (admins should use leave instead)
+        if auth_user.user_id == user_id:
+            raise HTTPException(status_code=400, detail="Cannot remove yourself. Use leave instead.")
+
+        # 3. Remove the user from organization_members
         member_result = supabase.table("organization_members").delete().eq("org_id", org_id).eq("user_id", user_id).execute()
-        print(f"Member removal result: {member_result}")
-        
-        # 3. Clean up any pending join requests for this user and org
-        join_request_result = supabase.table("join_requests").delete().eq("org_id", org_id).eq("user_id", user_id).execute()
-        print(f"Join request cleanup result: {join_request_result}")
-        
-        # 4. Clean up any pending invitations for this user and org
-        invite_result = supabase.table("organization_members").delete().eq("org_id", org_id).eq("invited_email", user_id).eq("status", "invited").execute()
-        print(f"Invitation cleanup result: {invite_result}")
-        
-        return {"message": "Member removed successfully", "data": member_result.data}
-        
+
+        # 4. Clean up any pending join requests for this user and org
+        supabase.table("join_requests").delete().eq("org_id", org_id).eq("user_id", user_id).execute()
+
+        logger.info("Member removed: user=%s org=%s by=%s", user_id, org_id, auth_user.user_id)
+        return {"message": "Member removed successfully"}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in remove_member: {str(e)}")
+        logger.error("Error in remove_member: %s", e)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 def check_org_access_permission(user_plan: str, org_plan: str, org_type: str = "Organization") -> bool:
