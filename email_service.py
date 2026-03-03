@@ -56,15 +56,19 @@ def send_invite_email(
 <body style="margin:0;padding:0;background-color:#f8f9fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f8f9fb;padding:48px 20px;">
     <tr><td align="center">
-      <!-- Main card — light glass style matching landing page -->
-      <table width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:20px;overflow:hidden;border:1px solid rgba(0,0,0,0.06);box-shadow:0 4px 24px rgba(108,130,210,0.08),0 2px 6px rgba(0,0,0,0.04);">
-        <!-- Logo -->
+      <!-- Main card -->
+      <table width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:20px;overflow:hidden;border:1px solid #e8e8ec;box-shadow:0 4px 24px rgba(108,130,210,0.08),0 2px 6px rgba(0,0,0,0.04);">
+        <!-- Logo as styled text (no external image dependency) -->
         <tr><td style="padding:36px 36px 8px;text-align:center;">
-          <img src="https://optiml.one/optimlwhite.png" alt="OptiML" height="36" style="display:block;margin:0 auto;">
+          <span style="font-size:28px;font-weight:700;color:#18181b;letter-spacing:-0.03em;">optiml</span>
         </td></tr>
-        <!-- Gradient accent line -->
+        <!-- Accent line (solid fallback for email clients) -->
         <tr><td style="padding:16px 36px 0;">
-          <div style="height:2px;border-radius:1px;background:linear-gradient(135deg,#6C8EEF 0%,#4EBF98 50%,#A97CF8 100%);"></div>
+          <table width="100%" cellpadding="0" cellspacing="0"><tr>
+            <td width="33%" style="height:2px;background-color:#6C8EEF;"></td>
+            <td width="34%" style="height:2px;background-color:#4EBF98;"></td>
+            <td width="33%" style="height:2px;background-color:#A97CF8;"></td>
+          </tr></table>
         </td></tr>
         <!-- Content -->
         <tr><td style="padding:24px 36px 32px;">
@@ -74,13 +78,18 @@ def send_invite_email(
           <p style="margin:0 0 28px;font-size:14px;color:#71717a;line-height:1.6;">
             {inviter_email} has invited you to collaborate on optiml. click below to accept and get started.
           </p>
-          <a href="{accept_url}"
-             style="display:inline-block;background:linear-gradient(135deg,#6C8EEF,#7B9CF2);color:#ffffff;text-decoration:none;padding:12px 36px;border-radius:12px;font-size:14px;font-weight:500;letter-spacing:-0.01em;box-shadow:0 2px 12px rgba(108,142,239,0.25);">
-            accept invitation
-          </a>
+          <!-- Button with solid background-color (works everywhere) -->
+          <table cellpadding="0" cellspacing="0"><tr>
+            <td style="border-radius:12px;background-color:#6C8EEF;">
+              <a href="{accept_url}"
+                 style="display:inline-block;color:#ffffff;text-decoration:none;padding:12px 36px;font-size:14px;font-weight:500;letter-spacing:-0.01em;">
+                accept invitation
+              </a>
+            </td>
+          </tr></table>
         </td></tr>
         <!-- Footer -->
-        <tr><td style="padding:20px 36px 28px;border-top:1px solid rgba(0,0,0,0.06);">
+        <tr><td style="padding:20px 36px 28px;border-top:1px solid #e8e8ec;">
           <p style="margin:0;font-size:12px;color:#a1a1aa;line-height:1.5;">
             this invitation expires in 7 days. if you didn't expect this email, you can safely ignore it.
           </p>
