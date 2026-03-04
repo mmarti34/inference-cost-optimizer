@@ -92,8 +92,8 @@ async def _stream_ai_step_openai(
 
 def _is_linear_streamable_workflow(graph: dict) -> tuple[bool, list[str] | None]:
     """
-    If the workflow is linear (input -> prompt? -> ai-step/tool_call/loop -> output) with exactly one
-    ai-step, tool_call, or loop node and no condition/router/optimizer, return (True, ordered node ids).
+    If the workflow is linear (input -> prompt? -> ai-step/tool_call/agent/loop -> output) with exactly one
+    ai-step, tool_call, agent, or loop node and no condition/router/optimizer, return (True, ordered node ids).
     Else (False, None).
     """
     nodes_by_id = _nodes_by_id(graph)
@@ -130,7 +130,7 @@ def _is_linear_streamable_workflow(graph: dict) -> tuple[bool, list[str] | None]
                 if tid:
                     queue.append(tid)
                     break
-    # Accept exactly one ai-step, tool_call, or loop (not multiple).
+    # Accept exactly one ai-step, tool_call, agent, or loop (not multiple).
     # When a loop node is present, its downstream body node (ai-step/tool_call) is
     # part of the loop and should not be counted separately.
     loop_body_ids: set[str] = set()
@@ -141,12 +141,12 @@ def _is_linear_streamable_workflow(graph: dict) -> tuple[bool, list[str] | None]
                 tid = e.get("target")
                 if tid:
                     tn = nodes_by_id.get(tid)
-                    if tn and (tn.get("type") or "").lower() in ("ai-step", "tool_call"):
+                    if tn and (tn.get("type") or "").lower() in ("ai-step", "tool_call", "agent"):
                         loop_body_ids.add(tid)
     ai_count = sum(
         1 for nid in path
         if nid not in loop_body_ids
-        and (nodes_by_id.get(nid) or {}).get("type", "").lower() in ("ai-step", "tool_call", "loop")
+        and (nodes_by_id.get(nid) or {}).get("type", "").lower() in ("ai-step", "tool_call", "agent", "loop")
     )
     if ai_count != 1:
         return False, None
@@ -298,6 +298,61 @@ async def stream_workflow_async(
                         "model": model, "provider": provider,
                         "tool_calls": tool_calls, "iterations": iterations,
                     })
+                elif ntype == "agent":
+                    # Stream agent execution — run in thread, emit reasoning steps and tool calls
+                    prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+                    prompt_text = _apply_variables(str(data.get("taskDescription") or data.get("task") or "Respond to the user."), variables, prev_output=prev)
+                    if conversation_prefix:
+                        prompt_text = conversation_prefix + prompt_text
+                    provider = (data.get("provider") or "openai").strip().lower()
+                    model = (data.get("modelName") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+                    # Run the agent node in a thread and collect results
+                    step_start = time.perf_counter()
+
+                    def _run_agent():
+                        from workflow_runtime import _execute_agent_node
+                        return _execute_agent_node(node_id, node, prompt_text, org_id)
+
+                    agent_result = await asyncio.to_thread(_run_agent)
+                    latency_ms = int((time.perf_counter() - step_start) * 1000)
+
+                    full_output = agent_result.get("output", "")
+                    cost_usd = float(agent_result.get("cost", 0))
+                    in_tok = agent_result.get("input_tokens", 0)
+                    out_tok = agent_result.get("tokens", 0)
+                    reasoning_steps = agent_result.get("reasoning_steps", [])
+                    tool_calls = agent_result.get("tool_calls", [])
+                    iterations = agent_result.get("iterations", 1)
+
+                    # Emit agent_step events for each reasoning step
+                    for rs in reasoning_steps:
+                        yield _sse_event("agent_step", {
+                            "node_id": node_id,
+                            "step": rs.get("step", 0),
+                            "type": rs.get("type", ""),
+                            "content": (rs.get("content") or "")[:500],
+                            "tool_name": rs.get("tool_name", ""),
+                            "tool_input": rs.get("tool_input", {}),
+                            "latency_ms": rs.get("latency_ms", 0),
+                        })
+
+                    # Emit tool_call_start/tool_call_end for each tool execution
+                    for tc in tool_calls:
+                        yield _sse_event("tool_call_start", {"node_id": node_id, "tool_name": tc.get("name", ""), "arguments": tc.get("arguments", {})})
+                        yield _sse_event("tool_call_end", {"node_id": node_id, "tool_name": tc.get("name", ""), "result": (tc.get("result", ""))[:500], "latency_ms": tc.get("latency_ms", 0)})
+
+                    context[node_id] = full_output
+                    total_cost += cost_usd
+                    total_latency += latency_ms
+                    last_content_type = "text"
+                    node_results.append({
+                        "node_id": node_id, "type": "agent", "latency_ms": latency_ms, "cost": cost_usd,
+                        "output": full_output[:200], "tokens": out_tok, "input_tokens": in_tok,
+                        "model": model, "provider": provider,
+                        "tool_calls": tool_calls, "iterations": iterations,
+                        "reasoning_steps": reasoning_steps, "agent_steps_count": len(reasoning_steps),
+                    })
                 elif ntype == "loop":
                     # Run loop node in a thread — emit iteration events as SSE
                     prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
@@ -335,7 +390,7 @@ async def stream_workflow_async(
                             if not target_id:
                                 continue
                             dn = _loop_nodes_by_id.get(target_id)
-                            if dn and (dn.get("type") or "").lower() in ("ai-step", "tool_call"):
+                            if dn and (dn.get("type") or "").lower() in ("ai-step", "tool_call", "agent"):
                                 loop_body_node_id = target_id
                                 loop_body_node = dn
                                 break

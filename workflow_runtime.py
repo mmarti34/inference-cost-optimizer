@@ -634,6 +634,180 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
     return out
 
 
+# ─── Agent Node Execution ──────────────────────────────────────────────────────
+
+_AGENT_SYSTEM_TEMPLATE = (
+    "You are an autonomous AI agent. Solve the given task step by step.\n\n"
+    "Guidelines:\n"
+    "- Think carefully before taking any action\n"
+    "- Use the available tools when you need information or need to perform actions\n"
+    "- If a tool call fails or returns unexpected results, try a different approach\n"
+    "- When you have enough information, provide your final answer\n"
+    "- Be thorough but efficient — do not make unnecessary tool calls\n"
+)
+
+
+def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
+    """
+    Execute an autonomous agent with reasoning trace.
+
+    Reuses the tool_call provider infrastructure (handle_prompt_with_tools) but
+    wraps it with a ReAct-style system prompt and a recording tool executor that
+    captures each act/observe step for a structured reasoning trace.
+
+    Returns the standard result dict plus:
+      reasoning_steps: list of {step, type, content?, tool_name?, tool_input?, latency_ms?}
+      agent_steps_count: int
+    """
+    data = node.get("data") or {}
+    target, provider, model, prompt_text = _resolve_model_target(data, org_id, prompt_text)
+
+    provider_lower = provider.lower()
+    if provider_lower not in _TOOL_CALL_PROVIDERS and not (target and target.target_type == "openai_compatible_endpoint"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agent requires tool calling support. Provider '{provider}' is not supported.",
+        )
+
+    # ── Build tools (same as tool_call) ─────────────────────────────────
+    tools_config = data.get("tools") or []
+    generic_tools = [
+        {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters") or {"type": "object", "properties": {}}}
+        for t in tools_config if t.get("name")
+    ]
+    tools_by_name = {t["name"]: t for t in tools_config if t.get("name")}
+
+    # ── Recording tool executor ─────────────────────────────────────────
+    reasoning_steps: list[dict] = []
+    step_counter = [0]
+
+    def agent_tool_executor(name: str, arguments: dict) -> tuple[str, int]:
+        step_counter[0] += 1
+        # Record the act step
+        reasoning_steps.append({
+            "step": step_counter[0],
+            "type": "act",
+            "tool_name": name,
+            "tool_input": arguments,
+        })
+        # Execute the actual tool
+        tool_def = tools_by_name.get(name, {"type": "builtin"})
+        resolved_def = _resolve_secrets(tool_def, org_id)
+        result_str, latency_ms = _execute_tool(resolved_def, name, arguments)
+        # Record the observe step
+        reasoning_steps.append({
+            "step": step_counter[0],
+            "type": "observe",
+            "content": result_str[:2000],
+            "latency_ms": latency_ms,
+        })
+        return result_str, latency_ms
+
+    # ── Build agent system prompt ───────────────────────────────────────
+    user_sys = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
+    agent_system = _AGENT_SYSTEM_TEMPLATE
+    if user_sys:
+        agent_system = agent_system + "\n" + user_sys
+
+    max_steps = int(data.get("maxSteps") or data.get("maxIterations") or 10)
+    max_steps = max(1, min(max_steps, 25))
+
+    payload = _PromptPayload(
+        org_id=org_id, provider=provider_lower, model=model,
+        prompt=prompt_text, prompt_id=f"workflow-{node_id}",
+    )
+
+    start = time.perf_counter()
+
+    # ── Provider dispatch (same routing as tool_call) ───────────────────
+    if target and target.target_type == "openai_compatible_endpoint":
+        result = call_with_resilience(
+            lambda: openai_router.handle_prompt_with_tools(
+                payload, generic_tools, target=target, system_message=agent_system,
+                max_iterations=max_steps, tool_executor=agent_tool_executor,
+            ),
+            context_label=f"custom-endpoint/{model} (agent node {node_id})",
+        )
+    elif provider_lower == "anthropic":
+        result = call_with_resilience(
+            lambda: anthropic_router.handle_prompt_with_tools(
+                payload, generic_tools, system_message=agent_system,
+                max_iterations=max_steps, tool_executor=agent_tool_executor,
+            ),
+            context_label=f"anthropic/{model} (agent node {node_id})",
+        )
+    elif provider_lower in ("groq", "together", "deepseek", "fireworks", "mistral", "gemini"):
+        router_mod = _ROUTER_MAP[provider_lower]
+        result = call_with_resilience(
+            lambda: router_mod.handle_prompt_with_tools(
+                payload, generic_tools, system_message=agent_system,
+                max_iterations=max_steps, tool_executor=agent_tool_executor,
+            ),
+            context_label=f"{provider_lower}/{model} (agent node {node_id})",
+        )
+    else:
+        result = call_with_resilience(
+            lambda: openai_router.handle_prompt_with_tools(
+                payload, generic_tools, system_message=agent_system,
+                max_iterations=max_steps, tool_executor=agent_tool_executor,
+            ),
+            context_label=f"{provider_lower}/{model} (agent node {node_id})",
+        )
+
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    out_text = result.get("response") or result.get("output") or ""
+
+    # ── Add final answer step ───────────────────────────────────────────
+    reasoning_steps.append({
+        "step": step_counter[0] + 1,
+        "type": "answer",
+        "content": out_text[:2000],
+    })
+
+    # ── Output quality validation ───────────────────────────────────────
+    _output_warning: str | None = None
+    _stripped = (out_text or "").strip()
+    if not _stripped:
+        _output_warning = "empty_output"
+    elif _stripped.lower().startswith(("i'm sorry", "i cannot", "i can't", "as an ai")):
+        _output_warning = "refusal"
+    if result.get("status") == "error" or result.get("error"):
+        _output_warning = _output_warning or "provider_error"
+
+    provider_latency_ms = result.get("provider_latency_ms")
+    gateway_overhead_ms = None
+    if provider_latency_ms is not None:
+        gateway_overhead_ms = max(latency_ms - provider_latency_ms, 0)
+
+    out = {
+        "output": out_text,
+        "latency_ms": latency_ms,
+        "tokens": result.get("output_tokens") or result.get("total_tokens") or 0,
+        "input_tokens": result.get("input_tokens", 0),
+        "cost": float(result.get("cost_usd") or 0),
+        "model": model,
+        "provider": provider,
+        "provider_latency_ms": provider_latency_ms,
+        "gateway_overhead_ms": gateway_overhead_ms,
+        "tool_calls": result.get("tool_calls", []),
+        "tool_calls_count": result.get("tool_calls_count", 0),
+        "iterations": result.get("iterations", 1),
+        # Agent-specific fields
+        "reasoning_steps": reasoning_steps,
+        "agent_steps_count": len(reasoning_steps),
+    }
+    if _output_warning:
+        out["output_warning"] = _output_warning
+    if target:
+        out["target_type"] = target.target_type
+        out["model_registry_id"] = target.model_registry_id
+        if target.endpoint_id:
+            out["endpoint_id"] = target.endpoint_id
+        if target.base_url:
+            out["resolved_base_url"] = target.base_url
+    return out
+
+
 def _execute_model_node_safe(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
     """
     Same as _execute_model_node but catches provider failures and returns
@@ -1301,6 +1475,83 @@ def execute_workflow(
             _record_latency_fact(
                 org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
                 node_id=node_id, node_type="tool_call",
+                target_type=result.get("target_type"), provider_label=(result.get("provider") or "unknown").lower(),
+                model_name=result.get("model"), endpoint_id=result.get("endpoint_id"),
+                resolved_base_url=result.get("resolved_base_url"),
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=result["latency_ms"],
+                provider_latency_ms=result.get("provider_latency_ms"),
+                gateway_overhead_ms=result.get("gateway_overhead_ms"),
+                input_tokens=in_tok or None, output_tokens=out_tok or None,
+                success=True,
+            )
+        elif node_type == "agent":
+            prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+            task = (data.get("taskDescription") or data.get("task") or "Solve the given task using the available tools.").strip()
+            if not isinstance(task, str):
+                task = str(task)
+            prompt_text = _apply_variables(task, variables, prev_output=prev)
+            if "{{input}}" not in task and prev and prev.strip():
+                prompt_text = prompt_text + "\n\n" + prev
+            if conversation_prefix:
+                prompt_text = conversation_prefix + prompt_text
+            _t0_agent = time.perf_counter()
+            try:
+                result = _execute_agent_node(node_id, node, prompt_text, org_id)
+            except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_agent) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="agent",
+                    target_type=None, provider_label=(data.get("provider") or "unknown").strip().lower(),
+                    model_name=data.get("modelName"), endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
+                if e.status_code == 404 or "API key" in (e.detail or ""):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No API key configured for this provider. Add a key in Settings → Integrations. (node_id={node_id})",
+                    ) from e
+                raise
+            context[node_id] = result
+            last_content_type = "text"
+            total_cost += result["cost"]
+            total_latency += result["latency_ms"]
+            out_tok = result.get("tokens") or 0
+            in_tok = result.get("input_tokens") or 0
+            nr_entry = {
+                "node_id": node_id,
+                "type": "agent",
+                "latency_ms": result["latency_ms"],
+                "tokens": out_tok,
+                "tokens_output": out_tok,
+                "input_tokens": in_tok,
+                "tokens_input": in_tok,
+                "cost": result["cost"],
+                "cost_usd": result["cost"],
+                "model": result.get("model"),
+                "provider": result.get("provider"),
+                "output": (result.get("output") or "")[:200] + ("..." if len(result.get("output") or "") > 200 else ""),
+                "prompt_after_interpolation": prompt_text[:2000] + ("..." if len(prompt_text) > 2000 else ""),
+                "tool_calls_count": result.get("tool_calls_count", 0),
+                "tool_calls": result.get("tool_calls", []),
+                "iterations": result.get("iterations", 1),
+                "reasoning_steps": result.get("reasoning_steps", []),
+                "agent_steps_count": result.get("agent_steps_count", 0),
+            }
+            for _k in ("target_type", "model_registry_id", "endpoint_id", "resolved_base_url"):
+                if result.get(_k):
+                    nr_entry[_k] = result[_k]
+            if result.get("output_warning"):
+                nr_entry["output_warning"] = result["output_warning"]
+                nr_entry["status"] = "warning"
+            node_results.append(nr_entry)
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="agent",
                 target_type=result.get("target_type"), provider_label=(result.get("provider") or "unknown").lower(),
                 model_name=result.get("model"), endpoint_id=result.get("endpoint_id"),
                 resolved_base_url=result.get("resolved_base_url"),
