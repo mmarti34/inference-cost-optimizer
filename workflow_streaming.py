@@ -27,6 +27,53 @@ from workflow_runtime import (
 )
 
 
+def _insert_workflow_run_linear(
+    org_id: str,
+    workflow_id: str | None,
+    endpoint_slug: str,
+    version: int,
+    input_text: str,
+    final_output: str,
+    node_results: list,
+    total_cost: float,
+    total_latency_ms: int,
+    experiment_id: str | None = None,
+    variant_name: str | None = None,
+    served_version: int | None = None,
+) -> str | None:
+    """Insert a workflow run for the linear streaming path so /usage and observability see it."""
+    if not workflow_id:
+        return None
+    try:
+        row = {
+            "workflow_id": workflow_id,
+            "org_id": org_id,
+            "user_id": None,
+            "input_text": (input_text or "")[:5000] or None,
+            "final_output": (final_output or "")[:10000] or None,
+            "node_results": node_results,
+            "total_cost": round(total_cost, 6),
+            "total_latency_ms": total_latency_ms,
+            "endpoint_slug": endpoint_slug or None,
+            "version": version,
+            "execution_mode": "production",
+        }
+        if experiment_id is not None:
+            row["experiment_id"] = experiment_id
+        if variant_name is not None:
+            row["variant_name"] = variant_name
+        if served_version is not None:
+            row["served_version"] = served_version
+        insert_result = supabase.table("workflow_runs").insert(row).execute()
+        data = insert_result.data
+        first = data[0] if isinstance(data, list) and len(data) > 0 else (data if isinstance(data, dict) else None)
+        if first and first.get("id") is not None:
+            return str(first["id"])
+    except Exception:
+        pass
+    return None
+
+
 def _sse_event(event: str, data: Any) -> str:
     """Format one SSE message: event line + data line (JSON) + blank line."""
     payload = json.dumps(data) if not isinstance(data, str) else data
@@ -535,10 +582,24 @@ async def stream_workflow_async(
                         save_conversation_turn(conversation_id, n + 1, "assistant", prev, None, request_id, served_version)
                         update_conversation_updated_at(conversation_id)
                     yield _sse_event("step_end", {"node_id": node_id, "type": ntype, "latency_ms": 0, "cost": 0, "output": prev[:500]})
+                    run_id = _insert_workflow_run_linear(
+                        org_id=org_id,
+                        workflow_id=workflow_id,
+                        endpoint_slug=endpoint_slug,
+                        version=dep_version,
+                        input_text=input_text,
+                        final_output=prev,
+                        node_results=node_results,
+                        total_cost=total_cost,
+                        total_latency_ms=total_latency,
+                        experiment_id=experiment_id,
+                        variant_name=variant_name,
+                        served_version=served_version,
+                    )
                     yield _sse_event("done", {
                         "request_id": request_id, "served_version": served_version,
                         "final_output": prev, "content_type": last_content_type,
-                        "total_latency_ms": total_latency, "total_cost": round(total_cost, 6), "run_id": None,
+                        "total_latency_ms": total_latency, "total_cost": round(total_cost, 6), "run_id": run_id,
                     })
                     yield "data: [DONE]\n\n"
                     return
