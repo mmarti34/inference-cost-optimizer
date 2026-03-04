@@ -1157,6 +1157,10 @@ def execute_workflow(
             if not isinstance(task, str):
                 task = str(task)
             prompt_text = _apply_variables(task, variables, prev_output=prev)
+            # If the task template doesn't contain {{input}}, the previous node
+            # output was never interpolated — append it so context always flows.
+            if "{{input}}" not in task and prev and prev.strip():
+                prompt_text = prompt_text + "\n\n" + prev
             if conversation_prefix:
                 prompt_text = conversation_prefix + prompt_text
             sys_instructions = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
@@ -1235,6 +1239,10 @@ def execute_workflow(
             if not isinstance(task, str):
                 task = str(task)
             prompt_text = _apply_variables(task, variables, prev_output=prev)
+            # If the task template doesn't contain {{input}}, the previous node
+            # output was never interpolated — append it so context always flows.
+            if "{{input}}" not in task and prev and prev.strip():
+                prompt_text = prompt_text + "\n\n" + prev
             if conversation_prefix:
                 prompt_text = conversation_prefix + prompt_text
             # System instructions are passed separately to the tool-call handler (not prepended to prompt)
