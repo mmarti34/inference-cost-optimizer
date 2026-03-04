@@ -368,3 +368,172 @@ def handle_prompt(payload: PromptPayload, *, target=None):
     except Exception as e:
         label = f"custom endpoint ({target.base_url})" if is_custom else "OpenAI"
         raise HTTPException(status_code=500, detail=f"{label} call failed: {e}")
+
+
+def handle_prompt_with_tools(payload: PromptPayload, tools: list[dict], *, target=None, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+    """
+    LLM call with tool/function calling support (OpenAI format).
+
+    Loops up to ``max_iterations`` times: if the model returns tool_calls,
+    we execute each tool via ``tool_executor(name, arguments_dict)`` and feed
+    the results back.  Once the model returns a text response (or the loop
+    exhausts), we return the final answer plus all tool-call records.
+
+    ``tool_executor`` signature:  (name: str, arguments: dict) -> (result_str, latency_ms)
+    """
+    from api_key_cache import get_provider_api_key
+
+    # ── Build client kwargs (same as handle_prompt) ───────────────────────
+    is_custom = target is not None and getattr(target, "base_url", None) is not None
+    client_kwargs: dict = {}
+
+    if is_custom:
+        client_kwargs["base_url"] = target.base_url
+        extra_headers: dict[str, str] = dict(target.default_headers or {})
+        auth_name = target.auth_header_name or "Authorization"
+        auth_value = target.auth_header_value or ""
+        if auth_name == "Authorization":
+            raw_key = auth_value
+            if raw_key.lower().startswith("bearer "):
+                raw_key = raw_key[7:]
+            client_kwargs["api_key"] = raw_key
+            extra_headers.pop("Authorization", None)
+            extra_headers.pop("authorization", None)
+        else:
+            client_kwargs["api_key"] = "custom-endpoint-placeholder"
+            extra_headers[auth_name] = auth_value
+            extra_headers.pop("Authorization", None)
+            extra_headers.pop("authorization", None)
+        if extra_headers:
+            client_kwargs["default_headers"] = extra_headers
+    else:
+        client_kwargs["api_key"] = get_provider_api_key(payload.org_id, payload.provider)
+
+    try:
+        client = OpenAI(**client_kwargs)
+    except Exception as e:
+        label = f"custom endpoint ({target.base_url})" if is_custom else "OpenAI"
+        raise HTTPException(status_code=500, detail=f"Failed to initialize {label} client: {e}")
+
+    # ── Convert tools to OpenAI format ────────────────────────────────────
+    openai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters") or {"type": "object", "properties": {}},
+            },
+        }
+        for t in tools
+        if t.get("name")
+    ]
+
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": system_message or "You are a helpful assistant."},
+        {"role": "user", "content": payload.prompt},
+    ]
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_provider_latency_ms = 0
+    all_tool_calls: list[dict] = []
+    iteration_count = 0
+    reply = ""
+
+    try:
+        for iteration_count in range(1, max_iterations + 1):
+            _t0 = time.perf_counter()
+            completion = client.chat.completions.create(
+                model=payload.model,
+                messages=messages,
+                tools=openai_tools if openai_tools else None,
+            )
+            _provider_ms = int((time.perf_counter() - _t0) * 1000)
+            total_provider_latency_ms += _provider_ms
+
+            usage = getattr(completion, "usage", None)
+            total_input_tokens += getattr(usage, "prompt_tokens", 0) if usage else 0
+            total_output_tokens += getattr(usage, "completion_tokens", 0) if usage else 0
+
+            choice = completion.choices[0]
+            finish = getattr(choice, "finish_reason", None)
+
+            if finish == "tool_calls" and choice.message.tool_calls:
+                # Append the assistant message with tool_calls to the conversation
+                messages.append(choice.message)  # type: ignore[arg-type]
+
+                for tc in choice.message.tool_calls:
+                    tc_name = tc.function.name
+                    try:
+                        tc_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    except json.JSONDecodeError:
+                        tc_args = {"raw": tc.function.arguments}
+
+                    # Execute the tool
+                    if tool_executor:
+                        result_str, tool_latency_ms = tool_executor(tc_name, tc_args)
+                    else:
+                        result_str, tool_latency_ms = "No tool executor configured", 0
+
+                    all_tool_calls.append({
+                        "name": tc_name,
+                        "arguments": tc_args,
+                        "result": result_str[:2000],
+                        "latency_ms": tool_latency_ms,
+                    })
+
+                    # Append the tool result
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_str[:4000],
+                    })
+            else:
+                # Final text response
+                reply = choice.message.content or ""
+                break
+        else:
+            # Loop exhausted — use last response
+            reply = reply or (completion.choices[0].message.content or "") if completion else ""
+
+        # ── Pricing ──────────────────────────────────────────────────────
+        try:
+            pricing = get_pricing("openai", payload.model)
+        except Exception:
+            pricing = {"input": 0, "output": 0}
+        total_cost = (total_input_tokens * pricing["input"] + total_output_tokens * pricing["output"]) / 1000
+
+        if is_custom:
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(target.base_url).hostname or target.base_url
+            except Exception:
+                host = target.base_url
+            provider_label = f"custom:{host}"
+        else:
+            provider_label = "OpenAI"
+
+        log_usage(
+            payload.org_id, provider_label, payload.model,
+            payload.prompt[:200], (reply or "")[:200], payload.prompt_id,
+            input_tokens=total_input_tokens, output_tokens=total_output_tokens,
+            total_tokens=total_input_tokens + total_output_tokens, cost_usd=total_cost,
+        )
+
+        return {
+            "status": "success",
+            "response": reply,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens,
+            "cost_usd": total_cost,
+            "provider_latency_ms": total_provider_latency_ms,
+            "tool_calls": all_tool_calls,
+            "tool_calls_count": len(all_tool_calls),
+            "iterations": iteration_count,
+        }
+
+    except Exception as e:
+        label = f"custom endpoint ({target.base_url})" if is_custom else "OpenAI"
+        raise HTTPException(status_code=500, detail=f"{label} tool-call failed: {e}")

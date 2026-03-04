@@ -3822,9 +3822,26 @@ async def run_rollback_monitor_cycle() -> dict:
                 triggered = await asyncio.to_thread(_evaluate_rollback_conditions_sync, rule)
                 now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 supabase.table("rollback_rules").update({"last_checked_at": now_str}).eq("id", rule["id"]).execute()
-                if triggered and (rule.get("action") or "rollback") == "rollback":
-                    await asyncio.to_thread(_execute_automatic_rollback_sync, rule)
+                if triggered:
+                    action = (rule.get("action") or "rollback").strip()
                     result["triggered"] += 1
+                    if action == "rollback":
+                        await asyncio.to_thread(_execute_automatic_rollback_sync, rule)
+                    # Notify on any triggered rule (rollback or alert_only)
+                    try:
+                        from notification_service import dispatch_alert
+                        await dispatch_alert(
+                            org_id=str(rule["org_id"]),
+                            alert_type="rollback_triggered" if action == "rollback" else "rule_triggered",
+                            endpoint_slug=rule.get("endpoint_slug", ""),
+                            details={
+                                "rule_id": str(rule["id"]),
+                                "action": action,
+                                "conditions": rule.get("conditions", []),
+                            },
+                        )
+                    except Exception:
+                        pass  # best-effort, don't break monitor cycle
             except Exception as e:
                 result["errors"].append({"rule_id": str(rule.get("id")), "error": str(e)})
     except Exception as e:

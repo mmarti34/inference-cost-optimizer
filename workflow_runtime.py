@@ -318,6 +318,201 @@ def _execute_model_node(node_id: str, node: dict, prompt_text: str, org_id: str)
     return out
 
 
+# ── Tool Call support ─────────────────────────────────────────────────────
+
+# Private IPs to block (SSRF protection)
+import ipaddress as _ipaddress
+import re as _re_ssrf
+from urllib.parse import urlparse as _urlparse
+
+
+def _is_private_url(url: str) -> bool:
+    """Return True if URL resolves to a private/loopback IP (SSRF protection)."""
+    try:
+        hostname = _urlparse(url).hostname or ""
+        # Block obvious private hostnames
+        if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1", ""):
+            return True
+        # Try to parse as IP
+        try:
+            ip = _ipaddress.ip_address(hostname)
+            return ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local
+        except ValueError:
+            pass  # Not a literal IP — allow (DNS resolution is at request time)
+        return False
+    except Exception:
+        return True  # If we can't parse, block it
+
+
+def _execute_tool(tool_def: dict, name: str, arguments: dict) -> tuple[str, int]:
+    """
+    Execute a single tool call. Returns (result_str, latency_ms).
+
+    Supported types:
+      - "http" / "webhook": POST/GET to a URL with JSON body
+      - "builtin": built-in tools (get_current_time)
+    """
+    import httpx
+    from datetime import datetime, timezone
+
+    tool_type = (tool_def.get("type") or "http").strip().lower()
+    _t0 = time.perf_counter()
+
+    try:
+        if tool_type in ("http", "webhook"):
+            url = (tool_def.get("url") or "").strip()
+            if not url:
+                return "Error: no URL configured for HTTP tool", 0
+            if _is_private_url(url):
+                return "Error: URL targets a private/internal address (blocked)", 0
+
+            method = (tool_def.get("method") or "POST").strip().upper()
+            headers_raw = tool_def.get("headers") or "{}"
+            try:
+                extra_headers = json.loads(headers_raw) if isinstance(headers_raw, str) else (headers_raw or {})
+            except (json.JSONDecodeError, TypeError):
+                extra_headers = {}
+            extra_headers.setdefault("Content-Type", "application/json")
+
+            body_bytes = json.dumps(arguments).encode("utf-8")
+
+            # Optional HMAC signing
+            hmac_secret = (tool_def.get("hmacSecret") or tool_def.get("hmac_secret") or "").strip()
+            if hmac_secret:
+                import hmac as _hmac
+                import hashlib as _hashlib
+                sig = _hmac.new(hmac_secret.encode("utf-8"), body_bytes, _hashlib.sha256).hexdigest()
+                extra_headers["X-OptiML-Signature"] = sig
+
+            with httpx.Client(timeout=30.0) as client:
+                if method == "GET":
+                    resp = client.get(url, headers=extra_headers, params=arguments)
+                else:
+                    resp = client.post(url, headers=extra_headers, content=body_bytes)
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return resp.text[:4000], latency_ms
+
+        elif tool_type == "builtin":
+            if name == "get_current_time":
+                result = datetime.now(timezone.utc).isoformat()
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            return f"Unknown built-in tool: {name}", 0
+
+        else:
+            return f"Unknown tool type: {tool_type}", 0
+
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        return f"Error: {str(e)[:500]}", latency_ms
+
+
+_TOOL_CALL_PROVIDERS = {"openai", "anthropic"}
+
+
+def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
+    """Execute an AI model call with tool use. Returns the standard result dict plus tool_call fields."""
+    data = node.get("data") or {}
+    target, provider, model, prompt_text = _resolve_model_target(data, org_id, prompt_text)
+
+    provider_lower = provider.lower()
+    if provider_lower not in _TOOL_CALL_PROVIDERS and not (target and target.target_type == "openai_compatible_endpoint"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tool calling is not yet supported for provider '{provider}'. Use OpenAI or Anthropic.",
+        )
+
+    tools_config = data.get("tools") or []
+    generic_tools = [
+        {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters") or {"type": "object", "properties": {}}}
+        for t in tools_config if t.get("name")
+    ]
+
+    # Build tool executor that maps tool name → definition → _execute_tool
+    tools_by_name = {t["name"]: t for t in tools_config if t.get("name")}
+
+    def tool_executor(name: str, arguments: dict) -> tuple[str, int]:
+        tool_def = tools_by_name.get(name, {"type": "builtin"})
+        return _execute_tool(tool_def, name, arguments)
+
+    sys_msg = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
+    max_iters = int(data.get("maxIterations") or 5)
+    max_iters = max(1, min(max_iters, 20))
+
+    payload = _PromptPayload(org_id=org_id, provider=provider_lower, model=model, prompt=prompt_text, prompt_id=f"workflow-{node_id}")
+
+    start = time.perf_counter()
+
+    if target and target.target_type == "openai_compatible_endpoint":
+        result = call_with_resilience(
+            lambda: openai_router.handle_prompt_with_tools(
+                payload, generic_tools, target=target, system_message=sys_msg,
+                max_iterations=max_iters, tool_executor=tool_executor,
+            ),
+            context_label=f"custom-endpoint/{model} (tool_call node {node_id})",
+        )
+    elif provider_lower == "anthropic":
+        result = call_with_resilience(
+            lambda: anthropic_router.handle_prompt_with_tools(
+                payload, generic_tools, system_message=sys_msg,
+                max_iterations=max_iters, tool_executor=tool_executor,
+            ),
+            context_label=f"anthropic/{model} (tool_call node {node_id})",
+        )
+    else:
+        # OpenAI and OpenAI-compatible
+        result = call_with_resilience(
+            lambda: openai_router.handle_prompt_with_tools(
+                payload, generic_tools, system_message=sys_msg,
+                max_iterations=max_iters, tool_executor=tool_executor,
+            ),
+            context_label=f"{provider_lower}/{model} (tool_call node {node_id})",
+        )
+
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    out_text = result.get("response") or result.get("output") or ""
+
+    # Output quality validation (same as _execute_model_node)
+    _output_warning: str | None = None
+    _stripped = (out_text or "").strip()
+    if not _stripped:
+        _output_warning = "empty_output"
+    elif _stripped.lower().startswith(("i'm sorry", "i cannot", "i can't", "as an ai")):
+        _output_warning = "refusal"
+    if result.get("status") == "error" or result.get("error"):
+        _output_warning = _output_warning or "provider_error"
+
+    provider_latency_ms = result.get("provider_latency_ms")
+    gateway_overhead_ms = None
+    if provider_latency_ms is not None:
+        gateway_overhead_ms = max(latency_ms - provider_latency_ms, 0)
+
+    out = {
+        "output": out_text,
+        "latency_ms": latency_ms,
+        "tokens": result.get("output_tokens") or result.get("total_tokens") or 0,
+        "input_tokens": result.get("input_tokens", 0),
+        "cost": float(result.get("cost_usd") or 0),
+        "model": model,
+        "provider": provider,
+        "provider_latency_ms": provider_latency_ms,
+        "gateway_overhead_ms": gateway_overhead_ms,
+        "tool_calls": result.get("tool_calls", []),
+        "tool_calls_count": result.get("tool_calls_count", 0),
+        "iterations": result.get("iterations", 1),
+    }
+    if _output_warning:
+        out["output_warning"] = _output_warning
+    if target:
+        out["target_type"] = target.target_type
+        out["model_registry_id"] = target.model_registry_id
+        if target.endpoint_id:
+            out["endpoint_id"] = target.endpoint_id
+        if target.base_url:
+            out["resolved_base_url"] = target.base_url
+    return out
+
+
 def _execute_model_node_safe(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
     """
     Same as _execute_model_node but catches provider failures and returns
@@ -401,7 +596,7 @@ def _get_model_performance_history(org_id: str, workflow_id: str, limit: int = 2
             if not isinstance(step, dict):
                 continue
             stype = (step.get("type") or "").lower()
-            if stype not in ("ai-step", "model", "optimizer"):
+            if stype not in ("ai-step", "model", "optimizer", "tool_call"):
                 continue
             model = step.get("model")
             if not model:
@@ -900,6 +1095,80 @@ def execute_workflow(
             _record_latency_fact(
                 org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
                 node_id=node_id, node_type="ai-step",
+                target_type=result.get("target_type"), provider_label=(result.get("provider") or "unknown").lower(),
+                model_name=result.get("model"), endpoint_id=result.get("endpoint_id"),
+                resolved_base_url=result.get("resolved_base_url"),
+                endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                total_latency_ms=result["latency_ms"],
+                provider_latency_ms=result.get("provider_latency_ms"),
+                gateway_overhead_ms=result.get("gateway_overhead_ms"),
+                input_tokens=in_tok or None, output_tokens=out_tok or None,
+                success=True,
+            )
+        elif node_type == "tool_call":
+            prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+            task = (data.get("taskDescription") or data.get("task") or "Respond to the user using the available tools.").strip()
+            if not isinstance(task, str):
+                task = str(task)
+            prompt_text = _apply_variables(task, variables, prev_output=prev)
+            if conversation_prefix:
+                prompt_text = conversation_prefix + prompt_text
+            # System instructions are passed separately to the tool-call handler (not prepended to prompt)
+            _t0_tool_call = time.perf_counter()
+            try:
+                result = _execute_tool_call_node(node_id, node, prompt_text, org_id)
+            except HTTPException as e:
+                _fail_ms = int((time.perf_counter() - _t0_tool_call) * 1000)
+                _record_latency_fact(
+                    org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                    node_id=node_id, node_type="tool_call",
+                    target_type=None, provider_label=(data.get("provider") or "unknown").strip().lower(),
+                    model_name=data.get("modelName"), endpoint_id=None, resolved_base_url=None,
+                    endpoint_slug=endpoint_slug, version=version, execution_mode=execution_mode,
+                    total_latency_ms=_fail_ms, provider_latency_ms=None, gateway_overhead_ms=None,
+                    input_tokens=None, output_tokens=None, success=False,
+                    error_type=_classify_error(e, e.detail), http_status=e.status_code,
+                )
+                if e.status_code == 404 or "API key" in (e.detail or ""):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No API key configured for this provider. Add a key in Settings → Integrations. (node_id={node_id})",
+                    ) from e
+                raise
+            context[node_id] = result
+            last_content_type = "text"
+            total_cost += result["cost"]
+            total_latency += result["latency_ms"]
+            out_tok = result.get("tokens") or 0
+            in_tok = result.get("input_tokens") or 0
+            nr_entry = {
+                "node_id": node_id,
+                "type": "tool_call",
+                "latency_ms": result["latency_ms"],
+                "tokens": out_tok,
+                "tokens_output": out_tok,
+                "input_tokens": in_tok,
+                "tokens_input": in_tok,
+                "cost": result["cost"],
+                "cost_usd": result["cost"],
+                "model": result.get("model"),
+                "provider": result.get("provider"),
+                "output": (result.get("output") or "")[:200] + ("..." if len(result.get("output") or "") > 200 else ""),
+                "prompt_after_interpolation": prompt_text[:2000] + ("..." if len(prompt_text) > 2000 else ""),
+                "tool_calls_count": result.get("tool_calls_count", 0),
+                "tool_calls": result.get("tool_calls", []),
+                "iterations": result.get("iterations", 1),
+            }
+            for _k in ("target_type", "model_registry_id", "endpoint_id", "resolved_base_url"):
+                if result.get(_k):
+                    nr_entry[_k] = result[_k]
+            if result.get("output_warning"):
+                nr_entry["output_warning"] = result["output_warning"]
+                nr_entry["status"] = "warning"
+            node_results.append(nr_entry)
+            _record_latency_fact(
+                org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,
+                node_id=node_id, node_type="tool_call",
                 target_type=result.get("target_type"), provider_label=(result.get("provider") or "unknown").lower(),
                 model_name=result.get("model"), endpoint_id=result.get("endpoint_id"),
                 resolved_base_url=result.get("resolved_base_url"),
