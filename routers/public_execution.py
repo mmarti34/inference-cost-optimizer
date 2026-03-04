@@ -128,6 +128,8 @@ class PublicExecuteBody(BaseModel):
     variables: Optional[dict] = None
     stream: Optional[bool] = False
     conversation_id: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
 
     class Config:
         extra = "ignore"
@@ -157,6 +159,40 @@ async def submit_tool_result(yield_id: str, body: ToolResultBody):
     if not success:
         raise HTTPException(status_code=404, detail="No pending tool yield with this ID — it may have timed out or already been resumed.")
     return {"status": "resumed", "yield_id": yield_id}
+
+
+def _apply_provider_model_overrides(
+    graph_json: dict,
+    provider_override: Optional[str],
+    model_override: Optional[str],
+) -> dict:
+    """
+    Patch all AI nodes in the graph to use caller-specified provider/model.
+    This enables API callers (e.g. Cursor, CLI tools) to select which model
+    the workflow runs on — without modifying the workflow definition.
+    Only overrides nodes that have a provider/modelName field (AI steps, agents,
+    tool_call, vision, image_gen, tts, stt, embedding).
+    """
+    if not provider_override and not model_override:
+        return graph_json
+    ai_node_types = {
+        "ai-step", "model", "agent", "tool_call",
+        "vision_step", "image_gen_step", "tts_step", "stt_step", "embedding_step",
+    }
+    nodes = graph_json.get("nodes", [])
+    patched = []
+    for node in nodes:
+        ntype = (node.get("type") or "").lower()
+        if ntype in ai_node_types:
+            data = dict(node.get("data") or {})
+            if provider_override:
+                data["provider"] = provider_override
+            if model_override:
+                data["modelName"] = model_override
+            patched.append({**node, "data": data})
+        else:
+            patched.append(node)
+    return {**graph_json, "nodes": patched}
 
 
 def _parse_version(version: Optional[str]) -> Optional[int]:
@@ -261,6 +297,10 @@ async def public_execute(
         log_entry["variant_name"] = variant_name
 
         graph_json = deployment.get("graph_json") or {"nodes": [], "edges": []}
+
+        # Apply caller-specified provider/model overrides (e.g. from Cursor / CLI)
+        graph_json = _apply_provider_model_overrides(graph_json, body.provider, body.model)
+
         workflow_id = deployment.get("workflow_id")
         dep_version = deployment.get("version")
         dep_slug = (deployment.get("endpoint_slug") or "").strip() or slug_clean
