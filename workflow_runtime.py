@@ -1303,6 +1303,162 @@ def execute_workflow(
                 input_tokens=in_tok or None, output_tokens=out_tok or None,
                 success=True,
             )
+        elif node_type == "loop":
+            prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+            max_iter = int(data.get("maxIterations") or 5)
+            exit_type = (data.get("exitConditionType") or "none").strip().lower()
+            exit_value = (data.get("exitConditionValue") or "").strip()
+            judge_prompt = (data.get("llmJudgePrompt") or "").strip()
+            judge_provider = (data.get("llmJudgeProvider") or "").strip()
+            judge_model = (data.get("llmJudgeModel") or "").strip()
+
+            # Find the first downstream AI/tool_call node to loop over
+            downstream_edges = edges_out.get(node_id, [])
+            loop_body_node_id = None
+            loop_body_node = None
+            for edge in downstream_edges:
+                target_id = edge.get("target")
+                if not target_id:
+                    continue
+                dn = nodes_by_id.get(target_id)
+                if dn and (dn.get("type") or "").lower() in ("ai-step", "tool_call"):
+                    loop_body_node_id = target_id
+                    loop_body_node = dn
+                    break
+
+            _t0_loop = time.perf_counter()
+            loop_output = prev
+            loop_cost = 0.0
+            loop_latency = 0
+            loop_tokens = 0
+            iterations_run = 0
+
+            for i in range(max_iter):
+                iterations_run = i + 1
+
+                if loop_body_node:
+                    body_type = (loop_body_node.get("type") or "").lower()
+                    body_data = loop_body_node.get("data") or {}
+
+                    if body_type == "ai-step":
+                        task = (body_data.get("taskDescription") or "Respond to the user.").strip()
+                        body_prompt = _apply_variables(task, variables, prev_output=loop_output)
+                        sys_instr = (body_data.get("systemInstructions") or "").strip()
+                        if sys_instr:
+                            sys_instr = _apply_variables(sys_instr, variables)
+                            body_prompt = sys_instr + "\n\n" + body_prompt
+                        body_model_node = {"id": loop_body_node_id, "type": "model", "data": {**body_data, "modelName": body_data.get("modelName") or "gpt-3.5-turbo", "provider": body_data.get("provider") or "OpenAI"}}
+                        try:
+                            step_result = _execute_model_node(loop_body_node_id, body_model_node, body_prompt, org_id)
+                            loop_output = step_result.get("output") or step_result.get("response") or ""
+                            loop_cost += step_result.get("cost", 0)
+                            loop_latency += step_result.get("latency_ms", 0)
+                            loop_tokens += step_result.get("tokens", 0)
+                        except Exception as e:
+                            _logger.warning("Loop body AI step failed at iteration %d: %s", i + 1, e)
+                            break
+
+                    elif body_type == "tool_call":
+                        task = (body_data.get("taskDescription") or "Respond using the tools.").strip()
+                        body_prompt = _apply_variables(task, variables, prev_output=loop_output)
+                        try:
+                            step_result = _execute_tool_call_node(loop_body_node_id, loop_body_node, body_prompt, org_id)
+                            loop_output = step_result.get("output") or step_result.get("response") or ""
+                            loop_cost += step_result.get("cost", 0)
+                            loop_latency += step_result.get("latency_ms", 0)
+                            loop_tokens += step_result.get("tokens", 0)
+                        except Exception as e:
+                            _logger.warning("Loop body tool_call failed at iteration %d: %s", i + 1, e)
+                            break
+
+                # Check exit condition
+                if exit_type == "none":
+                    continue
+                elif exit_type == "contains":
+                    if exit_value and exit_value.lower() in loop_output.lower():
+                        break
+                elif exit_type == "equals":
+                    if loop_output.strip().lower() == exit_value.lower():
+                        break
+                elif exit_type == "not_contains":
+                    if exit_value and exit_value.lower() not in loop_output.lower():
+                        break
+                elif exit_type == "llm_judge":
+                    if judge_provider and judge_model and judge_prompt:
+                        try:
+                            judge_text = judge_prompt.replace("{{output}}", loop_output[:2000])
+                            judge_payload = _PromptPayload(
+                                org_id=org_id, provider=judge_provider, model=judge_model,
+                                prompt=judge_text, prompt_id=f"loop-judge-{node_id}-{i}"
+                            )
+                            router_mod = _ROUTER_MAP.get(judge_provider.lower())
+                            if router_mod:
+                                judge_result = router_mod.handle_prompt(judge_payload)
+                                judge_answer = (judge_result.get("response") or "").strip().lower()
+                                loop_cost += judge_result.get("cost_usd", 0)
+                                if any(w in judge_answer for w in ("yes", "true", "stop", "exit", "done")):
+                                    break
+                        except Exception as e:
+                            _logger.warning("LLM judge failed at iteration %d: %s", i + 1, e)
+
+            _loop_total_ms = int((time.perf_counter() - _t0_loop) * 1000)
+
+            # Set the loop body node in context too so downstream nodes after the body can be skipped
+            if loop_body_node_id:
+                context[loop_body_node_id] = loop_output
+            context[node_id] = loop_output
+            total_cost += loop_cost
+            total_latency += _loop_total_ms
+            node_results.append({
+                "node_id": node_id,
+                "type": "loop",
+                "latency_ms": _loop_total_ms,
+                "tokens": loop_tokens,
+                "cost": loop_cost,
+                "output": loop_output[:200] + ("..." if len(loop_output) > 200 else ""),
+                "iterations_run": iterations_run,
+            })
+        elif node_type == "human_review":
+            prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+            reviewer_instructions = (data.get("reviewerInstructions") or data.get("instructions") or "").strip()
+
+            _t0_review = time.perf_counter()
+
+            if execution_mode == "draft":
+                # In draft/simulation mode, pass through without pausing
+                review_output = prev
+                review_status = "passed_through"
+            else:
+                # In production mode, create a pending review
+                try:
+                    review_record = supabase.table("pending_reviews").insert({
+                        "org_id": org_id,
+                        "workflow_id": workflow_id or "",
+                        "node_id": node_id,
+                        "status": "pending",
+                        "input_data": prev[:5000] if prev else "",
+                        "reviewer_instructions": reviewer_instructions,
+                    }).execute()
+                    review_id = review_record.data[0]["id"] if review_record.data else "unknown"
+                    review_output = f"[Awaiting human review: {review_id}]"
+                    review_status = "pending"
+                except Exception as e:
+                    _logger.error("Failed to create pending review: %s", e)
+                    review_output = prev
+                    review_status = "error"
+
+            _review_ms = int((time.perf_counter() - _t0_review) * 1000)
+            context[node_id] = review_output
+            node_results.append({
+                "node_id": node_id,
+                "type": "human_review",
+                "latency_ms": _review_ms,
+                "tokens": 0,
+                "cost": 0,
+                "output": review_output[:200],
+                "review_status": review_status,
+            })
+
         elif node_type == "model":
             prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
             if conversation_prefix:

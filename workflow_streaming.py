@@ -92,8 +92,8 @@ async def _stream_ai_step_openai(
 
 def _is_linear_streamable_workflow(graph: dict) -> tuple[bool, list[str] | None]:
     """
-    If the workflow is linear (input -> prompt? -> ai-step/tool_call -> output) with exactly one
-    ai-step or tool_call and no condition/router/optimizer, return (True, ordered node ids).
+    If the workflow is linear (input -> prompt? -> ai-step/tool_call/loop -> output) with exactly one
+    ai-step, tool_call, or loop node and no condition/router/optimizer, return (True, ordered node ids).
     Else (False, None).
     """
     nodes_by_id = _nodes_by_id(graph)
@@ -130,8 +130,24 @@ def _is_linear_streamable_workflow(graph: dict) -> tuple[bool, list[str] | None]
                 if tid:
                     queue.append(tid)
                     break
-    # Accept exactly one ai-step OR one tool_call (not both)
-    ai_count = sum(1 for nid in path if (nodes_by_id.get(nid) or {}).get("type", "").lower() in ("ai-step", "tool_call"))
+    # Accept exactly one ai-step, tool_call, or loop (not multiple).
+    # When a loop node is present, its downstream body node (ai-step/tool_call) is
+    # part of the loop and should not be counted separately.
+    loop_body_ids: set[str] = set()
+    for nid in path:
+        n = nodes_by_id.get(nid)
+        if n and (n.get("type") or "").lower() == "loop":
+            for e in edges_out.get(nid) or []:
+                tid = e.get("target")
+                if tid:
+                    tn = nodes_by_id.get(tid)
+                    if tn and (tn.get("type") or "").lower() in ("ai-step", "tool_call"):
+                        loop_body_ids.add(tid)
+    ai_count = sum(
+        1 for nid in path
+        if nid not in loop_body_ids
+        and (nodes_by_id.get(nid) or {}).get("type", "").lower() in ("ai-step", "tool_call", "loop")
+    )
     if ai_count != 1:
         return False, None
     has_output = any((nodes_by_id.get(nid) or {}).get("type", "").lower() == "output" for nid in path)
@@ -177,6 +193,10 @@ async def stream_workflow_async(
             for node_id in path:
                 node = nodes_by_id.get(node_id)
                 if not node:
+                    continue
+                # Skip nodes already executed (e.g. loop body nodes set in context by loop handler)
+                if node_id in context:
+                    from_node_id = node_id
                     continue
                 ntype = (node.get("type") or "").lower()
                 data = node.get("data") or {}
@@ -277,6 +297,144 @@ async def stream_workflow_async(
                         "output": full_output[:200], "tokens": out_tok, "input_tokens": in_tok,
                         "model": model, "provider": provider,
                         "tool_calls": tool_calls, "iterations": iterations,
+                    })
+                elif ntype == "loop":
+                    # Run loop node in a thread — emit iteration events as SSE
+                    prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+                    step_start = time.perf_counter()
+
+                    # Capture closure variables for the thread
+                    _loop_node_id = node_id
+                    _loop_data = data
+                    _loop_prev = prev
+                    _loop_variables = variables
+                    _loop_org_id = org_id
+                    _loop_nodes_by_id = nodes_by_id
+                    _loop_edges_out = edges_out
+
+                    def _run_loop():
+                        import time as _time
+                        from workflow_runtime import (
+                            _execute_model_node,
+                            _execute_tool_call_node,
+                            _PromptPayload,
+                            _ROUTER_MAP,
+                        )
+                        max_iter = int(_loop_data.get("maxIterations") or 5)
+                        exit_type = (_loop_data.get("exitConditionType") or "none").strip().lower()
+                        exit_value = (_loop_data.get("exitConditionValue") or "").strip()
+                        judge_prompt = (_loop_data.get("llmJudgePrompt") or "").strip()
+                        judge_provider = (_loop_data.get("llmJudgeProvider") or "").strip()
+                        judge_model = (_loop_data.get("llmJudgeModel") or "").strip()
+
+                        downstream_edges = _loop_edges_out.get(_loop_node_id, [])
+                        loop_body_node_id = None
+                        loop_body_node = None
+                        for edge in downstream_edges:
+                            target_id = edge.get("target")
+                            if not target_id:
+                                continue
+                            dn = _loop_nodes_by_id.get(target_id)
+                            if dn and (dn.get("type") or "").lower() in ("ai-step", "tool_call"):
+                                loop_body_node_id = target_id
+                                loop_body_node = dn
+                                break
+
+                        loop_output = _loop_prev
+                        loop_cost = 0.0
+                        loop_tokens = 0
+                        iterations_run = 0
+
+                        for i in range(max_iter):
+                            iterations_run = i + 1
+                            if loop_body_node:
+                                body_type = (loop_body_node.get("type") or "").lower()
+                                body_data = loop_body_node.get("data") or {}
+                                if body_type == "ai-step":
+                                    task = (body_data.get("taskDescription") or "Respond to the user.").strip()
+                                    body_prompt = _apply_variables(task, _loop_variables, prev_output=loop_output)
+                                    sys_instr = (body_data.get("systemInstructions") or "").strip()
+                                    if sys_instr:
+                                        sys_instr = _apply_variables(sys_instr, _loop_variables)
+                                        body_prompt = sys_instr + "\n\n" + body_prompt
+                                    body_model_node = {"id": loop_body_node_id, "type": "model", "data": {**body_data, "modelName": body_data.get("modelName") or "gpt-3.5-turbo", "provider": body_data.get("provider") or "OpenAI"}}
+                                    try:
+                                        step_result = _execute_model_node(loop_body_node_id, body_model_node, body_prompt, _loop_org_id)
+                                        loop_output = step_result.get("output") or step_result.get("response") or ""
+                                        loop_cost += step_result.get("cost", 0)
+                                        loop_tokens += step_result.get("tokens", 0)
+                                    except Exception:
+                                        break
+                                elif body_type == "tool_call":
+                                    task = (body_data.get("taskDescription") or "Respond using the tools.").strip()
+                                    body_prompt = _apply_variables(task, _loop_variables, prev_output=loop_output)
+                                    try:
+                                        step_result = _execute_tool_call_node(loop_body_node_id, loop_body_node, body_prompt, _loop_org_id)
+                                        loop_output = step_result.get("output") or step_result.get("response") or ""
+                                        loop_cost += step_result.get("cost", 0)
+                                        loop_tokens += step_result.get("tokens", 0)
+                                    except Exception:
+                                        break
+
+                            if exit_type == "none":
+                                continue
+                            elif exit_type == "contains":
+                                if exit_value and exit_value.lower() in loop_output.lower():
+                                    break
+                            elif exit_type == "equals":
+                                if loop_output.strip().lower() == exit_value.lower():
+                                    break
+                            elif exit_type == "not_contains":
+                                if exit_value and exit_value.lower() not in loop_output.lower():
+                                    break
+                            elif exit_type == "llm_judge":
+                                if judge_provider and judge_model and judge_prompt:
+                                    try:
+                                        judge_text = judge_prompt.replace("{{output}}", loop_output[:2000])
+                                        judge_payload = _PromptPayload(
+                                            org_id=_loop_org_id, provider=judge_provider, model=judge_model,
+                                            prompt=judge_text, prompt_id=f"loop-judge-{_loop_node_id}-{i}"
+                                        )
+                                        router_mod = _ROUTER_MAP.get(judge_provider.lower())
+                                        if router_mod:
+                                            judge_result = router_mod.handle_prompt(judge_payload)
+                                            judge_answer = (judge_result.get("response") or "").strip().lower()
+                                            loop_cost += judge_result.get("cost_usd", 0)
+                                            if any(w in judge_answer for w in ("yes", "true", "stop", "exit", "done")):
+                                                break
+                                    except Exception:
+                                        pass
+
+                        return {
+                            "output": loop_output,
+                            "cost": loop_cost,
+                            "tokens": loop_tokens,
+                            "iterations_run": iterations_run,
+                            "loop_body_node_id": loop_body_node_id,
+                        }
+
+                    loop_result = await asyncio.to_thread(_run_loop)
+                    latency_ms = int((time.perf_counter() - step_start) * 1000)
+
+                    full_output = loop_result.get("output", "")
+                    cost_usd = float(loop_result.get("cost", 0))
+                    loop_tokens_total = loop_result.get("tokens", 0)
+                    iterations_run = loop_result.get("iterations_run", 0)
+                    loop_body_nid = loop_result.get("loop_body_node_id")
+
+                    yield _sse_event("iteration", {"node_id": node_id, "iterations": iterations_run})
+
+                    context[node_id] = full_output
+                    # Also set body node in context so it gets skipped in path traversal
+                    if loop_body_nid:
+                        context[loop_body_nid] = full_output
+                    total_cost += cost_usd
+                    total_latency += latency_ms
+                    last_content_type = "text"
+                    node_results.append({
+                        "node_id": node_id, "type": "loop", "latency_ms": latency_ms, "cost": cost_usd,
+                        "output": full_output[:200], "tokens": loop_tokens_total,
+                        "iterations_run": iterations_run,
                     })
                 elif ntype == "output":
                     prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
