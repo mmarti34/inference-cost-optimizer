@@ -213,3 +213,141 @@ def handle_prompt(payload: PromptPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini call failed: {str(e)}")
+
+
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+    """
+    Tool calling via Gemini using google.generativeai SDK.
+    Converts generic tool format to Gemini function declarations, runs iteration loop.
+    """
+    api_key = _get_gemini_api_key(payload.org_id)
+    genai.configure(api_key=api_key)
+
+    # Convert tools to Gemini function declarations
+    function_declarations = []
+    for t in tools:
+        if not t.get("name"):
+            continue
+        params = t.get("parameters") or {"type": "object", "properties": {}}
+        # Gemini uses a slightly different schema format — pass as-is, SDK handles it
+        function_declarations.append({
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "parameters": params,
+        })
+
+    gemini_tools = None
+    if function_declarations:
+        gemini_tools = [genai.types.Tool(function_declarations=function_declarations)]
+
+    model_name = (payload.model or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+    model = genai.GenerativeModel(
+        model_name,
+        system_instruction=system_message or "You are a helpful assistant.",
+    )
+
+    chat = model.start_chat()
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_provider_latency_ms = 0
+    all_tool_calls = []
+    iteration_count = 0
+    reply = ""
+
+    try:
+        # First message
+        _t0 = time.perf_counter()
+        response = chat.send_message(payload.prompt, tools=gemini_tools)
+        _provider_ms = int((time.perf_counter() - _t0) * 1000)
+        total_provider_latency_ms += _provider_ms
+
+        usage = getattr(response, "usage_metadata", None)
+        total_input_tokens += getattr(usage, "prompt_token_count", 0) if usage else 0
+        total_output_tokens += getattr(usage, "candidates_token_count", 0) if usage else 0
+
+        for iteration_count in range(1, max_iterations + 1):
+            # Check for function calls in response
+            candidate = response.candidates[0] if response.candidates else None
+            if not candidate:
+                break
+
+            parts = candidate.content.parts if hasattr(candidate.content, "parts") else []
+            function_calls = [p for p in parts if hasattr(p, "function_call") and p.function_call.name]
+
+            if not function_calls:
+                # Text response — done
+                reply = response.text if hasattr(response, "text") else ""
+                break
+
+            # Execute each function call
+            function_responses = []
+            for fc_part in function_calls:
+                fc = fc_part.function_call
+                tc_name = fc.name
+                tc_args = dict(fc.args) if fc.args else {}
+
+                if tool_executor:
+                    result_str, tool_latency_ms = tool_executor(tc_name, tc_args)
+                else:
+                    result_str, tool_latency_ms = "No tool executor configured", 0
+
+                all_tool_calls.append({
+                    "name": tc_name,
+                    "arguments": tc_args,
+                    "result": result_str[:2000],
+                    "latency_ms": tool_latency_ms,
+                })
+
+                function_responses.append(
+                    genai.types.Part.from_function_response(
+                        name=tc_name,
+                        response={"result": result_str[:4000]},
+                    )
+                )
+
+            # Send function results back
+            _t0 = time.perf_counter()
+            response = chat.send_message(function_responses, tools=gemini_tools)
+            _provider_ms = int((time.perf_counter() - _t0) * 1000)
+            total_provider_latency_ms += _provider_ms
+
+            usage = getattr(response, "usage_metadata", None)
+            total_input_tokens += getattr(usage, "prompt_token_count", 0) if usage else 0
+            total_output_tokens += getattr(usage, "candidates_token_count", 0) if usage else 0
+        else:
+            # Loop exhausted
+            reply = response.text if hasattr(response, "text") else ""
+
+        # If we broke out with text
+        if not reply and hasattr(response, "text"):
+            reply = response.text
+
+        # Pricing
+        try:
+            pricing = get_pricing("gemini", model_name)
+        except Exception:
+            pricing = {"input": 0, "output": 0}
+        total_cost = (total_input_tokens * pricing["input"] + total_output_tokens * pricing["output"]) / 1000
+
+        log_usage(
+            payload.org_id, "Gemini", model_name,
+            payload.prompt[:200], (reply or "")[:200], payload.prompt_id,
+            input_tokens=total_input_tokens, output_tokens=total_output_tokens,
+            total_tokens=total_input_tokens + total_output_tokens, cost_usd=total_cost,
+        )
+
+        return {
+            "status": "success",
+            "response": reply,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens,
+            "cost_usd": total_cost,
+            "provider_latency_ms": total_provider_latency_ms,
+            "tool_calls": all_tool_calls,
+            "tool_calls_count": len(all_tool_calls),
+            "iterations": iteration_count,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini tool-call failed: {e}")

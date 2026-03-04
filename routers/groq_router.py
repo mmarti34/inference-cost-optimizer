@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from supabase_client import supabase
 from utils.encryption import decrypt_api_key
 from utils.usage_logger import log_usage
-from utils.openai_compatible import call_openai_compatible
+from utils.openai_compatible import call_openai_compatible, call_openai_compatible_with_tools
 
 router = APIRouter()
 
@@ -98,3 +98,15 @@ def handle_prompt(payload: PromptPayload):
         input_tokens=out["input_tokens"], output_tokens=out["output_tokens"], total_tokens=out["total_tokens"], cost_usd=out["cost_usd"], org_id=payload.org_id
     )
     return {"status": "success", "response": out["response"], "input_tokens": out["input_tokens"], "output_tokens": out["output_tokens"], "total_tokens": out["total_tokens"], "cost_usd": out["cost_usd"], "provider_latency_ms": out.get("provider_latency_ms")}
+
+
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+    """Tool calling via Groq (OpenAI-compatible)."""
+    from api_key_cache import get_provider_api_key
+    api_key = get_provider_api_key(payload.org_id, "groq")
+    return call_openai_compatible_with_tools(
+        "https://api.groq.com/openai/v1", api_key, "groq", payload.model,
+        payload.prompt, tools, tool_executor=tool_executor,
+        system_message=system_message, max_iterations=max_iterations,
+        prompt_id=payload.prompt_id, org_id=payload.org_id,
+    )

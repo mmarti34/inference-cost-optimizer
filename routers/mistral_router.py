@@ -7,7 +7,7 @@ from supabase_client import supabase
 from utils.usage_logger import log_usage
 from utils.pricing import get_pricing
 from utils.encryption import decrypt_api_key
-from utils.openai_compatible import call_openai_compatible_embeddings
+from utils.openai_compatible import call_openai_compatible_embeddings, call_openai_compatible_with_tools
 
 router = APIRouter()
 
@@ -141,3 +141,15 @@ def handle_prompt(payload: PromptPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Mistral call failed: {str(e)}")
+
+
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+    """Tool calling via Mistral (OpenAI-compatible API)."""
+    from api_key_cache import get_provider_api_key
+    api_key = get_provider_api_key(payload.org_id, "mistral")
+    return call_openai_compatible_with_tools(
+        "https://api.mistral.ai/v1", api_key, "mistral", payload.model,
+        payload.prompt, tools, tool_executor=tool_executor,
+        system_message=system_message, max_iterations=max_iterations,
+        prompt_id=payload.prompt_id, org_id=payload.org_id,
+    )

@@ -344,6 +344,58 @@ def _is_private_url(url: str) -> bool:
         return True  # If we can't parse, block it
 
 
+_secrets_cache: dict[str, dict[str, str]] = {}  # org_id -> {NAME: decrypted_value}
+
+
+def _resolve_secrets(tool_def: dict, org_id: str) -> dict:
+    """
+    Replace {{secrets.NAME}} placeholders in tool definition fields
+    (url, headers, hmacSecret) with decrypted values from org_secrets table.
+    Returns a new dict with resolved values. Does NOT mutate the original.
+    """
+    import re
+    pattern = re.compile(r"\{\{secrets\.([A-Z0-9_]+)\}\}", re.IGNORECASE)
+    fields_to_resolve = ("url", "headers", "hmacSecret", "hmac_secret")
+
+    # Check if any field contains a secret reference
+    needs_resolve = False
+    for f in fields_to_resolve:
+        val = tool_def.get(f)
+        if isinstance(val, str) and "{{secrets." in val:
+            needs_resolve = True
+            break
+    if not needs_resolve:
+        return tool_def
+
+    # Load secrets for this org (cached per execution)
+    if org_id not in _secrets_cache:
+        try:
+            from utils.encryption import decrypt_api_key
+            result = supabase.table("org_secrets").select("name, encrypted_value").eq("org_id", org_id).execute()
+            secrets = {}
+            for row in (result.data or []):
+                try:
+                    secrets[row["name"].upper()] = decrypt_api_key(row["encrypted_value"])
+                except Exception:
+                    pass  # Skip secrets that fail to decrypt
+            _secrets_cache[org_id] = secrets
+        except Exception:
+            _secrets_cache[org_id] = {}
+
+    org_secrets = _secrets_cache[org_id]
+
+    def replacer(match: re.Match) -> str:
+        secret_name = match.group(1).upper()
+        return org_secrets.get(secret_name, match.group(0))  # Keep placeholder if not found
+
+    resolved = dict(tool_def)
+    for f in fields_to_resolve:
+        val = resolved.get(f)
+        if isinstance(val, str) and "{{secrets." in val:
+            resolved[f] = pattern.sub(replacer, val)
+    return resolved
+
+
 def _execute_tool(tool_def: dict, name: str, arguments: dict) -> tuple[str, int]:
     """
     Execute a single tool call. Returns (result_str, latency_ms).
@@ -397,6 +449,64 @@ def _execute_tool(tool_def: dict, name: str, arguments: dict) -> tuple[str, int]
                 result = datetime.now(timezone.utc).isoformat()
                 latency_ms = int((time.perf_counter() - _t0) * 1000)
                 return result, latency_ms
+            elif name == "current_date":
+                fmt = arguments.get("format", "%Y-%m-%d")
+                try:
+                    result = datetime.now(timezone.utc).strftime(fmt)
+                except Exception:
+                    result = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            elif name == "generate_random_id":
+                import uuid
+                result = str(uuid.uuid4())
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            elif name == "json_parse":
+                raw = arguments.get("text", arguments.get("json_string", ""))
+                try:
+                    parsed = json.loads(raw)
+                    result = json.dumps(parsed, indent=2)
+                except (json.JSONDecodeError, TypeError) as e:
+                    result = f"Invalid JSON: {str(e)[:200]}"
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            elif name == "math_eval":
+                import ast
+                expr = str(arguments.get("expression", ""))
+                try:
+                    tree = ast.parse(expr, mode="eval")
+                    for node in ast.walk(tree):
+                        if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                                                  ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+                                                  ast.FloorDiv, ast.USub, ast.UAdd)):
+                            raise ValueError(f"Unsupported operation: {type(node).__name__}")
+                    result = str(eval(compile(tree, "<math>", "eval")))
+                except Exception as e:
+                    result = f"Math error: {str(e)[:200]}"
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            elif name == "base64_encode":
+                import base64 as _b64
+                text = str(arguments.get("text", ""))
+                result = _b64.b64encode(text.encode("utf-8")).decode("ascii")
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            elif name == "base64_decode":
+                import base64 as _b64
+                encoded = str(arguments.get("text", ""))
+                try:
+                    result = _b64.b64decode(encoded).decode("utf-8")
+                except Exception as e:
+                    result = f"Decode error: {str(e)[:200]}"
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
+            elif name == "url_encode":
+                from urllib.parse import quote
+                text = str(arguments.get("text", ""))
+                result = quote(text, safe="")
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                return result, latency_ms
             return f"Unknown built-in tool: {name}", 0
 
         else:
@@ -407,7 +517,7 @@ def _execute_tool(tool_def: dict, name: str, arguments: dict) -> tuple[str, int]
         return f"Error: {str(e)[:500]}", latency_ms
 
 
-_TOOL_CALL_PROVIDERS = {"openai", "anthropic"}
+_TOOL_CALL_PROVIDERS = {"openai", "anthropic", "groq", "together", "deepseek", "fireworks", "mistral", "gemini"}
 
 
 def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
@@ -433,7 +543,9 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
 
     def tool_executor(name: str, arguments: dict) -> tuple[str, int]:
         tool_def = tools_by_name.get(name, {"type": "builtin"})
-        return _execute_tool(tool_def, name, arguments)
+        # Resolve {{secrets.NAME}} placeholders before execution
+        resolved_def = _resolve_secrets(tool_def, org_id)
+        return _execute_tool(resolved_def, name, arguments)
 
     sys_msg = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
     max_iters = int(data.get("maxIterations") or 5)
@@ -458,6 +570,15 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
                 max_iterations=max_iters, tool_executor=tool_executor,
             ),
             context_label=f"anthropic/{model} (tool_call node {node_id})",
+        )
+    elif provider_lower in ("groq", "together", "deepseek", "fireworks", "mistral", "gemini"):
+        router_mod = _ROUTER_MAP[provider_lower]
+        result = call_with_resilience(
+            lambda: router_mod.handle_prompt_with_tools(
+                payload, generic_tools, system_message=sys_msg,
+                max_iterations=max_iters, tool_executor=tool_executor,
+            ),
+            context_label=f"{provider_lower}/{model} (tool_call node {node_id})",
         )
     else:
         # OpenAI and OpenAI-compatible
@@ -950,6 +1071,9 @@ def execute_workflow(
     If variables is provided, {{varName}} in AI Step/prompt templates are replaced; input_text can be empty.
     If conversation_prefix is set (multi-turn), it is prepended to the prompt for each AI/model step.
     """
+    # Clear per-execution secrets cache
+    _secrets_cache.clear()
+
     nodes_by_id = _nodes_by_id(graph)
     edges_out = _edges_out(graph)
     input_node_id = _find_input_node(nodes_by_id)

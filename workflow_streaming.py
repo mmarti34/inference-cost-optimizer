@@ -23,6 +23,7 @@ from workflow_runtime import (
     _edges_out,
     _find_input_node,
     _entry_point_ids,
+    _execute_tool,
 )
 
 
@@ -89,10 +90,11 @@ async def _stream_ai_step_openai(
     yield {"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
 
 
-def _is_linear_single_ai_workflow(graph: dict) -> tuple[bool, list[str] | None]:
+def _is_linear_streamable_workflow(graph: dict) -> tuple[bool, list[str] | None]:
     """
-    If the workflow is linear (input -> prompt? -> ai-step -> output) with exactly one ai-step
-    and no condition/router/optimizer, return (True, ordered node ids). Else (False, None).
+    If the workflow is linear (input -> prompt? -> ai-step/tool_call -> output) with exactly one
+    ai-step or tool_call and no condition/router/optimizer, return (True, ordered node ids).
+    Else (False, None).
     """
     nodes_by_id = _nodes_by_id(graph)
     edges_out = _edges_out(graph)
@@ -128,7 +130,8 @@ def _is_linear_single_ai_workflow(graph: dict) -> tuple[bool, list[str] | None]:
                 if tid:
                     queue.append(tid)
                     break
-    ai_count = sum(1 for nid in path if (nodes_by_id.get(nid) or {}).get("type", "").lower() == "ai-step")
+    # Accept exactly one ai-step OR one tool_call (not both)
+    ai_count = sum(1 for nid in path if (nodes_by_id.get(nid) or {}).get("type", "").lower() in ("ai-step", "tool_call"))
     if ai_count != 1:
         return False, None
     has_output = any((nodes_by_id.get(nid) or {}).get("type", "").lower() == "output" for nid in path)
@@ -161,7 +164,7 @@ async def stream_workflow_async(
     edges_out = _edges_out(graph_json)
     start = time.perf_counter()
 
-    linear_ok, path = _is_linear_single_ai_workflow(graph_json)
+    linear_ok, path = _is_linear_streamable_workflow(graph_json)
     use_linear = bool(linear_ok and path)
     if use_linear:
         context: dict[str, Any] = {}
@@ -222,6 +225,58 @@ async def stream_workflow_async(
                         "node_id": node_id, "type": "ai-step", "latency_ms": latency_ms, "cost": cost_usd,
                         "output": full_output[:200], "tokens": out_tok, "input_tokens": in_tok,
                         "model": model, "provider": "openai",
+                    })
+                elif ntype == "tool_call":
+                    # Stream tool call iterations — run synchronously in thread, emit SSE per iteration
+                    prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
+                    prompt_text = _apply_variables(str(data.get("taskDescription") or data.get("task") or "Respond to the user."), variables, prev_output=prev)
+                    if conversation_prefix:
+                        prompt_text = conversation_prefix + prompt_text
+                    sys_instructions = _apply_variables(str(data.get("systemInstructions") or data.get("system_prefix") or ""), variables).strip()
+                    provider = (data.get("provider") or "openai").strip().lower()
+                    model = (data.get("modelName") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+                    max_iters = int(data.get("maxIterations") or 5)
+                    max_iters = max(1, min(max_iters, 20))
+                    tools_config = data.get("tools") or []
+                    generic_tools = [
+                        {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters") or {"type": "object", "properties": {}}}
+                        for t in tools_config if t.get("name")
+                    ]
+                    tools_by_name = {t["name"]: t for t in tools_config if t.get("name")}
+
+                    # Run the tool call node in a thread and collect results
+                    step_start = time.perf_counter()
+
+                    def _run_tool_call():
+                        from workflow_runtime import _execute_tool_call_node
+                        return _execute_tool_call_node(node_id, node, prompt_text, org_id)
+
+                    tool_result = await asyncio.to_thread(_run_tool_call)
+                    latency_ms = int((time.perf_counter() - step_start) * 1000)
+
+                    full_output = tool_result.get("output", "")
+                    cost_usd = float(tool_result.get("cost", 0))
+                    in_tok = tool_result.get("input_tokens", 0)
+                    out_tok = tool_result.get("tokens", 0)
+                    tool_calls = tool_result.get("tool_calls", [])
+                    iterations = tool_result.get("iterations", 1)
+
+                    # Emit tool call events for each tool that was called
+                    for tc in tool_calls:
+                        yield _sse_event("tool_call_start", {"node_id": node_id, "tool_name": tc.get("name", ""), "arguments": tc.get("arguments", {})})
+                        yield _sse_event("tool_call_end", {"node_id": node_id, "tool_name": tc.get("name", ""), "result": (tc.get("result", ""))[:500], "latency_ms": tc.get("latency_ms", 0)})
+
+                    yield _sse_event("iteration", {"node_id": node_id, "iterations": iterations, "tool_calls_count": len(tool_calls)})
+
+                    context[node_id] = full_output
+                    total_cost += cost_usd
+                    total_latency += latency_ms
+                    last_content_type = "text"
+                    node_results.append({
+                        "node_id": node_id, "type": "tool_call", "latency_ms": latency_ms, "cost": cost_usd,
+                        "output": full_output[:200], "tokens": out_tok, "input_tokens": in_tok,
+                        "model": model, "provider": provider,
+                        "tool_calls": tool_calls, "iterations": iterations,
                     })
                 elif ntype == "output":
                     prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
