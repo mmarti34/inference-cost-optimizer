@@ -329,8 +329,8 @@ async def stream_workflow_async(
                     for rs in reasoning_steps:
                         yield _sse_event("agent_step", {
                             "node_id": node_id,
-                            "step": rs.get("step", 0),
-                            "type": rs.get("type", ""),
+                            "step_number": rs.get("step", 0),
+                            "step_type": rs.get("type", ""),
                             "content": (rs.get("content") or "")[:500],
                             "tool_name": rs.get("tool_name", ""),
                             "tool_input": rs.get("tool_input", {}),
