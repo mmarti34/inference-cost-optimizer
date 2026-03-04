@@ -15,6 +15,10 @@ CHARS_PER_TOKEN = 4
 DEFAULT_MAX_TOKENS = 8000
 DEFAULT_MAX_TURNS = 50
 
+# Agent conversations are verbose (tool calls, reasoning) — higher limits
+AGENT_MAX_TOKENS = 16000
+AGENT_MAX_TURNS = 20
+
 
 def get_or_create_conversation(
     org_id: str,
@@ -109,6 +113,31 @@ def format_history_as_prefix(turns: list[dict]) -> str:
         else:
             parts.append(f"User: {content}")
     return "\n\n".join(parts) + "\n\n"
+
+
+def format_agent_history_as_prefix(turns: list[dict]) -> str:
+    """Format conversation turns with structured delimiters and tool usage summaries.
+
+    Optimised for agent nodes — preserves tool call metadata stored in the
+    ``variables`` JSON column so the agent has richer context on follow-up turns.
+    """
+    if not turns:
+        return ""
+    parts: list[str] = []
+    for t in turns:
+        role = (t.get("role") or "user").strip().lower()
+        content = (t.get("content") or "").strip()
+        metadata = t.get("variables") or {}
+
+        if role == "assistant":
+            tool_summary = metadata.get("agent_tool_summary", "") if isinstance(metadata, dict) else ""
+            if tool_summary:
+                parts.append(f"[Previous assistant response]\n{tool_summary}\nFinal answer: {content}")
+            else:
+                parts.append(f"[Previous assistant response]\n{content}")
+        else:
+            parts.append(f"[Previous user message]\n{content}")
+    return "\n---\n".join(parts) + "\n---\n"
 
 
 def save_conversation_turn(

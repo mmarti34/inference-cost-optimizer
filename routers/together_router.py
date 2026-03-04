@@ -80,7 +80,7 @@ def handle_prompt(payload: PromptPayload):
     return {"status": "success", "response": out["response"], "input_tokens": out["input_tokens"], "output_tokens": out["output_tokens"], "total_tokens": out["total_tokens"], "cost_usd": out["cost_usd"], "provider_latency_ms": out.get("provider_latency_ms")}
 
 
-def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None, can_parallelize_tool=None):
     """Tool calling via Together (OpenAI-compatible)."""
     from api_key_cache import get_provider_api_key
     api_key = get_provider_api_key(payload.org_id, "together")
@@ -89,4 +89,5 @@ def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str 
         payload.prompt, tools, tool_executor=tool_executor,
         system_message=system_message, max_iterations=max_iterations,
         prompt_id=payload.prompt_id, org_id=payload.org_id,
+        can_parallelize_tool=can_parallelize_tool,
     )

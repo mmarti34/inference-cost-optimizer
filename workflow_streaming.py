@@ -579,7 +579,18 @@ async def stream_workflow_async(
                         )
                         n = get_next_turn_number(conversation_id)
                         save_conversation_turn(conversation_id, n, "user", input_text, variables, request_id, served_version)
-                        save_conversation_turn(conversation_id, n + 1, "assistant", prev, None, request_id, served_version)
+                        # For agent workflows, store tool call summary in variables column
+                        _assistant_vars = None
+                        for _nr in node_results:
+                            if _nr.get("type") == "agent" and _nr.get("reasoning_steps"):
+                                _tool_summary = "; ".join(
+                                    f"{s.get('tool_name', '?')}({s.get('latency_ms', 0)}ms)"
+                                    for s in _nr["reasoning_steps"] if s.get("type") == "act"
+                                )
+                                if _tool_summary:
+                                    _assistant_vars = {"agent_tool_summary": f"Tools used: {_tool_summary}"}
+                                break
+                        save_conversation_turn(conversation_id, n + 1, "assistant", prev, _assistant_vars, request_id, served_version)
                         update_conversation_updated_at(conversation_id)
                     yield _sse_event("step_end", {"node_id": node_id, "type": ntype, "latency_ms": 0, "cost": 0, "output": prev[:500]})
                     run_id = _insert_workflow_run_linear(
@@ -671,7 +682,17 @@ async def stream_workflow_async(
         )
         n = get_next_turn_number(conversation_id)
         save_conversation_turn(conversation_id, n, "user", input_text, variables, request_id, served_version)
-        save_conversation_turn(conversation_id, n + 1, "assistant", result["final_output"], None, request_id, served_version)
+        _assistant_vars2 = None
+        for _nr2 in (result.get("node_results") or []):
+            if _nr2.get("type") == "agent" and _nr2.get("reasoning_steps"):
+                _ts2 = "; ".join(
+                    f"{s.get('tool_name', '?')}({s.get('latency_ms', 0)}ms)"
+                    for s in _nr2["reasoning_steps"] if s.get("type") == "act"
+                )
+                if _ts2:
+                    _assistant_vars2 = {"agent_tool_summary": f"Tools used: {_ts2}"}
+                break
+        save_conversation_turn(conversation_id, n + 1, "assistant", result["final_output"], _assistant_vars2, request_id, served_version)
         update_conversation_updated_at(conversation_id)
     yield _sse_event(
         "done",

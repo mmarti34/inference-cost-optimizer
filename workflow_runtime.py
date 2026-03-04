@@ -550,6 +550,10 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
         resolved_def = _resolve_secrets(tool_def, org_id)
         return _execute_tool(resolved_def, name, arguments)
 
+    def _tc_can_parallelize(tool_name: str) -> bool:
+        tool_def = tools_by_name.get(tool_name, {})
+        return tool_def.get("execution") != "client"
+
     sys_msg = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
     max_iters = int(data.get("maxIterations") or 5)
     max_iters = max(1, min(max_iters, 20))
@@ -563,6 +567,7 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
             lambda: openai_router.handle_prompt_with_tools(
                 payload, generic_tools, target=target, system_message=sys_msg,
                 max_iterations=max_iters, tool_executor=tool_executor,
+                can_parallelize_tool=_tc_can_parallelize,
             ),
             context_label=f"custom-endpoint/{model} (tool_call node {node_id})",
         )
@@ -571,6 +576,7 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
             lambda: anthropic_router.handle_prompt_with_tools(
                 payload, generic_tools, system_message=sys_msg,
                 max_iterations=max_iters, tool_executor=tool_executor,
+                can_parallelize_tool=_tc_can_parallelize,
             ),
             context_label=f"anthropic/{model} (tool_call node {node_id})",
         )
@@ -580,6 +586,7 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
             lambda: router_mod.handle_prompt_with_tools(
                 payload, generic_tools, system_message=sys_msg,
                 max_iterations=max_iters, tool_executor=tool_executor,
+                can_parallelize_tool=_tc_can_parallelize,
             ),
             context_label=f"{provider_lower}/{model} (tool_call node {node_id})",
         )
@@ -589,6 +596,7 @@ def _execute_tool_call_node(node_id: str, node: dict, prompt_text: str, org_id: 
             lambda: openai_router.handle_prompt_with_tools(
                 payload, generic_tools, system_message=sys_msg,
                 max_iterations=max_iters, tool_executor=tool_executor,
+                can_parallelize_tool=_tc_can_parallelize,
             ),
             context_label=f"{provider_lower}/{model} (tool_call node {node_id})",
         )
@@ -735,19 +743,28 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
     # ── Recording tool executor ─────────────────────────────────────────
     reasoning_steps: list[dict] = []
     step_counter = [0]
+    import threading as _threading
+    _step_lock = _threading.Lock()
+
+    def can_parallelize_tool(tool_name: str) -> bool:
+        """Return True if this tool can be executed in parallel (server-side only)."""
+        tool_def = tools_by_name.get(tool_name, {})
+        return tool_def.get("execution") != "client"
 
     def agent_tool_executor(name: str, arguments: dict) -> tuple[str, int]:
-        step_counter[0] += 1
-        # Record the act step
-        reasoning_steps.append({
-            "step": step_counter[0],
-            "type": "act",
-            "tool_name": name,
-            "tool_input": arguments,
-        })
+        with _step_lock:
+            step_counter[0] += 1
+            current_step = step_counter[0]
+            # Record the act step
+            reasoning_steps.append({
+                "step": current_step,
+                "type": "act",
+                "tool_name": name,
+                "tool_input": arguments,
+            })
         if event_queue:
             event_queue.put({"event": "agent_step", "data": {
-                "node_id": node_id, "step_number": step_counter[0], "step_type": "act",
+                "node_id": node_id, "step_number": current_step, "step_type": "act",
                 "content": "", "tool_name": name, "tool_input": arguments, "latency_ms": 0,
             }})
 
@@ -758,7 +775,8 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
             if not event_queue:
                 # Non-streaming mode — client tools cannot work
                 err = f"Tool '{name}' requires client-side execution (only available in streaming mode)"
-                reasoning_steps.append({"step": step_counter[0], "type": "observe", "content": err, "latency_ms": 0})
+                with _step_lock:
+                    reasoning_steps.append({"step": current_step, "type": "observe", "content": err, "latency_ms": 0})
                 return err, 0
 
             yield_id = str(_uuid_mod.uuid4())
@@ -777,10 +795,11 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
                 with _yield_lock:
                     _pending_tool_yields.pop(yield_id, None)
                 err = f"Client tool '{name}' timed out ({_TOOL_YIELD_TIMEOUT_SECONDS}s)"
-                reasoning_steps.append({"step": step_counter[0], "type": "observe", "content": err, "latency_ms": 0})
+                with _step_lock:
+                    reasoning_steps.append({"step": current_step, "type": "observe", "content": err, "latency_ms": 0})
                 if event_queue:
                     event_queue.put({"event": "agent_step", "data": {
-                        "node_id": node_id, "step_number": step_counter[0], "step_type": "observe",
+                        "node_id": node_id, "step_number": current_step, "step_type": "observe",
                         "content": err, "tool_name": name, "tool_input": {}, "latency_ms": 0,
                     }})
                 return err, 0
@@ -794,17 +813,18 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
             resolved_def = _resolve_secrets(tool_def, org_id)
             result_str, latency_ms = _execute_tool(resolved_def, name, arguments)
 
-        # Record the observe step
-        reasoning_steps.append({
-            "step": step_counter[0],
-            "type": "observe",
-            "content": result_str[:2000],
-            "tool_name": name,
-            "latency_ms": latency_ms,
-        })
+        # Record the observe step (thread-safe)
+        with _step_lock:
+            reasoning_steps.append({
+                "step": current_step,
+                "type": "observe",
+                "content": result_str[:2000],
+                "tool_name": name,
+                "latency_ms": latency_ms,
+            })
         if event_queue:
             event_queue.put({"event": "agent_step", "data": {
-                "node_id": node_id, "step_number": step_counter[0], "step_type": "observe",
+                "node_id": node_id, "step_number": current_step, "step_type": "observe",
                 "content": (result_str or "")[:500], "tool_name": name, "tool_input": {}, "latency_ms": latency_ms,
             }})
         return result_str, latency_ms
@@ -816,7 +836,7 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
         agent_system = agent_system + "\n" + user_sys
 
     max_steps = int(data.get("maxSteps") or data.get("maxIterations") or 10)
-    max_steps = max(1, min(max_steps, 25))
+    max_steps = max(1, min(max_steps, 100))
 
     payload = _PromptPayload(
         org_id=org_id, provider=provider_lower, model=model,
@@ -831,6 +851,7 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
             lambda: openai_router.handle_prompt_with_tools(
                 payload, generic_tools, target=target, system_message=agent_system,
                 max_iterations=max_steps, tool_executor=agent_tool_executor,
+                can_parallelize_tool=can_parallelize_tool,
             ),
             context_label=f"custom-endpoint/{model} (agent node {node_id})",
         )
@@ -839,6 +860,7 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
             lambda: anthropic_router.handle_prompt_with_tools(
                 payload, generic_tools, system_message=agent_system,
                 max_iterations=max_steps, tool_executor=agent_tool_executor,
+                can_parallelize_tool=can_parallelize_tool,
             ),
             context_label=f"anthropic/{model} (agent node {node_id})",
         )
@@ -848,6 +870,7 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
             lambda: router_mod.handle_prompt_with_tools(
                 payload, generic_tools, system_message=agent_system,
                 max_iterations=max_steps, tool_executor=agent_tool_executor,
+                can_parallelize_tool=can_parallelize_tool,
             ),
             context_label=f"{provider_lower}/{model} (agent node {node_id})",
         )
@@ -856,6 +879,7 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
             lambda: openai_router.handle_prompt_with_tools(
                 payload, generic_tools, system_message=agent_system,
                 max_iterations=max_steps, tool_executor=agent_tool_executor,
+                can_parallelize_tool=can_parallelize_tool,
             ),
             context_label=f"{provider_lower}/{model} (agent node {node_id})",
         )

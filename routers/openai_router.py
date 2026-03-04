@@ -370,7 +370,7 @@ def handle_prompt(payload: PromptPayload, *, target=None):
         raise HTTPException(status_code=500, detail=f"{label} call failed: {e}")
 
 
-def handle_prompt_with_tools(payload: PromptPayload, tools: list[dict], *, target=None, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+def handle_prompt_with_tools(payload: PromptPayload, tools: list[dict], *, target=None, system_message: str = "", max_iterations: int = 5, tool_executor=None, can_parallelize_tool=None):
     """
     LLM call with tool/function calling support (OpenAI format).
 
@@ -463,18 +463,55 @@ def handle_prompt_with_tools(payload: PromptPayload, tools: list[dict], *, targe
                 # Append the assistant message with tool_calls to the conversation
                 messages.append(choice.message)  # type: ignore[arg-type]
 
+                # Parse all tool calls first
+                parsed_tcs = []
                 for tc in choice.message.tool_calls:
                     tc_name = tc.function.name
                     try:
                         tc_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
                     except json.JSONDecodeError:
                         tc_args = {"raw": tc.function.arguments}
+                    parsed_tcs.append((tc.id, tc_name, tc_args))
 
-                    # Execute the tool
+                # Classify into parallelizable vs sequential
+                if can_parallelize_tool and tool_executor and len(parsed_tcs) > 1:
+                    parallel_tcs = [(tid, n, a) for tid, n, a in parsed_tcs if can_parallelize_tool(n)]
+                    sequential_tcs = [(tid, n, a) for tid, n, a in parsed_tcs if not can_parallelize_tool(n)]
+                else:
+                    parallel_tcs = []
+                    sequential_tcs = parsed_tcs
+
+                # Execute parallelizable tools concurrently
+                results_map: dict[str, tuple[str, int]] = {}
+                if parallel_tcs:
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    with ThreadPoolExecutor(max_workers=min(len(parallel_tcs), 8)) as pool:
+                        future_to_tc = {
+                            pool.submit(tool_executor, n, a): (tid, n, a)
+                            for tid, n, a in parallel_tcs
+                        }
+                        for future in as_completed(future_to_tc):
+                            tid, _n, _a = future_to_tc[future]
+                            try:
+                                results_map[tid] = future.result()
+                            except Exception as exc:
+                                results_map[tid] = (f"Tool execution error: {exc}", 0)
+
+                # Execute sequential tools one at a time
+                for tid, n, a in sequential_tcs:
                     if tool_executor:
-                        result_str, tool_latency_ms = tool_executor(tc_name, tc_args)
+                        results_map[tid] = tool_executor(n, a)
                     else:
-                        result_str, tool_latency_ms = "No tool executor configured", 0
+                        results_map[tid] = ("No tool executor configured", 0)
+
+                # Append results in original order (matching tool_call_ids)
+                for tc in choice.message.tool_calls:
+                    tc_name = tc.function.name
+                    try:
+                        tc_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    except json.JSONDecodeError:
+                        tc_args = {"raw": tc.function.arguments}
+                    result_str, tool_latency_ms = results_map.get(tc.id, ("No result", 0))
 
                     all_tool_calls.append({
                         "name": tc_name,
@@ -482,8 +519,6 @@ def handle_prompt_with_tools(payload: PromptPayload, tools: list[dict], *, targe
                         "result": result_str[:2000],
                         "latency_ms": tool_latency_ms,
                     })
-
-                    # Append the tool result
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,

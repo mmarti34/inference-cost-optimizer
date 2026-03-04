@@ -28,9 +28,12 @@ from conversation_service import (
     load_conversation_turns,
     trim_history_to_fit,
     format_history_as_prefix,
+    format_agent_history_as_prefix,
     get_next_turn_number,
     save_conversation_turn,
     update_conversation_updated_at,
+    AGENT_MAX_TOKENS,
+    AGENT_MAX_TURNS,
 )
 from routing.resolver import resolve_version, resolve_version_and_deployment, get_promoted_deployment_by_version
 from api_request_logger import log_api_request, get_api_request_log_sync, update_api_request_log_metrics
@@ -348,8 +351,17 @@ async def public_execute(
             if conv:
                 conversation_id = str(conv.get("id") or body.conversation_id)
                 turns = load_conversation_turns(conversation_id)
-                trimmed = trim_history_to_fit(turns)
-                conversation_prefix = format_history_as_prefix(trimmed)
+                # Use richer formatting + higher limits for workflows with agent nodes
+                _has_agent = any(
+                    (n.get("type") or "").lower() == "agent"
+                    for n in (graph_json.get("nodes") or [])
+                )
+                if _has_agent:
+                    trimmed = trim_history_to_fit(turns, max_tokens=AGENT_MAX_TOKENS, max_turns=AGENT_MAX_TURNS)
+                    conversation_prefix = format_agent_history_as_prefix(trimmed)
+                else:
+                    trimmed = trim_history_to_fit(turns)
+                    conversation_prefix = format_history_as_prefix(trimmed)
 
         # 8. Stream or execute
         if body.stream:
@@ -437,7 +449,18 @@ async def public_execute(
         if conversation_id and result.get("final_output") is not None:
             n = get_next_turn_number(conversation_id)
             save_conversation_turn(conversation_id, n, "user", input_text, variables, request_id, resolved_version)
-            save_conversation_turn(conversation_id, n + 1, "assistant", result["final_output"], None, request_id, resolved_version)
+            # For agent workflows, store a summary of tool calls in the variables column
+            assistant_vars = None
+            for nr in (result.get("node_results") or []):
+                if nr.get("type") == "agent" and nr.get("reasoning_steps"):
+                    tool_summary = "; ".join(
+                        f"{s.get('tool_name', '?')}({s.get('latency_ms', 0)}ms)"
+                        for s in nr["reasoning_steps"] if s.get("type") == "act"
+                    )
+                    if tool_summary:
+                        assistant_vars = {"agent_tool_summary": f"Tools used: {tool_summary}"}
+                    break
+            save_conversation_turn(conversation_id, n + 1, "assistant", result["final_output"], assistant_vars, request_id, resolved_version)
             update_conversation_updated_at(conversation_id)
 
         if result.get("final_output"):

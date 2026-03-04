@@ -143,7 +143,7 @@ def handle_prompt(payload: PromptPayload):
         raise HTTPException(status_code=500, detail=f"Mistral call failed: {str(e)}")
 
 
-def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None, can_parallelize_tool=None):
     """Tool calling via Mistral (OpenAI-compatible API)."""
     from api_key_cache import get_provider_api_key
     api_key = get_provider_api_key(payload.org_id, "mistral")
@@ -152,4 +152,5 @@ def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str 
         payload.prompt, tools, tool_executor=tool_executor,
         system_message=system_message, max_iterations=max_iterations,
         prompt_id=payload.prompt_id, org_id=payload.org_id,
+        can_parallelize_tool=can_parallelize_tool,
     )

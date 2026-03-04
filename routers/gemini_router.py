@@ -215,7 +215,7 @@ def handle_prompt(payload: PromptPayload):
         raise HTTPException(status_code=500, detail=f"Gemini call failed: {str(e)}")
 
 
-def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None, can_parallelize_tool=None):
     """
     Tool calling via Gemini using google.generativeai SDK.
     Converts generic tool format to Gemini function declarations, runs iteration loop.
@@ -279,17 +279,41 @@ def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str 
                 reply = response.text if hasattr(response, "text") else ""
                 break
 
-            # Execute each function call
-            function_responses = []
-            for fc_part in function_calls:
-                fc = fc_part.function_call
-                tc_name = fc.name
-                tc_args = dict(fc.args) if fc.args else {}
+            # Parse all function calls
+            parsed_fcs = [(fc_part, fc_part.function_call.name, dict(fc_part.function_call.args) if fc_part.function_call.args else {}) for fc_part in function_calls]
 
+            # Classify into parallelizable vs sequential
+            if can_parallelize_tool and tool_executor and len(parsed_fcs) > 1:
+                parallel_fcs = [(fp, n, a) for fp, n, a in parsed_fcs if can_parallelize_tool(n)]
+                sequential_fcs = [(fp, n, a) for fp, n, a in parsed_fcs if not can_parallelize_tool(n)]
+            else:
+                parallel_fcs = []
+                sequential_fcs = parsed_fcs
+
+            # Execute parallelizable tools concurrently
+            results_map: dict[str, tuple[str, int]] = {}
+            if parallel_fcs:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=min(len(parallel_fcs), 8)) as pool:
+                    future_to_fc = {pool.submit(tool_executor, n, a): (n, a) for _, n, a in parallel_fcs}
+                    for future in as_completed(future_to_fc):
+                        _n, _a = future_to_fc[future]
+                        try:
+                            results_map[_n] = future.result()
+                        except Exception as exc:
+                            results_map[_n] = (f"Tool execution error: {exc}", 0)
+
+            # Execute sequential tools
+            for _, n, a in sequential_fcs:
                 if tool_executor:
-                    result_str, tool_latency_ms = tool_executor(tc_name, tc_args)
+                    results_map[n] = tool_executor(n, a)
                 else:
-                    result_str, tool_latency_ms = "No tool executor configured", 0
+                    results_map[n] = ("No tool executor configured", 0)
+
+            # Build results in original order
+            function_responses = []
+            for fc_part, tc_name, tc_args in parsed_fcs:
+                result_str, tool_latency_ms = results_map.get(tc_name, ("No result", 0))
 
                 all_tool_calls.append({
                     "name": tc_name,

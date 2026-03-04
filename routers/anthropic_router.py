@@ -125,7 +125,7 @@ def handle_prompt(payload: PromptPayload):
         raise HTTPException(status_code=500, detail=f"Anthropic call failed: {str(e)}")
 
 
-def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None):
+def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str = "", max_iterations: int = 5, tool_executor=None, can_parallelize_tool=None):
     """
     LLM call with tool use support (Anthropic format).
 
@@ -181,30 +181,59 @@ def handle_prompt_with_tools(payload, tools: list[dict], *, system_message: str 
                 # Append the full assistant response (text + tool_use blocks)
                 messages.append({"role": "assistant", "content": response.content})
 
-                # Extract tool_use blocks and execute
+                # Extract tool_use blocks
+                tool_use_blocks = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+
+                # Classify into parallelizable vs sequential
+                if can_parallelize_tool and tool_executor and len(tool_use_blocks) > 1:
+                    parallel_blocks = [b for b in tool_use_blocks if can_parallelize_tool(b.name)]
+                    sequential_blocks = [b for b in tool_use_blocks if not can_parallelize_tool(b.name)]
+                else:
+                    parallel_blocks = []
+                    sequential_blocks = tool_use_blocks
+
+                # Execute parallelizable tools concurrently
+                results_map: dict[str, tuple[str, int]] = {}
+                if parallel_blocks:
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    with ThreadPoolExecutor(max_workers=min(len(parallel_blocks), 8)) as pool:
+                        future_to_block = {
+                            pool.submit(tool_executor, b.name, b.input if isinstance(b.input, dict) else {}): b
+                            for b in parallel_blocks
+                        }
+                        for future in as_completed(future_to_block):
+                            block = future_to_block[future]
+                            try:
+                                results_map[block.id] = future.result()
+                            except Exception as exc:
+                                results_map[block.id] = (f"Tool execution error: {exc}", 0)
+
+                # Execute sequential tools one at a time
+                for block in sequential_blocks:
+                    tc_args = block.input if isinstance(block.input, dict) else {}
+                    if tool_executor:
+                        results_map[block.id] = tool_executor(block.name, tc_args)
+                    else:
+                        results_map[block.id] = ("No tool executor configured", 0)
+
+                # Build results in original order
                 tool_result_blocks: list[dict] = []
-                for block in response.content:
-                    if getattr(block, "type", None) == "tool_use":
-                        tc_name = block.name
-                        tc_args = block.input if isinstance(block.input, dict) else {}
+                for block in tool_use_blocks:
+                    tc_name = block.name
+                    tc_args = block.input if isinstance(block.input, dict) else {}
+                    result_str, tool_latency_ms = results_map.get(block.id, ("No result", 0))
 
-                        if tool_executor:
-                            result_str, tool_latency_ms = tool_executor(tc_name, tc_args)
-                        else:
-                            result_str, tool_latency_ms = "No tool executor configured", 0
-
-                        all_tool_calls.append({
-                            "name": tc_name,
-                            "arguments": tc_args,
-                            "result": result_str[:2000],
-                            "latency_ms": tool_latency_ms,
-                        })
-
-                        tool_result_blocks.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_str[:4000],
-                        })
+                    all_tool_calls.append({
+                        "name": tc_name,
+                        "arguments": tc_args,
+                        "result": result_str[:2000],
+                        "latency_ms": tool_latency_ms,
+                    })
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_str[:4000],
+                    })
 
                 # Send all tool results back
                 messages.append({"role": "user", "content": tool_result_blocks})
