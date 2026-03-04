@@ -133,6 +133,32 @@ class PublicExecuteBody(BaseModel):
         extra = "ignore"
 
 
+class ToolResultBody(BaseModel):
+    """Body for POST /tool-result/{yield_id}: external client submitting a client-side tool result."""
+    result: str
+    latency_ms: Optional[int] = 0
+
+    class Config:
+        extra = "ignore"
+
+
+@router.post("/tool-result/{yield_id}")
+async def submit_tool_result(yield_id: str, body: ToolResultBody):
+    """
+    Resume a pending client-side tool execution.
+
+    When a workflow agent calls a tool configured with ``execution: "client"``,
+    the SSE stream emits a ``tool_yield`` event containing a ``yield_id``.
+    The external client (e.g. an IDE like Cursor) executes the tool locally
+    and POSTs the result here.  The agent loop then resumes with this result.
+    """
+    from workflow_runtime import resume_tool_yield
+    success = resume_tool_yield(yield_id, body.result, body.latency_ms or 0)
+    if not success:
+        raise HTTPException(status_code=404, detail="No pending tool yield with this ID — it may have timed out or already been resumed.")
+    return {"status": "resumed", "yield_id": yield_id}
+
+
 def _parse_version(version: Optional[str]) -> Optional[int]:
     if not version:
         return None

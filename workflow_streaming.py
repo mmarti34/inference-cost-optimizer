@@ -299,7 +299,11 @@ async def stream_workflow_async(
                         "tool_calls": tool_calls, "iterations": iterations,
                     })
                 elif ntype == "agent":
-                    # Stream agent execution — run in thread, emit reasoning steps and tool calls
+                    # Stream agent execution with real-time events via queue.
+                    # This enables client-side tool execution: when the agent
+                    # calls a tool with execution="client", a tool_yield event
+                    # is emitted and the agent blocks until the client POSTs
+                    # the result to /api/public/tool-result/{yield_id}.
                     prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
                     prompt_text = _apply_variables(str(data.get("taskDescription") or data.get("task") or "Respond to the user."), variables, prev_output=prev)
                     if conversation_prefix:
@@ -307,14 +311,49 @@ async def stream_workflow_async(
                     provider = (data.get("provider") or "openai").strip().lower()
                     model = (data.get("modelName") or "gpt-4o-mini").strip() or "gpt-4o-mini"
 
-                    # Run the agent node in a thread and collect results
                     step_start = time.perf_counter()
+
+                    import queue as _q
+                    import concurrent.futures
+
+                    event_queue: _q.Queue = _q.Queue()
 
                     def _run_agent():
                         from workflow_runtime import _execute_agent_node
-                        return _execute_agent_node(node_id, node, prompt_text, org_id)
+                        return _execute_agent_node(node_id, node, prompt_text, org_id, event_queue=event_queue)
 
-                    agent_result = await asyncio.to_thread(_run_agent)
+                    # Run agent in a thread; read events from queue in real time
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(_run_agent)
+                        agent_done = False
+                        while not agent_done:
+                            if future.done():
+                                # Drain remaining events
+                                while not event_queue.empty():
+                                    try:
+                                        ev = event_queue.get_nowait()
+                                        if ev["event"] == "agent_step":
+                                            yield _sse_event("agent_step", ev["data"])
+                                        elif ev["event"] == "tool_yield":
+                                            yield _sse_event("tool_yield", ev["data"])
+                                    except _q.Empty:
+                                        break
+                                agent_done = True
+                            else:
+                                try:
+                                    ev = event_queue.get(timeout=0.2)
+                                    if ev["event"] == "agent_step":
+                                        yield _sse_event("agent_step", ev["data"])
+                                    elif ev["event"] == "tool_yield":
+                                        yield _sse_event("tool_yield", ev["data"])
+                                    elif ev["event"] == "agent_done":
+                                        agent_done = True
+                                except _q.Empty:
+                                    await asyncio.sleep(0)  # Yield control to event loop
+                                    continue
+
+                        agent_result = future.result()
+
                     latency_ms = int((time.perf_counter() - step_start) * 1000)
 
                     full_output = agent_result.get("output", "")
@@ -325,19 +364,8 @@ async def stream_workflow_async(
                     tool_calls = agent_result.get("tool_calls", [])
                     iterations = agent_result.get("iterations", 1)
 
-                    # Emit agent_step events for each reasoning step
-                    for rs in reasoning_steps:
-                        yield _sse_event("agent_step", {
-                            "node_id": node_id,
-                            "step_number": rs.get("step", 0),
-                            "step_type": rs.get("type", ""),
-                            "content": (rs.get("content") or "")[:500],
-                            "tool_name": rs.get("tool_name", ""),
-                            "tool_input": rs.get("tool_input", {}),
-                            "latency_ms": rs.get("latency_ms", 0),
-                        })
-
-                    # Emit tool_call_start/tool_call_end for each tool execution
+                    # agent_step events already emitted in real-time above.
+                    # Emit tool_call_start/end for backward compatibility.
                     for tc in tool_calls:
                         yield _sse_event("tool_call_start", {"node_id": node_id, "tool_name": tc.get("name", ""), "arguments": tc.get("arguments", {})})
                         yield _sse_event("tool_call_end", {"node_id": node_id, "tool_name": tc.get("name", ""), "result": (tc.get("result", ""))[:500], "latency_ms": tc.get("latency_ms", 0)})

@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
+import queue as _queue_mod
+import threading
 import time
+import uuid as _uuid_mod
 from typing import Any
 from fastapi import HTTPException
 
@@ -647,13 +650,65 @@ _AGENT_SYSTEM_TEMPLATE = (
 )
 
 
-def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str) -> dict:
+# ─── Client-Side Tool Execution Protocol ─────────────────────────────────────
+
+class ToolYieldRequest:
+    """Represents a pending client-side tool execution waiting for external result."""
+    __slots__ = ("yield_id", "tool_name", "arguments", "event", "result", "latency_ms")
+
+    def __init__(self, yield_id: str, tool_name: str, arguments: dict):
+        self.yield_id = yield_id
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self.event = threading.Event()
+        self.result: str = ""
+        self.latency_ms: int = 0
+
+
+# Module-level store for pending client tool yields (yield_id → request).
+# In a single-process deployment this is sufficient; horizontal scaling
+# would need Redis or similar shared state.
+_pending_tool_yields: dict[str, ToolYieldRequest] = {}
+_yield_lock = threading.Lock()
+
+_TOOL_YIELD_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
+def resume_tool_yield(yield_id: str, result: str, latency_ms: int = 0) -> bool:
+    """Resume a pending client-side tool yield with the external result.
+
+    Called by the POST /api/public/tool-result/{yield_id} endpoint.
+    Returns True if the yield_id was found and resumed.
+    """
+    with _yield_lock:
+        req = _pending_tool_yields.get(yield_id)
+    if not req:
+        return False
+    req.result = result
+    req.latency_ms = latency_ms
+    req.event.set()
+    return True
+
+
+def get_pending_yield(yield_id: str) -> ToolYieldRequest | None:
+    """Get a pending tool yield by ID (for introspection)."""
+    with _yield_lock:
+        return _pending_tool_yields.get(yield_id)
+
+
+def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str, event_queue: _queue_mod.Queue | None = None) -> dict:
     """
     Execute an autonomous agent with reasoning trace.
 
     Reuses the tool_call provider infrastructure (handle_prompt_with_tools) but
     wraps it with a ReAct-style system prompt and a recording tool executor that
     captures each act/observe step for a structured reasoning trace.
+
+    When ``event_queue`` is provided (streaming mode), reasoning steps and
+    tool_yield events are pushed onto the queue in real time so the SSE
+    generator can emit them before the agent finishes.  Tools with
+    ``"execution": "client"`` in their config will yield to the caller via
+    the queue and block until the external client POSTs the result back.
 
     Returns the standard result dict plus:
       reasoning_steps: list of {step, type, content?, tool_name?, tool_input?, latency_ms?}
@@ -690,17 +745,68 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str)
             "tool_name": name,
             "tool_input": arguments,
         })
-        # Execute the actual tool
+        if event_queue:
+            event_queue.put({"event": "agent_step", "data": {
+                "node_id": node_id, "step_number": step_counter[0], "step_type": "act",
+                "content": "", "tool_name": name, "tool_input": arguments, "latency_ms": 0,
+            }})
+
         tool_def = tools_by_name.get(name, {"type": "builtin"})
-        resolved_def = _resolve_secrets(tool_def, org_id)
-        result_str, latency_ms = _execute_tool(resolved_def, name, arguments)
+
+        if tool_def.get("execution") == "client":
+            # ── Client-side tool: yield to external caller ────────────────
+            if not event_queue:
+                # Non-streaming mode — client tools cannot work
+                err = f"Tool '{name}' requires client-side execution (only available in streaming mode)"
+                reasoning_steps.append({"step": step_counter[0], "type": "observe", "content": err, "latency_ms": 0})
+                return err, 0
+
+            yield_id = str(_uuid_mod.uuid4())
+            yield_req = ToolYieldRequest(yield_id, name, arguments)
+            with _yield_lock:
+                _pending_tool_yields[yield_id] = yield_req
+
+            # Signal the SSE stream to emit a tool_yield event
+            event_queue.put({"event": "tool_yield", "data": {
+                "yield_id": yield_id, "node_id": node_id,
+                "tool_name": name, "arguments": arguments,
+            }})
+
+            # Block this thread until the client POSTs the result back
+            if not yield_req.event.wait(timeout=_TOOL_YIELD_TIMEOUT_SECONDS):
+                with _yield_lock:
+                    _pending_tool_yields.pop(yield_id, None)
+                err = f"Client tool '{name}' timed out ({_TOOL_YIELD_TIMEOUT_SECONDS}s)"
+                reasoning_steps.append({"step": step_counter[0], "type": "observe", "content": err, "latency_ms": 0})
+                if event_queue:
+                    event_queue.put({"event": "agent_step", "data": {
+                        "node_id": node_id, "step_number": step_counter[0], "step_type": "observe",
+                        "content": err, "tool_name": name, "tool_input": {}, "latency_ms": 0,
+                    }})
+                return err, 0
+
+            with _yield_lock:
+                _pending_tool_yields.pop(yield_id, None)
+            result_str = yield_req.result
+            latency_ms = yield_req.latency_ms
+        else:
+            # ── Server-side tool: execute immediately ─────────────────────
+            resolved_def = _resolve_secrets(tool_def, org_id)
+            result_str, latency_ms = _execute_tool(resolved_def, name, arguments)
+
         # Record the observe step
         reasoning_steps.append({
             "step": step_counter[0],
             "type": "observe",
             "content": result_str[:2000],
+            "tool_name": name,
             "latency_ms": latency_ms,
         })
+        if event_queue:
+            event_queue.put({"event": "agent_step", "data": {
+                "node_id": node_id, "step_number": step_counter[0], "step_type": "observe",
+                "content": (result_str or "")[:500], "tool_name": name, "tool_input": {}, "latency_ms": latency_ms,
+            }})
         return result_str, latency_ms
 
     # ── Build agent system prompt ───────────────────────────────────────
@@ -763,6 +869,13 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str)
         "type": "answer",
         "content": out_text[:2000],
     })
+    if event_queue:
+        event_queue.put({"event": "agent_step", "data": {
+            "node_id": node_id, "step_number": step_counter[0] + 1, "step_type": "answer",
+            "content": out_text[:500], "tool_name": "", "tool_input": {}, "latency_ms": 0,
+        }})
+        # Signal that agent execution is complete
+        event_queue.put({"event": "agent_done"})
 
     # ── Output quality validation ───────────────────────────────────────
     _output_warning: str | None = None
