@@ -128,8 +128,6 @@ class PublicExecuteBody(BaseModel):
     variables: Optional[dict] = None
     stream: Optional[bool] = False
     conversation_id: Optional[str] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
 
     class Config:
         extra = "ignore"
@@ -161,38 +159,50 @@ async def submit_tool_result(yield_id: str, body: ToolResultBody):
     return {"status": "resumed", "yield_id": yield_id}
 
 
-def _apply_provider_model_overrides(
+def _resolve_user_selected_providers(
     graph_json: dict,
-    provider_override: Optional[str],
-    model_override: Optional[str],
+    variables: Optional[dict],
 ) -> dict:
     """
-    Patch all AI nodes in the graph to use caller-specified provider/model.
-    This enables API callers (e.g. Cursor, CLI tools) to select which model
-    the workflow runs on — without modifying the workflow definition.
-    Only overrides nodes that have a provider/modelName field (AI steps, agents,
-    tool_call, vision, image_gen, tts, stt, embedding).
+    Resolve nodes with provider set to "user_selected".
+
+    When the workflow designer sets a node's provider to "user_selected", the
+    API caller's end-user picks the provider/model through the designer's own
+    UI.  The chosen values are passed as workflow variables named ``provider``
+    and ``model``.  This function patches those nodes at execution time so the
+    runtime sees a concrete provider/model.
+
+    If no nodes use "user_selected", the graph is returned unchanged.
     """
-    if not provider_override and not model_override:
+    if not variables:
         return graph_json
+    caller_provider = (variables.get("provider") or "").strip()
+    caller_model = (variables.get("model") or "").strip()
+    if not caller_provider and not caller_model:
+        return graph_json
+
     ai_node_types = {
         "ai-step", "model", "agent", "tool_call",
         "vision_step", "image_gen_step", "tts_step", "stt_step", "embedding_step",
     }
     nodes = graph_json.get("nodes", [])
     patched = []
+    changed = False
     for node in nodes:
         ntype = (node.get("type") or "").lower()
-        if ntype in ai_node_types:
-            data = dict(node.get("data") or {})
-            if provider_override:
-                data["provider"] = provider_override
-            if model_override:
-                data["modelName"] = model_override
+        data = node.get("data") or {}
+        node_provider = (data.get("provider") or "").strip().lower()
+        if ntype in ai_node_types and node_provider == "user_selected":
+            data = dict(data)
+            if caller_provider:
+                data["provider"] = caller_provider
+            if caller_model:
+                data["modelName"] = caller_model
             patched.append({**node, "data": data})
+            changed = True
         else:
             patched.append(node)
-    return {**graph_json, "nodes": patched}
+    return {**graph_json, "nodes": patched} if changed else graph_json
 
 
 def _parse_version(version: Optional[str]) -> Optional[int]:
@@ -298,8 +308,9 @@ async def public_execute(
 
         graph_json = deployment.get("graph_json") or {"nodes": [], "edges": []}
 
-        # Apply caller-specified provider/model overrides (e.g. from Cursor / CLI)
-        graph_json = _apply_provider_model_overrides(graph_json, body.provider, body.model)
+        # Resolve "user_selected" provider nodes from caller variables
+        variables_raw = body.variables if isinstance(body.variables, dict) else None
+        graph_json = _resolve_user_selected_providers(graph_json, variables_raw)
 
         workflow_id = deployment.get("workflow_id")
         dep_version = deployment.get("version")
