@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 class AuthenticatedUser:
     user_id: str
     email: Optional[str] = None
+    _org_role: Optional[str] = None
 
 
 async def require_auth(
@@ -90,8 +91,10 @@ async def require_org_member(
             pass
 
     if not org_id:
-        # If we can't find an org_id, just verify auth is valid
-        return auth_user
+        raise HTTPException(
+            status_code=400,
+            detail="org_id is required but could not be found in path, query, or body.",
+        )
 
     # Check membership
     try:
@@ -115,4 +118,23 @@ async def require_org_member(
         logger.warning("Org membership check failed: %s", type(e).__name__)
         raise HTTPException(status_code=500, detail="Error verifying organization access.") from e
 
+    # Stash the role so require_org_admin can use it without re-querying
+    auth_user._org_role = result.data[0].get("role", "member") if result.data else "member"
+    return auth_user
+
+
+async def require_org_admin(
+    request: Request,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+) -> AuthenticatedUser:
+    """
+    Verify the authenticated user is an admin of the org.
+    Chains on require_org_member (which already verified membership + stashed role).
+    Raises 403 if user is not an admin.
+    """
+    if getattr(auth_user, "_org_role", None) != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required for this operation.",
+        )
     return auth_user

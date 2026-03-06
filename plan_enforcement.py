@@ -170,30 +170,28 @@ def increment_monthly_usage(org_id: str) -> None:
             "p_month": month,
         }).execute()
     except Exception as e:
-        # RPC may not exist yet — fall back to manual upsert
-        logger.warning("increment_monthly_usage RPC failed (%s), falling back", type(e).__name__)
+        # RPC may not exist yet — fall back to atomic SQL upsert
+        logger.warning("increment_monthly_usage RPC failed (%s), falling back to upsert", type(e).__name__)
         try:
-            result = (
-                supabase.table("monthly_usage")
-                .select("id, request_count")
-                .eq("org_id", org_id)
-                .eq("month", month)
-                .limit(1)
-                .execute()
-            )
-            if result.data:
-                row = result.data[0]
-                supabase.table("monthly_usage").update({
-                    "request_count": int(row["request_count"]) + 1,
-                }).eq("id", row["id"]).execute()
-            else:
-                supabase.table("monthly_usage").insert({
-                    "org_id": org_id,
-                    "month": month,
-                    "request_count": 1,
-                }).execute()
-        except Exception as e2:
-            logger.warning("monthly_usage fallback failed: %s", e2)
+            supabase.rpc("raw_sql", {
+                "query": """
+                    INSERT INTO monthly_usage (org_id, month, request_count)
+                    VALUES (%s, %s, 1)
+                    ON CONFLICT (org_id, month)
+                    DO UPDATE SET request_count = monthly_usage.request_count + 1
+                """,
+                "params": [org_id, month],
+            }).execute()
+        except Exception:
+            # Last resort: use postgrest upsert which is still atomic
+            try:
+                supabase.table("monthly_usage").upsert(
+                    {"org_id": org_id, "month": month, "request_count": 1},
+                    on_conflict="org_id,month",
+                    count="exact",
+                ).execute()
+            except Exception as e3:
+                logger.warning("monthly_usage fallback failed: %s", e3)
 
 
 def get_monthly_usage(org_id: str) -> int:

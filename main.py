@@ -1159,14 +1159,9 @@ def replay_request(
 ):
     """
     Replay a stored request against a specified model/provider (admin-only).
-    This is for offline research and doesn't affect production traffic.
-    
-    Body:
-    - request_id: Original request ID to replay
-    - provider: Provider to use for replay (optional, uses original if not specified)
-    - model: Model to use for replay (optional, uses original if not specified)
-    - prompt_text: Prompt text (required if original prompt wasn't stored)
+    Not implemented — this endpoint is a stub that does not call real providers.
     """
+    raise HTTPException(status_code=501, detail="Replay endpoint is not yet implemented.")
     import os
     if not os.getenv("OPTIML_ENABLE_REPLAY", "false").lower() == "true":
         raise HTTPException(status_code=403, detail="Replay is disabled. Set OPTIML_ENABLE_REPLAY=true to enable.")

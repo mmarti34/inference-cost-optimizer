@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from supabase_client import supabase
-from auth_dependency import require_org_member, AuthenticatedUser
+from auth_dependency import require_auth, require_org_member, AuthenticatedUser
 from email_service import send_invite_email
 
 logger = logging.getLogger(__name__)
@@ -59,19 +59,19 @@ def test_connection():
 @router.post("/api/organizations/create")
 def create_organization(user_id: str = Body(...), org_name: str = Body(...), plan: str = Body("free")):
     try:
-        print(f"Creating organization: user_id={user_id}, org_name={org_name}, plan={plan}")
+        logger.info(f"Creating organization: user_id={user_id}, org_name={org_name}, plan={plan}")
         
         # Check if Supabase client is initialized
         if not supabase:
-            print("Error: Supabase client not initialized")
+            logger.info("Error: Supabase client not initialized")
             raise HTTPException(status_code=500, detail="Database connection not available")
         
         # Test basic Supabase connection first
         try:
             test_result = supabase.table("organizations").select("count").limit(1).execute()
-            print("Supabase connection test successful")
+            logger.info("Supabase connection test successful")
         except Exception as db_error:
-            print(f"Database connection test failed: {db_error}")
+            logger.info(f"Database connection test failed: {db_error}")
             raise HTTPException(status_code=500, detail=f"Database connection failed: {str(db_error)}")
         
         # 1. Get user's actual plan from user_profiles table
@@ -80,12 +80,12 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         user_actual_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_actual_plan = user_profile_result.data["subscription_tier"]
-        print(f"User's actual plan: {user_actual_plan}")
+        logger.info(f"User's actual plan: {user_actual_plan}")
         
         # Use the provided plan or user's actual plan, whichever is higher
         plan_priority = {"free": 0, "startup": 1, "team": 2, "enterprise": 3}
         effective_plan = max([plan, user_actual_plan], key=lambda p: plan_priority.get(p, 0))
-        print(f"Effective plan for organization: {effective_plan}")
+        logger.info(f"Effective plan for organization: {effective_plan}")
         
         # 2. Check if user can create organizations (Free users cannot create orgs)
         if effective_plan == "free":
@@ -96,7 +96,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         print("Checking admin limits...")
         admin_orgs_result = supabase.table("organization_members").select("org_id").eq("user_id", user_id).eq("role", "admin").eq("status", "active").execute()
         admin_orgs = admin_orgs_result.data if admin_orgs_result.data else []
-        print(f"User is currently admin of {len(admin_orgs)} organizations")
+        logger.info(f"User is currently admin of {len(admin_orgs)} organizations")
         
         admin_limit = PLAN_LIMITS.get(effective_plan, PLAN_LIMITS["free"])["admins"]
         if len(admin_orgs) >= admin_limit:
@@ -129,7 +129,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
                     raise
         
         if not new_org_result.data:
-            print("Error: No data returned from organization creation")
+            logger.info("Error: No data returned from organization creation")
             raise HTTPException(status_code=500, detail="Failed to create organization")
         
         new_org = new_org_result.data[0] if isinstance(new_org_result.data, list) else new_org_result.data
@@ -145,19 +145,19 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         }).execute()
         
         if not member_result.data:
-            print("Error: Failed to add user as admin member")
+            logger.info("Error: Failed to add user as admin member")
             # Clean up the created org
             supabase.table("organizations").delete().eq("id", org_id).execute()
             raise HTTPException(status_code=500, detail="Failed to add user as admin member")
         
-        print(f"Organization created successfully: {new_org_result.data}")
+        logger.info(f"Organization created successfully: {new_org_result.data}")
         return new_org_result.data
         
     except HTTPException:
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        print(f"Unexpected error in create_organization: {str(e)}")
+        logger.info(f"Unexpected error in create_organization: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/invite")
@@ -429,14 +429,14 @@ def get_pending_invites_for_user(email: str = Query(...)):
 def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
     """Join an organization - check plan limits before allowing"""
     try:
-        print(f"User {user_id} attempting to join organization {org_id}")
+        logger.info(f"User {user_id} attempting to join organization {org_id}")
         
         # 1. Get user's actual plan
         user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
-        print(f"User's plan: {user_plan}")
+        logger.info(f"User's plan: {user_plan}")
         
         # 2. Check if user already has too many org memberships
         user_orgs_result = supabase.table("organization_members").select("org_id").eq("user_id", user_id).eq("status", "active").execute()
@@ -451,7 +451,7 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
         
         # Count only Organization type memberships
         org_count = org_types.count("Organization")
-        print(f"User currently has {org_count} Organization memberships")
+        logger.info(f"User currently has {org_count} Organization memberships")
         
         org_limit = PLAN_LIMITS.get(user_plan, PLAN_LIMITS["free"])["orgs"]
         if org_count >= org_limit:
@@ -493,7 +493,7 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in join_organization: {str(e)}")
+        logger.info(f"Error in join_organization: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.delete("/api/organizations/members/{org_id}/{user_id}")
@@ -552,17 +552,18 @@ def check_org_access_permission(user_plan: str, org_plan: str, org_type: str = "
     return user_priority >= org_priority
 
 @router.get("/api/organizations/check-access/{org_id}")
-def check_organization_access(org_id: str, user_id: str):
+def check_organization_access(org_id: str, auth_user: AuthenticatedUser = Depends(require_auth)):
     """Check if a user can access an organization based on their current plan"""
+    user_id = auth_user.user_id
     try:
-        print(f"Checking access for user {user_id} to organization {org_id}")
+        logger.info("Checking access for user %s to organization %s", user_id, org_id)
         
         # 1. Get user's current plan
         user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
-        print(f"User's current plan: {user_plan}")
+        logger.info(f"User's current plan: {user_plan}")
         
         # 2. Get organization details
         org_result = supabase.table("organizations").select("id, name, type, plan, created_by, logo, created_at").eq("id", org_id).single().execute()
@@ -571,14 +572,14 @@ def check_organization_access(org_id: str, user_id: str):
         
         org = org_result.data
         org_plan = get_org_plan(org)
-        print(f"Organization plan: {org_plan}")
+        logger.info(f"Organization plan: {org_plan}")
         
         # 3. Check if user is a member of this org
         membership_result = supabase.table("organization_members").select("id, org_id, user_id, role, status, invited_email, created_at").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").single().execute()
         
         # If user is already a member, they can access it regardless of plan
         if membership_result.data:
-            print(f"User is existing member - granting access")
+            logger.info(f"User is existing member - granting access")
             return {
                 "can_access": True,
                 "user_plan": user_plan,
@@ -606,21 +607,22 @@ def check_organization_access(org_id: str, user_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in check_organization_access: {str(e)}")
+        logger.info(f"Error in check_organization_access: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.get("/api/organizations/user-accessible")
-def get_user_accessible_organizations(user_id: str):
+def get_user_accessible_organizations(auth_user: AuthenticatedUser = Depends(require_auth)):
     """Get all organizations that a user can access based on their current plan"""
+    user_id = auth_user.user_id
     try:
-        print(f"Getting accessible organizations for user {user_id}")
+        logger.info("Getting accessible organizations for user %s", user_id)
         
         # 1. Get user's current plan
         user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
-        print(f"User's current plan: {user_plan}")
+        logger.info(f"User's current plan: {user_plan}")
         
         # 2. Get all organizations where user is a member
         memberships_result = supabase.table("organization_members").select("""
@@ -669,21 +671,22 @@ def get_user_accessible_organizations(user_id: str):
         }
         
     except Exception as e:
-        print(f"Error in get_user_accessible_organizations: {str(e)}")
+        logger.info(f"Error in get_user_accessible_organizations: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.get("/api/organizations/validate-api-key-access")
-def validate_api_key_access(user_id: str, org_id: str):
+def validate_api_key_access(org_id: str, auth_user: AuthenticatedUser = Depends(require_auth)):
     """Validate if a user can use API keys for a specific organization based on their subscription plan"""
+    user_id = auth_user.user_id
     try:
-        print(f"Validating API key access for user {user_id} to organization {org_id}")
+        logger.info("Validating API key access for user %s to organization %s", user_id, org_id)
         
         # 1. Get user's current plan
         user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
-        print(f"User's current plan: {user_plan}")
+        logger.info(f"User's current plan: {user_plan}")
         
         # 2. Get organization details
         org_result = supabase.table("organizations").select("id, name, type, plan, created_by, logo, created_at").eq("id", org_id).single().execute()
@@ -737,5 +740,5 @@ def validate_api_key_access(user_id: str, org_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in validate_api_key_access: {str(e)}")
+        logger.info(f"Error in validate_api_key_access: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

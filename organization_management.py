@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from supabase_client import supabase
-from auth_dependency import require_auth, require_org_member, AuthenticatedUser
+from auth_dependency import require_auth, require_org_member, require_org_admin, AuthenticatedUser
 
 logger = logging.getLogger(__name__)
 
@@ -173,9 +173,9 @@ async def get_user_subscription(
 async def update_organization_plan(
     org_id: str,
     plan_data: OrganizationPlanUpdate,
-    auth_user: AuthenticatedUser = Depends(require_org_member),
+    auth_user: AuthenticatedUser = Depends(require_org_admin),
 ):
-    """Update organization plan. Slug is never updated."""
+    """Update organization plan. Admin only. Slug is never updated."""
     try:
         update_data = _org_update_payload_safe({"plan": plan_data.plan})
         result = supabase.table("organizations").update(update_data).eq("id", org_id).execute()
@@ -194,9 +194,9 @@ async def update_organization_plan(
 async def update_organization(
     org_id: str,
     payload: OrganizationUpdate,
-    auth_user: AuthenticatedUser = Depends(require_org_member),
+    auth_user: AuthenticatedUser = Depends(require_org_admin),
 ):
-    """Update organization (name, plan, logo). Slug is immutable and must never be sent or updated."""
+    """Update organization (name, plan, logo). Admin only. Slug is immutable and must never be sent or updated."""
     try:
         update_data = {}
         if payload.name is not None:

@@ -6,8 +6,9 @@ import asyncio
 import json
 import logging
 import math
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from auth_dependency import require_auth, require_org_member, AuthenticatedUser
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from datetime import datetime, timezone, timedelta
@@ -230,7 +231,7 @@ _WF_COLS = "id, org_id, project_id, name, slug, graph_json, variables, created_a
 
 
 @router.get("/workflows/{org_id}", response_model=List[WorkflowResponse])
-async def get_workflows(org_id: str, project_id: Optional[str] = None):
+async def get_workflows(org_id: str, project_id: Optional[str] = None, _user: AuthenticatedUser = Depends(require_org_member)):
     """List workflows for an organization. Optional project_id to filter by project."""
     try:
         q = (
@@ -250,7 +251,7 @@ async def get_workflows(org_id: str, project_id: Optional[str] = None):
 
 
 @router.get("/projects/{org_id}/{project_id}/workflows", response_model=List[WorkflowResponse])
-async def get_project_workflows(org_id: str, project_id: str):
+async def get_project_workflows(org_id: str, project_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """List workflows for a project. Verifies project belongs to org."""
     try:
         proj = supabase.table("projects").select("id").eq("id", project_id).eq("org_id", org_id).limit(1).execute()
@@ -272,7 +273,7 @@ async def get_project_workflows(org_id: str, project_id: str):
 
 
 @router.post("/workflows", response_model=WorkflowResponse)
-async def create_workflow(payload: WorkflowCreate):
+async def create_workflow(payload: WorkflowCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a new workflow. Uses project_id if provided; otherwise uses or creates default project for org."""
     try:
         # Plan enforcement: check workflow limit before creating
@@ -313,7 +314,7 @@ async def create_workflow(payload: WorkflowCreate):
 
 
 @router.put("/workflows/{workflow_id}", response_model=WorkflowResponse)
-async def update_workflow(workflow_id: str, payload: WorkflowUpdate):
+async def update_workflow(workflow_id: str, payload: WorkflowUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update workflow name, slug, graph_json, variables."""
     try:
         update_data = {}
@@ -341,7 +342,7 @@ async def update_workflow(workflow_id: str, payload: WorkflowUpdate):
 
 
 @router.delete("/workflows/{workflow_id}")
-async def delete_workflow(workflow_id: str):
+async def delete_workflow(workflow_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a workflow and all associated data: runs, deployments, golden_inputs, eval_suites, then the workflow."""
     try:
         # Verify workflow exists and get org_id for RLS (optional; delete may still work with service role)
@@ -432,7 +433,7 @@ def _deployment_row_to_response(row: dict) -> dict:
 
 
 @router.get("/workflow-deployments/latest")
-async def get_latest_deployment(workflow_id: str, org_id: str, promoted_only: bool = True):
+async def get_latest_deployment(workflow_id: str, org_id: str, promoted_only: bool = True, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get the latest deployment for a workflow. Default: latest promoted only (what's live). Set promoted_only=false for latest by version (e.g. candidate)."""
     try:
         q = (
@@ -452,7 +453,7 @@ async def get_latest_deployment(workflow_id: str, org_id: str, promoted_only: bo
 
 
 @router.get("/workflow-deployments")
-async def list_workflow_deployments(workflow_id: str, org_id: str, limit: int = 50, promoted_only: bool = False):
+async def list_workflow_deployments(workflow_id: str, org_id: str, limit: int = 50, promoted_only: bool = False, _user: AuthenticatedUser = Depends(require_org_member)):
     """List deployments for a workflow (history, newest first). Set promoted_only=true to only return promoted (e.g. for canary/experiments)."""
     try:
         q = (
@@ -470,7 +471,7 @@ async def list_workflow_deployments(workflow_id: str, org_id: str, limit: int = 
 
 
 @router.get("/workflow-deployments/diff")
-async def diff_deployments(org_id: str, endpoint_slug: str, version_a: int, version_b: int):
+async def diff_deployments(org_id: str, endpoint_slug: str, version_a: int, version_b: int, _user: AuthenticatedUser = Depends(require_org_member)):
     """Compare two promoted deployment versions (e.g. for experiment v5 vs v6). Returns changes and summary."""
     try:
         dep_a = await get_promoted_deployment_by_version(org_id, endpoint_slug.strip(), version_a)
@@ -501,7 +502,7 @@ def _endpoint_limit_for_plan(plan: Optional[str]) -> float:
 
 
 @router.post("/workflow-deployments")
-async def create_workflow_deployment(payload: DeploymentCreate):
+async def create_workflow_deployment(payload: DeploymentCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a new deployment. Version increments automatically per workflow.
     - If this workflow already has deployments: reuse existing endpoint_slug; reject different slug with 400.
     - First deploy: use payload endpoint_slug; 409 if slug already used by another workflow in this org.
@@ -635,7 +636,7 @@ class PromoteOverridePayload(BaseModel):
 
 
 @router.post("/workflow-deployments/{deployment_id}/promote")
-async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload):
+async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """Admin override: promote a deployment despite failed eval. Sets status=promoted, promoted_at=now(), override_reason."""
     try:
         result = (
@@ -671,7 +672,7 @@ class ActivateDeploymentPayload(BaseModel):
 
 
 @router.post("/workflow-deployments/{deployment_id}/activate")
-async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPayload):
+async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """Re-activate an existing deployment as the live version (rollback without creating a new version).
 
     Sets the target deployment to status=promoted and demotes any other promoted
@@ -717,7 +718,7 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
 
 
 @router.delete("/workflow-deployments/{deployment_id}")
-async def delete_deployment(deployment_id: str):
+async def delete_deployment(deployment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a deployment version. Cannot delete the currently promoted (live) deployment."""
     try:
         fetch = supabase.table("workflow_deployments").select("id, status").eq("id", deployment_id).execute()
@@ -735,7 +736,7 @@ async def delete_deployment(deployment_id: str):
 
 
 @router.get("/workflow-runs")
-async def list_workflow_runs(org_id: str, limit: int = 50):
+async def list_workflow_runs(org_id: str, limit: int = 50, _user: AuthenticatedUser = Depends(require_org_member)):
     """List recent workflow runs for an organization (for Logs / observability)."""
     try:
         cap = max(1, min(limit, 2000))
@@ -753,7 +754,7 @@ async def list_workflow_runs(org_id: str, limit: int = 50):
 
 
 @router.post("/execute-workflow")
-async def api_execute_workflow(payload: ExecuteWorkflowPayload):
+async def api_execute_workflow(payload: ExecuteWorkflowPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """
     Execute a workflow. Draft vs production:
     - Draft: graph_json + org_id in body (Studio simulation). Logs execution_mode='draft'. Deployment table not used.
@@ -915,7 +916,7 @@ async def _stream_execute_workflow_draft(
 
 
 @router.post("/execute-workflow/stream")
-async def api_execute_workflow_stream(payload: ExecuteWorkflowPayload):
+async def api_execute_workflow_stream(payload: ExecuteWorkflowPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """
     Execute a workflow with SSE streaming (draft only). Emits workflow_info, step_start, step_end, done, [DONE].
     Requires graph_json and org_id. Use POST /execute-workflow for non-streaming or production.
@@ -976,7 +977,7 @@ class TestProductionCallPayload(BaseModel):
 
 
 @router.post("/test-production-call")
-async def api_test_production_call(payload: TestProductionCallPayload):
+async def api_test_production_call(payload: TestProductionCallPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """
     Run the deployed production endpoint for the given org_id and endpoint_slug.
     Uses the same execution path as the public API but authorizes via request context (JWT).
@@ -1064,7 +1065,7 @@ def _current_minute_count_by_slug(org_id: str) -> list[dict]:
 
 
 @router.get("/observability/summary")
-async def get_workflow_observability_summary(org_id: str):
+async def get_workflow_observability_summary(org_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """
     Summary: total production/draft requests, cost and request count by endpoint_slug,
     avg latency by endpoint_slug, version distribution, current_minute_count per slug.
@@ -1181,7 +1182,7 @@ async def get_workflow_observability_summary(org_id: str):
 
 
 @router.get("/observability/by-endpoint")
-async def get_workflow_observability_by_endpoint(org_id: str, slug: str):
+async def get_workflow_observability_by_endpoint(org_id: str, slug: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """
     Per-endpoint: version breakdown, last 50 runs, cost and latency per version. Explicit columns only.
     """
@@ -1292,7 +1293,7 @@ class GoldenInputUpdate(BaseModel):
 
 
 @router.get("/golden-inputs/{org_id}/{workflow_id}")
-async def list_golden_inputs(org_id: str, workflow_id: str):
+async def list_golden_inputs(org_id: str, workflow_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """List golden inputs (test cases) for a workflow. Requires auth and org access."""
     try:
         result = (
@@ -1309,7 +1310,7 @@ async def list_golden_inputs(org_id: str, workflow_id: str):
 
 
 @router.post("/golden-inputs")
-async def create_golden_input(payload: GoldenInputCreate):
+async def create_golden_input(payload: GoldenInputCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a golden input (test case). Requires auth and org access."""
     try:
         insert = {
@@ -1333,7 +1334,7 @@ async def create_golden_input(payload: GoldenInputCreate):
 
 
 @router.put("/golden-inputs/{golden_input_id}")
-async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate):
+async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update a golden input. Requires auth and org access."""
     try:
         update = {k: v for k, v in payload.model_dump(exclude_unset=True).items()}
@@ -1355,7 +1356,7 @@ async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate):
 
 
 @router.delete("/golden-inputs/{golden_input_id}", status_code=204)
-async def delete_golden_input(golden_input_id: str):
+async def delete_golden_input(golden_input_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a golden input. Requires auth and org access."""
     try:
         supabase.table("golden_inputs").delete().eq("id", golden_input_id).execute()
@@ -1374,7 +1375,7 @@ class ImportFromProductionPayload(BaseModel):
 
 
 @router.post("/golden-inputs/import-from-production")
-async def import_golden_input_from_production(payload: ImportFromProductionPayload):
+async def import_golden_input_from_production(payload: ImportFromProductionPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a golden input from a workflow run (e.g. production run). Requires auth and org access."""
     try:
         run = (
@@ -1436,7 +1437,7 @@ def _eval_suite_row_to_response(row: dict) -> dict:
 
 
 @router.get("/eval-suites/{org_id}/{workflow_id}")
-async def get_eval_suite(org_id: str, workflow_id: str):
+async def get_eval_suite(org_id: str, workflow_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get eval suite for a workflow. Creates one with default checks if none exists."""
     try:
         result = (
@@ -1477,7 +1478,7 @@ class EvalSuiteUpdate(BaseModel):
 
 
 @router.put("/eval-suites/{org_id}/{workflow_id}")
-async def put_eval_suite(org_id: str, workflow_id: str, payload: EvalSuiteUpdate):
+async def put_eval_suite(org_id: str, workflow_id: str, payload: EvalSuiteUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create or update eval suite for a workflow."""
     try:
         existing = (
@@ -1864,7 +1865,7 @@ class EvalRunStartPayload(BaseModel):
 
 
 @router.post("/eval/run")
-async def start_eval_run(payload: EvalRunStartPayload):
+async def start_eval_run(payload: EvalRunStartPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """Start an eval run for a deployment. Returns eval_run id; run executes and status can be polled via GET."""
     try:
         dep = (
@@ -1916,7 +1917,7 @@ async def start_eval_run(payload: EvalRunStartPayload):
 
 
 @router.get("/eval/runs/{eval_run_id}")
-async def get_eval_run(eval_run_id: str):
+async def get_eval_run(eval_run_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get eval run status and results (for polling)."""
     try:
         run_row = (
@@ -1984,7 +1985,7 @@ class PromoteOverridePayload(BaseModel):
 
 
 @router.post("/workflow-deployments/{deployment_id}/promote")
-async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload = None):
+async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload = None, _user: AuthenticatedUser = Depends(require_org_member)):
     """Admin override: promote a deployment despite failed eval. Sets status=promoted, promoted_at, override_reason."""
     try:
         payload = payload or PromoteOverridePayload()
@@ -2053,7 +2054,7 @@ class RoutingPolicyCreate(BaseModel):
 
 
 @router.get("/routing-policies/{org_id}/{endpoint_slug}")
-async def get_routing_policy(org_id: str, endpoint_slug: str):
+async def get_routing_policy(org_id: str, endpoint_slug: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get active routing policy for an endpoint, if any."""
     try:
         result = (
@@ -2073,7 +2074,7 @@ async def get_routing_policy(org_id: str, endpoint_slug: str):
 
 
 @router.post("/routing-policies")
-async def create_or_update_routing_policy(payload: RoutingPolicyCreate):
+async def create_or_update_routing_policy(payload: RoutingPolicyCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create or update routing policy. Only one active policy per endpoint; weights must sum to 100."""
     try:
         slug = (payload.endpoint_slug or "").strip()
@@ -2132,7 +2133,7 @@ async def create_or_update_routing_policy(payload: RoutingPolicyCreate):
 
 
 @router.delete("/routing-policies/{policy_id}", status_code=204)
-async def delete_routing_policy(policy_id: str):
+async def delete_routing_policy(policy_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete (deactivate) a routing policy; traffic reverts to latest promoted."""
     try:
         supabase.table("routing_policies").update({"active": False}).eq("id", policy_id).execute()
@@ -2153,6 +2154,7 @@ async def get_metrics_by_version(
     endpoint_slug: str,
     versions: str,
     window: str = "1h",
+    _user: AuthenticatedUser = Depends(require_org_member),
 ):
     """Aggregate workflow_runs by served_version for the given versions and time window."""
     try:
@@ -2608,7 +2610,7 @@ class EstimateSampleBody(BaseModel):
 
 
 @router.post("/experiments/estimate-sample")
-async def estimate_experiment_sample(body: EstimateSampleBody):
+async def estimate_experiment_sample(body: EstimateSampleBody, _user: AuthenticatedUser = Depends(require_org_member)):
     """Estimate required sample size per variant and total; optional estimated_days from recent traffic."""
     try:
         alpha = 1.0 - (body.confidence_level / 100.0)
@@ -2666,7 +2668,7 @@ class ExperimentCreate(BaseModel):
 
 
 @router.post("/experiments")
-async def create_experiment(payload: ExperimentCreate):
+async def create_experiment(payload: ExperimentCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a new experiment (draft)."""
     try:
         slug = (payload.endpoint_slug or "").strip()
@@ -2722,7 +2724,7 @@ async def create_experiment(payload: ExperimentCreate):
 
 
 @router.get("/experiments")
-async def list_experiments(org_id: str, endpoint_slug: Optional[str] = None):
+async def list_experiments(org_id: str, endpoint_slug: Optional[str] = None, _user: AuthenticatedUser = Depends(require_org_member)):
     """List experiments. If endpoint_slug is omitted, returns all experiments for the org."""
     try:
         q = (
@@ -2740,7 +2742,7 @@ async def list_experiments(org_id: str, endpoint_slug: Optional[str] = None):
 
 
 @router.get("/experiments/{experiment_id}")
-async def get_experiment(experiment_id: str):
+async def get_experiment(experiment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get experiment by id with computed results."""
     try:
         result = (
@@ -2815,7 +2817,7 @@ class CustomMetricCreate(BaseModel):
 
 
 @router.get("/custom-metrics")
-async def list_custom_metrics(org_id: str):
+async def list_custom_metrics(org_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """List custom metric definitions for an org."""
     try:
         result = (
@@ -2831,7 +2833,7 @@ async def list_custom_metrics(org_id: str):
 
 
 @router.post("/custom-metrics")
-async def create_custom_metric(payload: CustomMetricCreate):
+async def create_custom_metric(payload: CustomMetricCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a custom metric definition. key must be unique per org."""
     try:
         key = (payload.key or "").strip()
@@ -2863,7 +2865,7 @@ async def create_custom_metric(payload: CustomMetricCreate):
 
 
 @router.delete("/custom-metrics/{metric_id}")
-async def delete_custom_metric(metric_id: str):
+async def delete_custom_metric(metric_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a custom metric definition. Does not remove existing values from api_request_log."""
     try:
         supabase.table("custom_metrics").delete().eq("id", metric_id).execute()
@@ -2943,7 +2945,7 @@ class AutoGradedMetricUpdate(BaseModel):
 
 
 @router.get("/auto-graded-metrics")
-async def list_auto_graded_metrics(org_id: str):
+async def list_auto_graded_metrics(org_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """List auto-graded metric definitions for an org."""
     try:
         result = (
@@ -2959,7 +2961,7 @@ async def list_auto_graded_metrics(org_id: str):
 
 
 @router.post("/auto-graded-metrics")
-async def create_auto_graded_metric(payload: AutoGradedMetricCreate):
+async def create_auto_graded_metric(payload: AutoGradedMetricCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create an auto-graded metric definition."""
     try:
         key = (payload.key or "").strip().lower().replace(" ", "_")
@@ -2998,7 +3000,7 @@ async def create_auto_graded_metric(payload: AutoGradedMetricCreate):
 
 
 @router.put("/auto-graded-metrics/{metric_id}")
-async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpdate):
+async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update an auto-graded metric definition."""
     try:
         updates = {}
@@ -3044,7 +3046,7 @@ async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpd
 
 
 @router.delete("/auto-graded-metrics/{metric_id}")
-async def delete_auto_graded_metric(metric_id: str):
+async def delete_auto_graded_metric(metric_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete an auto-graded metric definition."""
     try:
         supabase.table("auto_graded_metrics").delete().eq("id", metric_id).execute()
@@ -3058,6 +3060,7 @@ async def get_experiment_timeseries(
     experiment_id: str,
     metric: str = "error_rate",
     bucket: str = "1h",
+    _user: AuthenticatedUser = Depends(require_org_member),
 ):
     """
     Bucketed metrics per variant for experiment. bucket: 15m, 1h, 6h, 1d.
@@ -3153,7 +3156,7 @@ async def get_experiment_timeseries(
 
 
 @router.put("/experiments/{experiment_id}/start")
-async def start_experiment(experiment_id: str):
+async def start_experiment(experiment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Set experiment to running and create weighted routing policy from variants."""
     try:
         result = (
@@ -3315,7 +3318,7 @@ async def _maybe_auto_conclude(experiment_id: str) -> None:
 
 
 @router.put("/experiments/{experiment_id}/conclude")
-async def conclude_experiment(experiment_id: str, body: Optional[ConcludeBody] = None):
+async def conclude_experiment(experiment_id: str, body: Optional[ConcludeBody] = None, _user: AuthenticatedUser = Depends(require_org_member)):
     """Conclude experiment: set winner, deactivate routing policy. If winner is not latest promoted, create new deployment with winner's graph so it serves 100%."""
     winner_version = body.winner_version if body else None
     if winner_version is None:
@@ -3377,7 +3380,7 @@ def _end_experiments_on_endpoint_sync(org_id: str, endpoint_slug: str, reason: s
 
 
 @router.put("/experiments/{experiment_id}/cancel")
-async def cancel_experiment(experiment_id: str):
+async def cancel_experiment(experiment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Cancel experiment and deactivate its routing policy."""
     try:
         result = (
@@ -3478,7 +3481,7 @@ class RollbackRuleUpdate(BaseModel):
 
 
 @router.get("/rollback-rules/{org_id}/{endpoint_slug}")
-async def list_rollback_rules(org_id: str, endpoint_slug: str):
+async def list_rollback_rules(org_id: str, endpoint_slug: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """List rollback rules for an endpoint."""
     try:
         result = (
@@ -3495,7 +3498,7 @@ async def list_rollback_rules(org_id: str, endpoint_slug: str):
 
 
 @router.get("/rollback-rules/detail/{rule_id}")
-async def get_rollback_rule(rule_id: str):
+async def get_rollback_rule(rule_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get a single rollback rule by id."""
     try:
         result = (
@@ -3539,7 +3542,7 @@ def _build_rollback_conditions_from_payload(payload: RollbackRuleCreate) -> list
 
 
 @router.post("/rollback-rules")
-async def create_rollback_rule(payload: RollbackRuleCreate):
+async def create_rollback_rule(payload: RollbackRuleCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a rollback rule. Accepts either conditions array or new schema (metric, direction, threshold, window_minutes, min_requests)."""
     try:
         if payload.metric is not None and (payload.metric or "").strip():
@@ -3572,7 +3575,7 @@ async def create_rollback_rule(payload: RollbackRuleCreate):
 
 
 @router.put("/rollback-rules/{rule_id}")
-async def update_rollback_rule(rule_id: str, payload: RollbackRuleUpdate):
+async def update_rollback_rule(rule_id: str, payload: RollbackRuleUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update a rollback rule."""
     try:
         result = (
@@ -3605,7 +3608,7 @@ async def update_rollback_rule(rule_id: str, payload: RollbackRuleUpdate):
 
 
 @router.delete("/rollback-rules/{rule_id}", status_code=204)
-async def delete_rollback_rule(rule_id: str):
+async def delete_rollback_rule(rule_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a rollback rule."""
     try:
         supabase.table("rollback_rules").delete().eq("id", rule_id).execute()
@@ -3850,7 +3853,7 @@ async def run_rollback_monitor_cycle() -> dict:
 
 
 @router.post("/rollback-monitor/run")
-async def trigger_rollback_monitor():
+async def trigger_rollback_monitor(_user: AuthenticatedUser = Depends(require_org_member)):
     """Trigger one rollback monitor cycle (e.g. from cron every 60s). Returns summary."""
     summary = await run_rollback_monitor_cycle()
     return summary
@@ -3861,7 +3864,7 @@ async def trigger_rollback_monitor():
 # ---------------------------------------------------------------------------
 
 @router.get("/control-plane/endpoints")
-async def control_plane_endpoints(org_id: str):
+async def control_plane_endpoints(org_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """List endpoints for the org with routing, experiments, and rollback summary. For control plane UI."""
     try:
         # All promoted deployments for org (we'll take latest per endpoint_slug)
