@@ -52,14 +52,17 @@ async def list_webhooks(
             .order("created_at", desc=False)
             .execute()
         )
-        webhooks = result.data or []
-        # Mask secrets
-        for w in webhooks:
-            if w.get("secret"):
-                w["secret_masked"] = w["secret"][:4] + "••••" + w["secret"][-4:] if len(w["secret"]) > 8 else "••••••••"
-                del w["secret"]
+        raw = result.data or []
+        # Build response with masked secrets (don't mutate; Supabase rows may be read-only)
+        webhooks = []
+        for w in raw:
+            row = dict(w) if not isinstance(w, dict) else w.copy()
+            secret = row.pop("secret", None)
+            if secret and isinstance(secret, str) and len(secret) > 8:
+                row["secret_masked"] = secret[:4] + "••••" + secret[-4:]
             else:
-                w["secret_masked"] = None
+                row["secret_masked"] = "••••••••" if secret else None
+            webhooks.append(row)
         return webhooks
     except Exception as e:
         logger.error("Failed to list webhooks for org %s: %s", org_id, e)
