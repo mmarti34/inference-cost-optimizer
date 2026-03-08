@@ -69,10 +69,11 @@ async def require_auth(
 async def require_org_member(
     request: Request,
     auth_user: AuthenticatedUser = Depends(require_auth),
+    x_org_id: Optional[str] = Header(None),
 ) -> AuthenticatedUser:
     """
     Verify the authenticated user is a member of the org_id in the request path or body.
-    Extracts org_id from path params, query params, or JSON body.
+    Extracts org_id from path params, query params, JSON body, or X-Org-Id header.
     Raises 403 if user is not a member of that org.
     """
     # Try to get org_id from path params
@@ -90,10 +91,15 @@ async def require_org_member(
         except Exception:
             pass
 
+    # Fall back to X-Org-Id header (used by frontend for endpoints where org_id
+    # is not in the path, e.g. DELETE /workflows/{id}, GET /experiments/{id})
+    if not org_id:
+        org_id = x_org_id
+
     if not org_id:
         raise HTTPException(
             status_code=400,
-            detail="org_id is required but could not be found in path, query, or body.",
+            detail="org_id is required but could not be found in path, query, body, or X-Org-Id header.",
         )
 
     # Check membership
