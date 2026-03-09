@@ -92,7 +92,7 @@ async def get_member_role(
 ):
     """Get member role for a specific user in an organization"""
     try:
-        result = supabase.table("organization_members").select("role, status").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").single().execute()
+        result = supabase.table("organization_members").select("role, status").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").maybe_single().execute()
 
         if not result.data:
             raise HTTPException(status_code=404, detail="Member not found or not active")
