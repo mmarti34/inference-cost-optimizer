@@ -76,7 +76,7 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         
         # 1. Get user's actual plan from user_profiles table
         print("Fetching user's actual plan...")
-        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).maybe_single().execute()
         user_actual_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_actual_plan = user_profile_result.data["subscription_tier"]
@@ -432,7 +432,7 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
         logger.info(f"User {user_id} attempting to join organization {org_id}")
         
         # 1. Get user's actual plan
-        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).maybe_single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
@@ -559,7 +559,7 @@ def check_organization_access(org_id: str, auth_user: AuthenticatedUser = Depend
         logger.info("Checking access for user %s to organization %s", user_id, org_id)
         
         # 1. Get user's current plan
-        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).maybe_single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
@@ -618,7 +618,7 @@ def get_user_accessible_organizations(auth_user: AuthenticatedUser = Depends(req
         logger.info("Getting accessible organizations for user %s", user_id)
         
         # 1. Get user's current plan
-        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).maybe_single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
@@ -682,7 +682,7 @@ def validate_api_key_access(org_id: str, auth_user: AuthenticatedUser = Depends(
         logger.info("Validating API key access for user %s to organization %s", user_id, org_id)
         
         # 1. Get user's current plan
-        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).single().execute()
+        user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).maybe_single().execute()
         user_plan = "free"
         if user_profile_result.data and user_profile_result.data.get("subscription_tier"):
             user_plan = user_profile_result.data["subscription_tier"]
@@ -719,7 +719,7 @@ def validate_api_key_access(org_id: str, auth_user: AuthenticatedUser = Depends(
             admin_result = supabase.table("organization_members").select("user_id").eq("org_id", org_id).eq("role", "admin").eq("status", "active").single().execute()
             if admin_result.data:
                 admin_user_id = admin_result.data["user_id"]
-                admin_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", admin_user_id).single().execute()
+                admin_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", admin_user_id).maybe_single().execute()
                 admin_plan = "free"
                 if admin_profile_result.data and admin_profile_result.data.get("subscription_tier"):
                     admin_plan = admin_profile_result.data["subscription_tier"]
