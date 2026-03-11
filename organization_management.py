@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from supabase_client import supabase
 from auth_dependency import require_auth, require_org_member, require_org_admin, AuthenticatedUser
+from plan_enforcement import get_monthly_usage, get_org_plan_tier, _get_plan_limit
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,30 @@ async def get_user_subscription(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching user subscription: {str(e)}")
+
+@router.get("/organizations/{org_id}/usage/monthly")
+async def get_org_monthly_usage(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Return the current month's API request count, plan tier, and monthly limit.
+    Used by the frontend to render the usage bar in the sidebar.
+    """
+    try:
+        plan = get_org_plan_tier(org_id)
+        limit = _get_plan_limit(plan, "requests_per_month")
+        count = get_monthly_usage(org_id)
+        return {
+            "plan": plan,
+            "request_count": count,
+            "limit": limit,  # -1 = unlimited
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching monthly usage: {str(e)}")
+
 
 @router.put("/organizations/{org_id}/plan")
 async def update_organization_plan(
