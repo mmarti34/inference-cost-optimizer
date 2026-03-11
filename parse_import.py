@@ -24,8 +24,10 @@ PARSE_PROMPT = """\
 Extract the AI API call config from the code below. Return ONLY valid JSON — no markdown, no explanation.
 
 STEP 1 — Identify the api_type:
-- "chat"             → text chat/completion (openai.chat.completions.create, anthropic.messages.create, responses.create, groq/mistral/cohere/together chat, etc.)
-- "vision"           → chat call where messages include an image_url or base64 image in the content array
+- "chat"             → plain text chat/completion with NO tools (openai.chat.completions.create, anthropic.messages.create, responses.create, groq/mistral/cohere/together chat, etc.)
+- "vision"           → chat call (no tools) where messages include an image_url or base64 image in the content array
+- "tool_call"        → single LLM call WITH a tools/functions array (openai chat with tools=[], anthropic messages with tools=[], responses.create with tools=[])
+- "agent"            → autonomous multi-step agentic loop: Assistants API (beta.assistants / beta.threads.runs), LangChain AgentExecutor, AutoGPT-style while loops that call an LLM + execute tool results iteratively
 - "image_generation" → image generation (openai.images.generate, stability, replicate image models, etc.)
 - "tts"              → text-to-speech (openai.audio.speech.create, elevenlabs, etc.)
 - "stt"              → speech-to-text / transcription (openai.audio.transcriptions.create, whisper, deepgram, etc.)
@@ -33,34 +35,38 @@ STEP 1 — Identify the api_type:
 
 STEP 2 — Apply rules by api_type:
 
-For "chat" and "vision":
+For "chat", "vision", "tool_call", "agent":
 - "system_prompt": HARDCODED text from system/developer/instructions role. Use "" if none. Do NOT include user-role content.
-- "user_variable": snake_case variable NAME for dynamic user input (e.g. userMessage → user_message). If hardcoded string literal, use "user_message".
+- "user_variable": if user-role content is a runtime VARIABLE (identifier, not a string literal), its snake_case name (e.g. userMessage → user_message). Set to null if the content is a hardcoded string literal.
+- "user_content": if user-role content is a HARDCODED string literal, that exact text. Set to null if it is a variable.
+- Exactly one of user_variable / user_content will be non-null.
 - Treat role "developer", "system", "instructions" identically — all are system prompts.
 - For responses.create / Responses API: "input" array = same as "messages".
 - For Anthropic: "system" param = system prompt; user role in messages[] = user input.
+- For Assistants API / agent loops: "user_variable" is the user message fed into the thread/run.
 - For "vision": also set "image_variable" to the snake_case name of the image variable (e.g. imageUrl → image_url). If hardcoded, use "image_url".
 - "stream": true if streaming, else false or null.
 
 For "image_generation":
-- "user_variable": snake_case name of the text prompt variable (e.g. promptText → prompt_text). If hardcoded, use "prompt".
+- "user_variable": snake_case name of the prompt variable if dynamic; null if hardcoded. "user_content": the hardcoded prompt text if hardcoded; null if dynamic. Default variable name: "prompt".
 
 For "tts":
-- "user_variable": snake_case name of the input text variable (e.g. inputText → input_text). If hardcoded, use "text".
+- "user_variable": snake_case name of the text variable if dynamic; null if hardcoded. "user_content": the hardcoded text if hardcoded; null if dynamic. Default variable name: "text".
 
 For "stt":
-- "user_variable": snake_case name of the audio input variable (e.g. audioFile → audio_file). If hardcoded, use "audio".
+- "user_variable": snake_case name of the audio input variable if dynamic; null if hardcoded. "user_content": null (audio is always a runtime input). Default variable name: "audio".
 
 For "embeddings":
-- "user_variable": snake_case name of the text-to-embed variable (e.g. inputText → input_text). If hardcoded, use "text".
+- "user_variable": snake_case name of the text variable if dynamic; null if hardcoded. "user_content": the hardcoded text if hardcoded; null if dynamic. Default variable name: "text".
 
 Return this JSON shape:
 {
-  "api_type": "chat" | "vision" | "image_generation" | "tts" | "stt" | "embeddings",
+  "api_type": "chat" | "vision" | "tool_call" | "agent" | "image_generation" | "tts" | "stt" | "embeddings",
   "provider": "openai" | "anthropic" | "gemini" | "mistral" | "cohere" | "groq" | "together" | "deepseek" | "fireworks" | "elevenlabs" | "stability" | "replicate",
-  "model": "exact model string from the code",
+  "model": "exact model string from the code (or assistant model for agent)",
   "system_prompt": "hardcoded system/developer role text, or empty string",
-  "user_variable": "snake_case variable name for primary dynamic input",
+  "user_variable": "snake_case variable name if input is dynamic, or null if hardcoded",
+  "user_content": "the hardcoded input text if user_variable is null, otherwise null",
   "image_variable": "snake_case variable name for image input (vision only), or null",
   "temperature": number or null,
   "max_tokens": number or null,
@@ -109,7 +115,7 @@ async def parse_import(
                     "model": "gpt-4o-mini",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 600,
+                    "max_tokens": 700,
                 },
             )
             resp.raise_for_status()
