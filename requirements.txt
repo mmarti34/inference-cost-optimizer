@@ -4,7 +4,7 @@ supabase
 httpx
 openai
 anthropic
-mistralai
+mistralai>=1.0.0,<2.0.0
 cohere
 google-generativeai
 google-genai

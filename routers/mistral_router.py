@@ -2,7 +2,7 @@ import json
 import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from mistralai.client import MistralClient
+from mistralai import Mistral as MistralClient
 from supabase_client import supabase
 from utils.usage_logger import log_usage
 from utils.pricing import get_pricing
@@ -39,7 +39,7 @@ def handle_vision(payload: VisionPayload) -> dict:
         {"type": "image_url", "image_url": {"url": image_url}},
     ]
     try:
-        response = client.chat(
+        response = client.chat.complete(
             model=(payload.model or "mistral-small-3.2").strip() or "mistral-small-3.2",
             messages=[{"role": "user", "content": content}],
         )
@@ -101,7 +101,7 @@ def handle_prompt(payload: PromptPayload):
 
     try:
         _t0_provider = time.perf_counter()
-        response = client.chat(
+        response = client.chat.complete(
             model=payload.model,
             messages=[{"role": "user", "content": payload.prompt}]
         )
