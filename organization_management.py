@@ -92,15 +92,16 @@ async def get_member_role(
 ):
     """Get member role for a specific user in an organization"""
     try:
-        result = supabase.table("organization_members").select("role, status").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").maybe_single().execute()
+        result = supabase.table("organization_members").select("role, status").eq("org_id", org_id).eq("user_id", user_id).eq("status", "active").limit(1).execute()
 
-        if not result.data:
+        if not result.data or len(result.data) == 0:
             raise HTTPException(status_code=404, detail="Member not found or not active")
 
+        row = result.data[0]
         return {
-            "role": result.data["role"],
-            "status": result.data["status"],
-            "is_admin": result.data["role"] == "admin"
+            "role": row["role"],
+            "status": row["status"],
+            "is_admin": row["role"] == "admin"
         }
     except HTTPException:
         raise
@@ -155,7 +156,7 @@ async def get_user_subscription(
     if auth_user.user_id != user_id:
         raise HTTPException(status_code=403, detail="Cannot access another user's subscription.")
     try:
-        result = supabase.table("user_profiles").select("subscription_tier, subscription_status").eq("user_id", user_id).single().execute()
+        result = supabase.table("user_profiles").select("subscription_tier, subscription_status").eq("user_id", user_id).maybe_single().execute()
 
         if not result.data:
             raise HTTPException(status_code=404, detail="User profile not found")
