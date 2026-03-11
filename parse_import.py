@@ -21,29 +21,54 @@ router = APIRouter()
 SYSTEM_OPENAI_API_KEY = os.environ.get("SYSTEM_OPENAI_API_KEY", "")
 
 PARSE_PROMPT = """\
-Extract the LLM call config from the code below. Return ONLY valid JSON — no markdown, no explanation.
+Extract the AI API call config from the code below. Return ONLY valid JSON — no markdown, no explanation.
 
-RULES:
-- "system_prompt": the HARDCODED text from the system / developer / instructions role message. If there is no such message, use "". Do NOT include user-role content here.
-- "user_variable": the variable NAME (in snake_case) that holds the dynamic user input at runtime. Look for a JS/Python variable passed as the user-role content (e.g. userMessage, user_input, query). If user content is a hardcoded string literal (not a variable), use "user_message" as the default name.
-- Treat role "developer" and role "system" and role "instructions" identically — all are system prompts.
-- For openai.responses.create / client.responses.create (the Responses API), the "input" array works the same as "messages": developer role = system prompt, user role = user input.
-- For Anthropic, the "system" parameter is the system prompt; look for the user-role content in messages[].
-- For streaming calls, set stream: true.
+STEP 1 — Identify the api_type:
+- "chat"             → text chat/completion (openai.chat.completions.create, anthropic.messages.create, responses.create, groq/mistral/cohere/together chat, etc.)
+- "vision"           → chat call where messages include an image_url or base64 image in the content array
+- "image_generation" → image generation (openai.images.generate, stability, replicate image models, etc.)
+- "tts"              → text-to-speech (openai.audio.speech.create, elevenlabs, etc.)
+- "stt"              → speech-to-text / transcription (openai.audio.transcriptions.create, whisper, deepgram, etc.)
+- "embeddings"       → vector embeddings (openai.embeddings.create, cohere embed, etc.)
+
+STEP 2 — Apply rules by api_type:
+
+For "chat" and "vision":
+- "system_prompt": HARDCODED text from system/developer/instructions role. Use "" if none. Do NOT include user-role content.
+- "user_variable": snake_case variable NAME for dynamic user input (e.g. userMessage → user_message). If hardcoded string literal, use "user_message".
+- Treat role "developer", "system", "instructions" identically — all are system prompts.
+- For responses.create / Responses API: "input" array = same as "messages".
+- For Anthropic: "system" param = system prompt; user role in messages[] = user input.
+- For "vision": also set "image_variable" to the snake_case name of the image variable (e.g. imageUrl → image_url). If hardcoded, use "image_url".
+- "stream": true if streaming, else false or null.
+
+For "image_generation":
+- "user_variable": snake_case name of the text prompt variable (e.g. promptText → prompt_text). If hardcoded, use "prompt".
+
+For "tts":
+- "user_variable": snake_case name of the input text variable (e.g. inputText → input_text). If hardcoded, use "text".
+
+For "stt":
+- "user_variable": snake_case name of the audio input variable (e.g. audioFile → audio_file). If hardcoded, use "audio".
+
+For "embeddings":
+- "user_variable": snake_case name of the text-to-embed variable (e.g. inputText → input_text). If hardcoded, use "text".
 
 Return this JSON shape:
 {
-  "provider": "openai" | "anthropic" | "gemini" | "mistral" | "cohere" | "groq" | "together" | "deepseek" | "fireworks",
+  "api_type": "chat" | "vision" | "image_generation" | "tts" | "stt" | "embeddings",
+  "provider": "openai" | "anthropic" | "gemini" | "mistral" | "cohere" | "groq" | "together" | "deepseek" | "fireworks" | "elevenlabs" | "stability" | "replicate",
   "model": "exact model string from the code",
   "system_prompt": "hardcoded system/developer role text, or empty string",
-  "user_variable": "snake_case variable name for dynamic user input",
+  "user_variable": "snake_case variable name for primary dynamic input",
+  "image_variable": "snake_case variable name for image input (vision only), or null",
   "temperature": number or null,
   "max_tokens": number or null,
   "stream": true | false | null,
   "suggestedName": "short-kebab-case endpoint name based on the apparent purpose"
 }
 
-Use null for numeric fields you cannot determine. If this is not an LLM API call, return:
+Use null for fields not applicable to the api_type. If this is not an AI API call, return:
 {"error": "not an LLM call"}
 
 Code:
@@ -84,7 +109,7 @@ async def parse_import(
                     "model": "gpt-4o-mini",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 500,
+                    "max_tokens": 600,
                 },
             )
             resp.raise_for_status()
