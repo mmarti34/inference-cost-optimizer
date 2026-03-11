@@ -23,11 +23,11 @@ SYSTEM_OPENAI_API_KEY = os.environ.get("SYSTEM_OPENAI_API_KEY", "")
 PARSE_PROMPT = """\
 Extract the AI API call config from the code below. Return ONLY valid JSON — no markdown, no explanation.
 
-STEP 1 — Identify the api_type:
-- "chat"             → plain text chat/completion with NO tools (openai.chat.completions.create, anthropic.messages.create, responses.create, groq/mistral/cohere/together chat, etc.)
-- "vision"           → chat call (no tools) where messages include an image_url or base64 image in the content array
-- "tool_call"        → single LLM call WITH a tools/functions array (openai chat with tools=[], anthropic messages with tools=[], responses.create with tools=[])
-- "agent"            → autonomous multi-step agentic loop: Assistants API (beta.assistants / beta.threads.runs), LangChain AgentExecutor, AutoGPT-style while loops that call an LLM + execute tool results iteratively
+STEP 1 — Identify the api_type. Read the ENTIRE call carefully before deciding.
+- "chat"             → text completion with NO tools parameter. Includes: chat.completions.create, anthropic.messages.create, responses.create (with or without a messages/input array), any provider chat endpoint — as long as there is NO explicit tools/functions parameter.
+- "vision"           → same as "chat" (no tools) but the messages/input contain an image_url or base64 image in the content.
+- "tool_call"        → ONLY when the call has an EXPLICIT tools=[] or functions=[] parameter containing at least one tool definition. The name "responses.create" alone does NOT mean tool_call.
+- "agent"            → autonomous multi-step loop: Assistants API (beta.assistants / beta.threads.runs), LangChain AgentExecutor, while-loop that calls LLM + executes tool results iteratively.
 - "image_generation" → image generation (openai.images.generate, stability, replicate image models, etc.)
 - "tts"              → text-to-speech (openai.audio.speech.create, elevenlabs, etc.)
 - "stt"              → speech-to-text / transcription (openai.audio.transcriptions.create, whisper, deepgram, etc.)
@@ -41,23 +41,30 @@ For "chat", "vision", "tool_call", "agent":
 - "user_content": if user-role content is a HARDCODED string literal, that exact text. Set to null if it is a variable.
 - Exactly one of user_variable / user_content will be non-null.
 - Treat role "developer", "system", "instructions" identically — all are system prompts.
-- For responses.create / Responses API: "input" array = same as "messages".
+- For responses.create / Responses API: "input" can be a plain string (treat as user content) OR an array of role objects (developer/system = system_prompt, user = user content). Handle both forms.
 - For Anthropic: "system" param = system prompt; user role in messages[] = user input.
 - For Assistants API / agent loops: "user_variable" is the user message fed into the thread/run.
 - For "vision": also set "image_variable" to the snake_case name of the image variable (e.g. imageUrl → image_url). If hardcoded, use "image_url".
 - "stream": true if streaming, else false or null.
 
 For "image_generation":
-- "user_variable": snake_case name of the prompt variable if dynamic; null if hardcoded. "user_content": the hardcoded prompt text if hardcoded; null if dynamic. Default variable name: "prompt".
+- "user_variable": snake_case name of the prompt variable if dynamic; null if hardcoded.
+- "user_content": the hardcoded prompt text if hardcoded; null if dynamic. Default variable name: "prompt".
 
 For "tts":
-- "user_variable": snake_case name of the text variable if dynamic; null if hardcoded. "user_content": the hardcoded text if hardcoded; null if dynamic. Default variable name: "text".
+- "user_variable": snake_case name of the input text variable if dynamic; null if hardcoded.
+- "user_content": the hardcoded text-to-speak if hardcoded; null if dynamic. Default variable name: "text".
+- "instructions": hardcoded text from the "instructions" parameter (speaking style / tone). Use "" if not present.
+- "voice": the voice name/id string from the code (e.g. "coral", "alloy", "nova"). Use null if not specified.
 
 For "stt":
-- "user_variable": snake_case name of the audio input variable if dynamic; null if hardcoded. "user_content": null (audio is always a runtime input). Default variable name: "audio".
+- "user_variable": snake_case name of the audio variable if dynamic; null if hardcoded. Default variable name: "audio".
+- "user_content": null (audio is always a runtime input).
+- "instructions": hardcoded text from the "prompt" parameter (context hint for transcription). Use "" if not present.
 
 For "embeddings":
-- "user_variable": snake_case name of the text variable if dynamic; null if hardcoded. "user_content": the hardcoded text if hardcoded; null if dynamic. Default variable name: "text".
+- "user_variable": snake_case name of the text variable if dynamic; null if hardcoded.
+- "user_content": the hardcoded text if hardcoded; null if dynamic. Default variable name: "text".
 
 Return this JSON shape:
 {
@@ -68,6 +75,8 @@ Return this JSON shape:
   "user_variable": "snake_case variable name if input is dynamic, or null if hardcoded",
   "user_content": "the hardcoded input text if user_variable is null, otherwise null",
   "image_variable": "snake_case variable name for image input (vision only), or null",
+  "instructions": "speaking style for tts, transcription context for stt, or null for other types",
+  "voice": "voice name/id for tts (e.g. 'coral'), or null",
   "temperature": number or null,
   "max_tokens": number or null,
   "stream": true | false | null,
