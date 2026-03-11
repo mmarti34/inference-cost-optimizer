@@ -652,6 +652,7 @@ def get_user_accessible_organizations(auth_user: AuthenticatedUser = Depends(req
                 org_data = {
                     "id": org["id"],
                     "name": org["name"],
+                    "slug": org.get("slug") or "",
                     "type": org.get("type", "Organization"),
                     "plan": org_plan,
                     "role": user_role,
