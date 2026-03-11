@@ -23,18 +23,27 @@ SYSTEM_OPENAI_API_KEY = os.environ.get("SYSTEM_OPENAI_API_KEY", "")
 PARSE_PROMPT = """\
 Extract the LLM call config from the code below. Return ONLY valid JSON — no markdown, no explanation.
 
+RULES:
+- "system_prompt": the HARDCODED text from the system / developer / instructions role message. If there is no such message, use "". Do NOT include user-role content here.
+- "user_variable": the variable NAME (in snake_case) that holds the dynamic user input at runtime. Look for a JS/Python variable passed as the user-role content (e.g. userMessage, user_input, query). If user content is a hardcoded string literal (not a variable), use "user_message" as the default name.
+- Treat role "developer" and role "system" and role "instructions" identically — all are system prompts.
+- For openai.responses.create / client.responses.create (the Responses API), the "input" array works the same as "messages": developer role = system prompt, user role = user input.
+- For Anthropic, the "system" parameter is the system prompt; look for the user-role content in messages[].
+- For streaming calls, set stream: true.
+
+Return this JSON shape:
 {
   "provider": "openai" | "anthropic" | "gemini" | "mistral" | "cohere" | "groq" | "together" | "deepseek" | "fireworks",
   "model": "exact model string from the code",
-  "system_prompt": "system prompt text, or empty string if none",
-  "user_variable": "variable name used for user input, converted to snake_case",
+  "system_prompt": "hardcoded system/developer role text, or empty string",
+  "user_variable": "snake_case variable name for dynamic user input",
   "temperature": number or null,
   "max_tokens": number or null,
   "stream": true | false | null,
   "suggestedName": "short-kebab-case endpoint name based on the apparent purpose"
 }
 
-Use null for any field you cannot determine. If this is not an LLM API call, return:
+Use null for numeric fields you cannot determine. If this is not an LLM API call, return:
 {"error": "not an LLM call"}
 
 Code:
