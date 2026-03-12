@@ -102,6 +102,7 @@ _default_origins = [
     "https://www.optiml.one",
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://localhost:3020",
 ]
 _ALLOWED_ORIGINS = os.environ.get("OPTIML_CORS_ORIGINS", "").strip()
 if _ALLOWED_ORIGINS:
