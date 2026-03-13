@@ -1,8 +1,9 @@
 """
 Supabase JWT authentication dependency for internal endpoints.
+Also supports Cursor tokens (Bearer optml_...) for plugin/API access.
 
-Verifies the Authorization: Bearer <supabase_jwt> header by calling
-Supabase auth.getUser(). Returns the authenticated user_id.
+Verifies the Authorization: Bearer <supabase_jwt> or Bearer <cursor_token> header.
+Returns the authenticated user_id (and for Cursor tokens: _cursor_org_id).
 
 Usage:
     from auth_dependency import require_auth, require_org_access
@@ -21,8 +22,11 @@ from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request
 from supabase_client import supabase
+from utils.encryption import hash_service_api_key
 
 logger = logging.getLogger(__name__)
+
+CURSOR_TOKEN_PREFIX = "optml_"
 
 
 @dataclass
@@ -30,15 +34,40 @@ class AuthenticatedUser:
     user_id: str
     email: Optional[str] = None
     _org_role: Optional[str] = None
+    _cursor_org_id: Optional[str] = None
+
+
+def _verify_cursor_token(token: str) -> Optional[AuthenticatedUser]:
+    """Look up cursor_tokens by hash; return AuthenticatedUser with _cursor_org_id or None."""
+    if not token.startswith(CURSOR_TOKEN_PREFIX) or len(token) < len(CURSOR_TOKEN_PREFIX) + 10:
+        return None
+    try:
+        token_hash = hash_service_api_key(token)
+        result = (
+            supabase.table("cursor_tokens")
+            .select("user_id, org_id")
+            .eq("token_hash", token_hash)
+            .limit(1)
+            .execute()
+        )
+        if not result.data or len(result.data) == 0:
+            return None
+        row = result.data[0]
+        return AuthenticatedUser(
+            user_id=str(row["user_id"]),
+            _cursor_org_id=str(row["org_id"]),
+        )
+    except Exception as e:
+        logger.debug("Cursor token lookup failed: %s", type(e).__name__)
+        return None
 
 
 async def require_auth(
     authorization: Optional[str] = Header(None),
 ) -> AuthenticatedUser:
     """
-    Verify Supabase JWT from Authorization header.
-    Returns AuthenticatedUser with user_id extracted from the token.
-    Raises 401 if missing/invalid.
+    Verify Authorization: Bearer. Tries Cursor token (optml_...) first, then Supabase JWT.
+    Returns AuthenticatedUser. Raises 401 if missing/invalid.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
@@ -47,9 +76,13 @@ async def require_auth(
     if not token:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
 
+    # Cursor token (long-lived, org-scoped)
+    cursor_user = _verify_cursor_token(token)
+    if cursor_user is not None:
+        return cursor_user
+
+    # Supabase JWT
     try:
-        # Use Supabase's auth.get_user() to validate the JWT and extract user info.
-        # This calls Supabase's GoTrue server, which verifies signature + expiry.
         user_response = supabase.auth.get_user(token)
         if not user_response or not user_response.user:
             raise HTTPException(status_code=401, detail="Invalid or expired token.")
@@ -102,7 +135,17 @@ async def require_org_member(
             detail="org_id is required but could not be found in path, query, body, or X-Org-Id header.",
         )
 
-    # Check membership
+    # Cursor token is scoped to one org: require request org matches token's org
+    if getattr(auth_user, "_cursor_org_id", None):
+        if org_id != auth_user._cursor_org_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Cursor token is scoped to a different organization.",
+            )
+        auth_user._org_role = "member"
+        return auth_user
+
+    # Check membership (Supabase-authenticated user)
     try:
         result = (
             supabase.table("organization_members")
