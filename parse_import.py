@@ -9,7 +9,7 @@ import logging
 import os
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -94,12 +94,8 @@ class ParseImportRequest(BaseModel):
     code: str
 
 
-@router.post("/parse-import")
-async def parse_import(
-    body: ParseImportRequest,
-    auth_user: AuthenticatedUser = Depends(require_auth),
-):
-    code = body.code.strip()
+async def _run_parse_import(code: str) -> JSONResponse:
+    code = code.strip()
     if len(code) < 20:
         return JSONResponse(status_code=400, content={"error": "code is too short"})
     if len(code) > 5000:
@@ -145,4 +141,24 @@ async def parse_import(
         return JSONResponse(status_code=502, content={"error": "upstream API error"})
     except Exception as e:
         logger.error("parse_import: unexpected error: %s", e)
-        raise HTTPException(status_code=500, detail=f"Parse error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Parse error: {str(e)}"},
+        )
+
+
+@router.post("/parse-import")
+async def parse_import(
+    body: ParseImportRequest,
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    return await _run_parse_import(body.code)
+
+
+@router.post("/public/parse-import-preview")
+async def parse_import_preview(body: ParseImportRequest):
+    """
+    Unauthenticated preview for marketing / landing page.
+    Same limits and parsing as /api/parse-import; does not create workflows.
+    """
+    return await _run_parse_import(body.code)
