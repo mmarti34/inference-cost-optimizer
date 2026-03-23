@@ -30,6 +30,7 @@ from custom_model_management import get_custom_model_by_id
 from model_target import ModelTarget
 from provider_resilience import call_with_resilience
 from context_runtime import resolve_node_context, build_context_trace
+from context_embeddings import search_similar as _search_kb
 
 _logger = logging.getLogger(__name__)
 
@@ -741,6 +742,39 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
     ]
     tools_by_name = {t["name"]: t for t in tools_config if t.get("name")}
 
+    # Inject RAG tools if context is enabled
+    _ctx_config = data.get("contextConfig") or {}
+    if _ctx_config.get("enabled"):
+        _scoped_ids = [
+            s["assetId"] for s in (_ctx_config.get("sources") or [])
+            if s.get("type") == "knowledge_asset" and s.get("assetId")
+        ] or None
+
+        _kb_search_tool = {
+            "name": "search_knowledge_base",
+            "description": "Search the organization's knowledge base for relevant information using semantic similarity.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
+                },
+                "required": ["query"],
+            },
+        }
+        _kb_get_tool = {
+            "name": "get_knowledge_asset",
+            "description": "Get the full content of a knowledge base asset by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "description": "ID of the asset"},
+                },
+                "required": ["asset_id"],
+            },
+        }
+        generic_tools = [_kb_search_tool, _kb_get_tool] + generic_tools
+
     # ── Recording tool executor ─────────────────────────────────────────
     reasoning_steps: list[dict] = []
     step_counter = [0]
@@ -768,6 +802,31 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
                 "node_id": node_id, "step_number": current_step, "step_type": "act",
                 "content": "", "tool_name": name, "tool_input": arguments, "latency_ms": 0,
             }})
+
+        if name == "search_knowledge_base":
+            import json as _json_mod
+            _q = arguments.get("query", "")
+            _lim = arguments.get("limit", 5)
+            _start = time.perf_counter()
+            _results = _search_kb(_q, org_id, limit=_lim, asset_ids=_scoped_ids if '_scoped_ids' in dir() else None)
+            _lat = int((time.perf_counter() - _start) * 1000)
+            return _json_mod.dumps(_results, default=str), _lat
+
+        if name == "get_knowledge_asset":
+            import json as _json_mod
+            _aid = arguments.get("asset_id", "")
+            _start = time.perf_counter()
+            try:
+                _row = supabase.table("context_assets").select("id, name, content, asset_type, metadata").eq("id", _aid).eq("org_id", org_id).execute()
+                if _row.data:
+                    _a = _row.data[0]
+                    _out = {"id": _a["id"], "name": _a["name"], "content": _a.get("content", ""), "asset_type": _a.get("asset_type"), "char_count": len(_a.get("content") or "")}
+                else:
+                    _out = {"error": "Asset not found"}
+            except Exception as _e:
+                _out = {"error": str(_e)}
+            _lat = int((time.perf_counter() - _start) * 1000)
+            return _json_mod.dumps(_out, default=str), _lat
 
         tool_def = tools_by_name.get(name, {"type": "builtin"})
 
