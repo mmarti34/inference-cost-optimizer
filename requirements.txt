@@ -15,3 +15,7 @@ pycryptodome
 stripe>=7.0.0,<10.0.0
 resend
 psycopg2-binary
+pypdf
+python-docx
+trafilatura
+notion-client
