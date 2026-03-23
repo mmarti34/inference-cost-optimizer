@@ -103,10 +103,10 @@ class UpdateContextAssetRequest(BaseModel):
 async def upload_context_asset(
     file: UploadFile = File(...),
     name: str = Form(...),
+    org_id: str = Form(...),
     description: str = Form(""),
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
-    org_id = auth_user.org_id
     file_bytes = await file.read()
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(400, "File exceeds 10MB limit")
