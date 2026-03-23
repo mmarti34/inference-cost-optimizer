@@ -61,17 +61,51 @@ def _extract_text_from_url(url: str) -> str:
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 
-def _bg_index_asset(asset_id: str, org_id: str, content: str, metadata: dict):
-    """Fire-and-forget: chunk + embed asset, update embedding_status in metadata."""
+def _auto_tag_topics(content: str, name: str) -> list[str]:
+    """Use a fast model call to extract 2-4 topic tags from content."""
+    import os, json as _json
+    try:
+        from openai import OpenAI
+        api_key = os.getenv("SYSTEM_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return []
+        client = OpenAI(api_key=api_key)
+        # Send first 3000 chars to keep it fast/cheap
+        snippet = content[:3000]
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=100,
+            messages=[
+                {"role": "system", "content": "You are a document classifier. Given a document's name and content preview, return 2-4 short topic tags that describe what this document covers. Return ONLY a JSON array of lowercase strings. Example: [\"legal\", \"compliance\", \"contracts\"]"},
+                {"role": "user", "content": f"Document name: {name}\n\nContent preview:\n{snippet}"}
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        tags = _json.loads(raw)
+        if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
+            return [t.lower().strip() for t in tags[:4]]
+    except Exception:
+        logger.exception("Auto-tag failed for asset %s", name)
+    return []
+
+
+def _bg_index_asset(asset_id: str, org_id: str, content: str, metadata: dict, name: str = ""):
+    """Fire-and-forget: chunk + embed asset, auto-tag topics, update metadata."""
     from context_embeddings import index_asset
     success = index_asset(asset_id, org_id, content)
     _status = "indexed" if success else "failed"
+    # Auto-generate topic tags
+    topics = _auto_tag_topics(content, name)
+    updated_meta = {**metadata, "embedding_status": _status}
+    if topics:
+        updated_meta["topics"] = topics
     try:
         supabase.table("context_assets").update(
-            {"metadata": {**metadata, "embedding_status": _status}}
+            {"metadata": updated_meta}
         ).eq("id", asset_id).execute()
     except Exception:
-        logger.exception("Failed to update embedding_status for asset %s", asset_id)
+        logger.exception("Failed to update metadata for asset %s", asset_id)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +160,7 @@ async def upload_context_asset(
     row = {"id": str(uuid.uuid4()), "org_id": org_id, "name": name, "description": description or None, "asset_type": "document", "content": content, "metadata": metadata, "status": "active"}
     result = supabase.table("context_assets").insert(row).execute()
     asset = result.data[0] if result.data else row
-    _thread_pool.submit(_bg_index_asset, asset["id"], org_id, content, metadata)
+    _thread_pool.submit(_bg_index_asset, asset["id"], org_id, content, metadata, name)
     return asset
 
 
@@ -236,7 +270,7 @@ async def create_context_asset(
 
     # Fire-and-forget embedding indexing for assets with content
     if content and body.asset_type in ("text", "url", "notion_page"):
-        _thread_pool.submit(_bg_index_asset, asset["id"], org_id, content, metadata)
+        _thread_pool.submit(_bg_index_asset, asset["id"], org_id, content, metadata, body.name)
 
     return asset
 
@@ -375,8 +409,8 @@ async def sync_context_asset(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", asset_id).eq("org_id", org_id).execute()
 
-    # Re-index after sync
-    _thread_pool.submit(_bg_index_asset, asset_id, org_id, content, metadata)
+    # Re-index and re-tag after sync
+    _thread_pool.submit(_bg_index_asset, asset_id, org_id, content, metadata, asset.get("name", ""))
 
     return {"synced": True, "char_count": len(content), "word_count": len(content.split())}
 
