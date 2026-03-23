@@ -98,6 +98,38 @@ class UpdateContextAssetRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# Upload must be defined BEFORE {org_id} routes to avoid path matching conflicts
+@router.post("/context-assets/upload")
+async def upload_context_asset(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    description: str = Form(""),
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    org_id = auth_user.org_id
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(400, "File exceeds 10MB limit")
+    filename = file.filename or "unknown"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext == "pdf":
+        content = _extract_text_from_pdf(file_bytes)
+    elif ext in ("docx", "doc"):
+        content = _extract_text_from_docx(file_bytes)
+    elif ext in ("txt", "md", "text", "markdown"):
+        content = file_bytes.decode("utf-8", errors="replace")
+    else:
+        raise HTTPException(400, f"Unsupported file type: .{ext}. Supported: .pdf, .docx, .txt, .md")
+    if len(content) > _MAX_CONTENT_CHARS:
+        raise HTTPException(400, f"Extracted text exceeds {_MAX_CONTENT_CHARS} character limit")
+    metadata = {"original_filename": filename, "file_type": ext, "char_count": len(content), "word_count": len(content.split()), "embedding_status": "pending"}
+    row = {"id": str(uuid.uuid4()), "org_id": org_id, "name": name, "description": description or None, "asset_type": "document", "content": content, "metadata": metadata, "status": "active"}
+    result = supabase.table("context_assets").insert(row).execute()
+    asset = result.data[0] if result.data else row
+    _thread_pool.submit(_bg_index_asset, asset["id"], org_id, content, metadata)
+    return asset
+
+
 @router.get("/context-assets/{org_id}")
 async def list_context_assets(
     org_id: str,
@@ -271,37 +303,6 @@ async def update_context_asset(
         .execute()
     )
     return result.data[0] if result.data else updates
-
-
-@router.post("/context-assets/upload")
-async def upload_context_asset(
-    file: UploadFile = File(...),
-    name: str = Form(...),
-    description: str = Form(""),
-    auth_user: AuthenticatedUser = Depends(require_org_member),
-):
-    org_id = auth_user.org_id
-    file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(400, "File exceeds 10MB limit")
-    filename = file.filename or "unknown"
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext == "pdf":
-        content = _extract_text_from_pdf(file_bytes)
-    elif ext in ("docx", "doc"):
-        content = _extract_text_from_docx(file_bytes)
-    elif ext in ("txt", "md", "text", "markdown"):
-        content = file_bytes.decode("utf-8", errors="replace")
-    else:
-        raise HTTPException(400, f"Unsupported file type: .{ext}. Supported: .pdf, .docx, .txt, .md")
-    if len(content) > _MAX_CONTENT_CHARS:
-        raise HTTPException(400, f"Extracted text exceeds {_MAX_CONTENT_CHARS} character limit")
-    metadata = {"original_filename": filename, "file_type": ext, "char_count": len(content), "word_count": len(content.split()), "embedding_status": "pending"}
-    row = {"id": str(uuid.uuid4()), "org_id": org_id, "name": name, "description": description or None, "asset_type": "document", "content": content, "metadata": metadata, "status": "active"}
-    result = supabase.table("context_assets").insert(row).execute()
-    asset = result.data[0] if result.data else row
-    _thread_pool.submit(_bg_index_asset, asset["id"], org_id, content, metadata)
-    return asset
 
 
 @router.post("/context-assets/{org_id}/{asset_id}/sync")
