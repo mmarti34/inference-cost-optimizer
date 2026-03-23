@@ -10,6 +10,11 @@ _mock_supabase_mod = types.ModuleType("supabase_client")
 _mock_supabase_mod.supabase = MagicMock()
 sys.modules.setdefault("supabase_client", _mock_supabase_mod)
 
+# Mock openai (needed for summarize strategy)
+_mock_openai = types.ModuleType("openai")
+_mock_openai.OpenAI = MagicMock()
+sys.modules.setdefault("openai", _mock_openai)
+
 from context_runtime import resolve_node_context, build_context_trace, _collect_sources, _package_context
 
 
