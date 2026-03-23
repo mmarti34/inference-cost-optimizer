@@ -29,6 +29,7 @@ from supabase_client import supabase
 from custom_model_management import get_custom_model_by_id
 from model_target import ModelTarget
 from provider_resilience import call_with_resilience
+from context_runtime import resolve_node_context, build_context_trace
 
 _logger = logging.getLogger(__name__)
 
@@ -704,7 +705,7 @@ def get_pending_yield(yield_id: str) -> ToolYieldRequest | None:
         return _pending_tool_yields.get(yield_id)
 
 
-def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str, event_queue: _queue_mod.Queue | None = None) -> dict:
+def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str, event_queue: _queue_mod.Queue | None = None, context_text: str | None = None) -> dict:
     """
     Execute an autonomous agent with reasoning trace.
 
@@ -832,6 +833,8 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
     # ── Build agent system prompt ───────────────────────────────────────
     user_sys = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
     agent_system = _AGENT_SYSTEM_TEMPLATE
+    if context_text:
+        agent_system = agent_system + "\n\n--- Context ---\n" + context_text
     if user_sys:
         agent_system = agent_system + "\n" + user_sys
 
@@ -1463,6 +1466,7 @@ def execute_workflow(
                 "output": formatted[:200] + ("..." if len(formatted) > 200 else ""),
             })
         elif node_type == "ai-step":
+            ctx_result = None
             prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
             task = (data.get("taskDescription") or data.get("task") or "Respond to the user.").strip()
             if not isinstance(task, str):
@@ -1474,10 +1478,25 @@ def execute_workflow(
                 prompt_text = prompt_text + "\n\n" + prev
             if conversation_prefix:
                 prompt_text = conversation_prefix + prompt_text
+            # --- Context injection ---
+            ctx_result = resolve_node_context(node, context, variables, input_text, org_id, execution_mode)
+            if ctx_result:
+                _ctx_text = ctx_result["final_text"]
+                _ctx_loc = ctx_result["injection_location"]
+                if _ctx_loc == "append_to_prompt":
+                    prompt_text = prompt_text + "\n\n" + _ctx_text
+                elif _ctx_loc == "prepend_to_prompt":
+                    prompt_text = _ctx_text + "\n\n" + prompt_text
+                # prepend_to_system handled after sys_instructions below
+            # --- End context injection (part 1) ---
             sys_instructions = (data.get("systemInstructions") or data.get("system_prefix") or "").strip()
             if sys_instructions:
                 sys_instructions = _apply_variables(sys_instructions, variables)
                 prompt_text = sys_instructions + "\n\n" + prompt_text
+            # --- Context injection (part 2: prepend_to_system) ---
+            if ctx_result and ctx_result["injection_location"] == "prepend_to_system":
+                prompt_text = ctx_result["final_text"] + "\n\n" + prompt_text
+            # --- End context injection ---
             model_node = {"id": node_id, "type": "model", "data": {**data, "modelName": data.get("modelName") or "gpt-3.5-turbo", "provider": data.get("provider") or "OpenAI"}}
             _t0_ai_step = time.perf_counter()
             try:
@@ -1529,6 +1548,7 @@ def execute_workflow(
             if result.get("output_warning"):
                 nr_entry["output_warning"] = result["output_warning"]
                 nr_entry["status"] = "warning"
+            nr_entry["context_trace"] = build_context_trace(ctx_result, data)
             node_results.append(nr_entry)
             # Internal latency instrumentation (best-effort, never raises)
             _record_latency_fact(
@@ -1632,9 +1652,24 @@ def execute_workflow(
                 prompt_text = prompt_text + "\n\n" + prev
             if conversation_prefix:
                 prompt_text = conversation_prefix + prompt_text
+            # --- Context injection ---
+            ctx_result = None
+            _ctx_for_agent = None
+            _ctx_resolved = resolve_node_context(node, context, variables, input_text, org_id, execution_mode)
+            if _ctx_resolved:
+                _ctx_text = _ctx_resolved["final_text"]
+                _ctx_loc = _ctx_resolved["injection_location"]
+                if _ctx_loc == "prepend_to_system":
+                    _ctx_for_agent = _ctx_text
+                elif _ctx_loc == "prepend_to_prompt":
+                    prompt_text = _ctx_text + "\n\n" + prompt_text
+                elif _ctx_loc == "append_to_prompt":
+                    prompt_text = prompt_text + "\n\n" + _ctx_text
+                ctx_result = _ctx_resolved
+            # --- End context injection ---
             _t0_agent = time.perf_counter()
             try:
-                result = _execute_agent_node(node_id, node, prompt_text, org_id)
+                result = _execute_agent_node(node_id, node, prompt_text, org_id, context_text=_ctx_for_agent)
             except HTTPException as e:
                 _fail_ms = int((time.perf_counter() - _t0_agent) * 1000)
                 _record_latency_fact(
@@ -1685,6 +1720,7 @@ def execute_workflow(
             if result.get("output_warning"):
                 nr_entry["output_warning"] = result["output_warning"]
                 nr_entry["status"] = "warning"
+            nr_entry["context_trace"] = build_context_trace(ctx_result, data)
             node_results.append(nr_entry)
             _record_latency_fact(
                 org_id=org_id, workflow_run_id=None, workflow_id=workflow_id,

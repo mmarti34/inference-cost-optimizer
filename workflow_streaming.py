@@ -25,6 +25,7 @@ from workflow_runtime import (
     _entry_point_ids,
     _execute_tool,
 )
+from context_runtime import resolve_node_context, build_context_trace
 
 
 def _insert_workflow_run_linear(
@@ -358,6 +359,20 @@ async def stream_workflow_async(
                     provider = (data.get("provider") or "openai").strip().lower()
                     model = (data.get("modelName") or "gpt-4o-mini").strip() or "gpt-4o-mini"
 
+                    # --- Context injection ---
+                    _ctx_for_agent = None
+                    _ctx_resolved = resolve_node_context(node, context, variables, input_text, org_id, "production")
+                    if _ctx_resolved:
+                        _ctx_text = _ctx_resolved["final_text"]
+                        _ctx_loc = _ctx_resolved["injection_location"]
+                        if _ctx_loc == "prepend_to_system":
+                            _ctx_for_agent = _ctx_text
+                        elif _ctx_loc == "prepend_to_prompt":
+                            prompt_text = _ctx_text + "\n\n" + prompt_text
+                        elif _ctx_loc == "append_to_prompt":
+                            prompt_text = prompt_text + "\n\n" + _ctx_text
+                    # --- End context injection ---
+
                     step_start = time.perf_counter()
 
                     import queue as _q
@@ -365,9 +380,12 @@ async def stream_workflow_async(
 
                     event_queue: _q.Queue = _q.Queue()
 
+                    # Capture context_text for closure
+                    _agent_context_text = _ctx_for_agent
+
                     def _run_agent():
                         from workflow_runtime import _execute_agent_node
-                        return _execute_agent_node(node_id, node, prompt_text, org_id, event_queue=event_queue)
+                        return _execute_agent_node(node_id, node, prompt_text, org_id, event_queue=event_queue, context_text=_agent_context_text)
 
                     # Run agent in a thread; read events from queue in real time
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -421,13 +439,15 @@ async def stream_workflow_async(
                     total_cost += cost_usd
                     total_latency += latency_ms
                     last_content_type = "text"
-                    node_results.append({
+                    _agent_nr = {
                         "node_id": node_id, "type": "agent", "latency_ms": latency_ms, "cost": cost_usd,
                         "output": full_output[:200], "tokens": out_tok, "input_tokens": in_tok,
                         "model": model, "provider": provider,
                         "tool_calls": tool_calls, "iterations": iterations,
                         "reasoning_steps": reasoning_steps, "agent_steps_count": len(reasoning_steps),
-                    })
+                    }
+                    _agent_nr["context_trace"] = build_context_trace(_ctx_resolved, data)
+                    node_results.append(_agent_nr)
                 elif ntype == "loop":
                     # Run loop node in a thread — emit iteration events as SSE
                     prev = _get_previous_output(context, from_node_id or "") if from_node_id else (input_text or "")
