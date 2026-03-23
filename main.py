@@ -51,6 +51,7 @@ from routers.public_execution import router as public_execution_router
 from parse_import import router as parse_import_router
 from cursor_tokens import router as cursor_tokens_router
 from cursor_deploy import router as cursor_deploy_router
+from workflow_draft_generator import router as workflow_draft_generator_router
 from middleware.observability_middleware import ObservabilityMiddleware
 from utils.observability import log_request, log_span, generate_request_id, generate_trace_id
 
@@ -149,6 +150,7 @@ app.include_router(secrets_management_router, prefix="/api")
 app.include_router(hitl_management_router, prefix="/api")
 app.include_router(webhook_management_router, prefix="/api")
 app.include_router(context_asset_management_router, prefix="/api")
+app.include_router(workflow_draft_generator_router, prefix="/api")
 
 # Health check endpoint for Railway
 @app.get("/health")
