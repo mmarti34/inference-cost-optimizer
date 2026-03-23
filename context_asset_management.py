@@ -82,6 +82,9 @@ def _auto_tag_topics(content: str, name: str) -> list[str]:
             ],
         )
         raw = resp.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         tags = _json.loads(raw)
         if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
             return [t.lower().strip() for t in tags[:4]]
