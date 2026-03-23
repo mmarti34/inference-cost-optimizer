@@ -438,6 +438,7 @@ async def public_execute(
             variant_name,
             resolved_version,
             conversation_prefix,
+            deployment.get("id") if deployment else None,  # deployment_id for context versioning
         )
 
         log_entry["http_status"] = 200

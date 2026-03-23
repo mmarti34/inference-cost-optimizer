@@ -1379,6 +1379,7 @@ def execute_workflow(
     variant_name: str | None = None,
     served_version: int | None = None,
     conversation_prefix: str | None = None,
+    deployment_id: str | None = None,
 ) -> dict:
     """
     Execute workflow graph. Returns final_output, node_results, total_cost, total_latency.
@@ -1479,7 +1480,7 @@ def execute_workflow(
             if conversation_prefix:
                 prompt_text = conversation_prefix + prompt_text
             # --- Context injection ---
-            ctx_result = resolve_node_context(node, context, variables, input_text, org_id, execution_mode)
+            ctx_result = resolve_node_context(node, context, variables, input_text, org_id, execution_mode, deployment_id=deployment_id)
             if ctx_result:
                 _ctx_text = ctx_result["final_text"]
                 _ctx_loc = ctx_result["injection_location"]
@@ -1655,7 +1656,7 @@ def execute_workflow(
             # --- Context injection ---
             ctx_result = None
             _ctx_for_agent = None
-            _ctx_resolved = resolve_node_context(node, context, variables, input_text, org_id, execution_mode)
+            _ctx_resolved = resolve_node_context(node, context, variables, input_text, org_id, execution_mode, deployment_id=deployment_id)
             if _ctx_resolved:
                 _ctx_text = _ctx_resolved["final_text"]
                 _ctx_loc = _ctx_resolved["injection_location"]

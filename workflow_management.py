@@ -590,6 +590,28 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
             raise HTTPException(status_code=500, detail="Failed to create deployment")
         deployment = result.data[0]
         deployment_id = str(deployment["id"])
+
+        # Snapshot referenced context assets for deterministic production execution
+        _graph = payload.graph_json if payload.graph_json else {"nodes": [], "edges": []}
+        _asset_ids_to_snapshot: set[str] = set()
+        for _node in _graph.get("nodes", []):
+            _ctx_cfg = (_node.get("data") or {}).get("contextConfig") or {}
+            if _ctx_cfg.get("enabled"):
+                for _src in _ctx_cfg.get("sources", []):
+                    if _src.get("type") == "knowledge_asset" and _src.get("assetId"):
+                        _asset_ids_to_snapshot.add(_src["assetId"])
+        if _asset_ids_to_snapshot:
+            try:
+                _assets = supabase.table("context_assets").select("id, content, metadata").in_("id", list(_asset_ids_to_snapshot)).execute()
+                _snap_rows = [
+                    {"asset_id": _a["id"], "deployment_id": deployment_id, "content": _a.get("content") or "", "metadata": _a.get("metadata") or {}}
+                    for _a in (_assets.data or [])
+                ]
+                if _snap_rows:
+                    supabase.table("context_asset_snapshots").insert(_snap_rows).execute()
+            except Exception:
+                logger.exception("Failed to snapshot context assets for deployment %s", deployment_id)
+
         resp = _deployment_row_to_response(deployment)
         try:
             suite_row = (

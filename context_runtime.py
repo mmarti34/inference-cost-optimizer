@@ -8,8 +8,10 @@ collects sources, packages them, and returns injectable text with trace metadata
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from openai import OpenAI
 from supabase_client import supabase
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,7 @@ def resolve_node_context(
     input_text: str,
     org_id: str,
     execution_mode: str,
+    deployment_id: str | None = None,
 ) -> dict | None:
     """
     Entry point. Returns None if context not enabled on this node.
@@ -48,11 +51,11 @@ def resolve_node_context(
     packaging_config = config.get("packaging") or {}
     injection_config = config.get("injection") or {}
 
-    candidates = _collect_sources(sources_config, context, org_id)
+    candidates = _collect_sources(sources_config, context, org_id, deployment_id=deployment_id)
     if not candidates:
         return None
 
-    packaged = _package_context(candidates, packaging_config)
+    packaged = _package_context(candidates, packaging_config, org_id=org_id)
 
     if not packaged["final_text"].strip():
         return None
@@ -91,6 +94,7 @@ def _collect_sources(
     sources_config: list[dict],
     context: dict,
     org_id: str,
+    deployment_id: str | None = None,
 ) -> list[dict]:
     """
     Resolve each source config to a normalized candidate.
@@ -142,9 +146,9 @@ def _collect_sources(
             if asset.get("status") == "deleted":
                 logger.warning("Context asset %s has been deleted, skipping", asset_id)
                 continue
-            if asset.get("asset_type") != "text":
+            if not asset.get("content"):
                 logger.warning(
-                    "Context asset %s is type '%s' (not yet supported), skipping",
+                    "Context asset %s has no content (type '%s'), skipping",
                     asset_id, asset.get("asset_type"),
                 )
                 if required:
@@ -153,6 +157,26 @@ def _collect_sources(
                     continue
             else:
                 raw_text = asset.get("content") or ""
+
+            # Prefer snapshot content for versioned deployments
+            if deployment_id:
+                try:
+                    snap = (
+                        supabase.table("context_asset_snapshots")
+                        .select("content")
+                        .eq("asset_id", asset_id)
+                        .eq("deployment_id", deployment_id)
+                        .maybe_single()
+                        .execute()
+                    )
+                    if snap.data and snap.data.get("content"):
+                        raw_text = snap.data["content"]
+                except Exception:
+                    logger.warning(
+                        "Failed to fetch snapshot for asset %s deployment %s, using live content",
+                        asset_id, deployment_id,
+                    )
+
             label = label or asset.get("name", "asset")
 
         elif src_type == "inline_text":
@@ -199,9 +223,44 @@ def _collect_sources(
     return candidates
 
 
+def _summarize_context(text: str, max_chars: int, org_id: str | None = None) -> str:
+    """Summarize text using gpt-4o-mini to fit within max_chars."""
+    api_key = os.environ.get("SYSTEM_OPENAI_API_KEY")
+    if not api_key:
+        logger.warning("SYSTEM_OPENAI_API_KEY not set, falling back to truncation")
+        return text[:max_chars]
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Summarize the following context to fit within {max_chars} characters. "
+                        "Preserve the most important facts, data points, and key information. "
+                        "Be concise but accurate."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            max_tokens=max_chars // 3,
+            temperature=0.2,
+        )
+        summary = response.choices[0].message.content or ""
+        if len(summary) > max_chars:
+            summary = summary[:max_chars]
+        return summary
+    except Exception:
+        logger.exception("Summarization failed (org=%s), falling back to truncation", org_id)
+        return text[:max_chars]
+
+
 def _package_context(
     candidates: list[dict],
     packaging_config: dict,
+    org_id: str | None = None,
 ) -> dict:
     """Assemble candidates into final text with trimming."""
     strategy = packaging_config.get("strategy", "concat")
@@ -221,8 +280,12 @@ def _package_context(
 
     truncated = False
     if max_chars and len(final_text) > max_chars:
-        final_text = final_text[:max_chars]
-        truncated = True
+        if strategy == "summarize":
+            final_text = _summarize_context(final_text, max_chars, org_id=org_id)
+            truncated = len(final_text) >= max_chars
+        else:
+            final_text = final_text[:max_chars]
+            truncated = True
 
     return {
         "final_text": final_text,
