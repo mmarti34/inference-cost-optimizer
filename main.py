@@ -44,6 +44,7 @@ from custom_model_management import router as custom_model_router
 from model_registry_management import router as model_registry_router
 from alert_management import router as alert_management_router
 from secrets_management import router as secrets_management_router
+from context_asset_management import router as context_asset_management_router
 from hitl_management import router as hitl_management_router
 from webhook_management import router as webhook_management_router
 from routers.public_execution import router as public_execution_router
@@ -147,6 +148,7 @@ app.include_router(alert_management_router, prefix="/api")
 app.include_router(secrets_management_router, prefix="/api")
 app.include_router(hitl_management_router, prefix="/api")
 app.include_router(webhook_management_router, prefix="/api")
+app.include_router(context_asset_management_router, prefix="/api")
 
 # Health check endpoint for Railway
 @app.get("/health")
