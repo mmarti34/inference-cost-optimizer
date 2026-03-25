@@ -378,16 +378,32 @@ async def github_scan_repo(body: ScanRepoRequest):
     all_file_paths: set[str] = set()
 
     try:
-        # ── Strategy 1: Code Search API ──────────────────────────────
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        # ── Strategy 1: Code Search API (skip if auth fails) ─────────
+        code_search_failed = False
+        async with httpx.AsyncClient(timeout=10.0) as client:
             for query in _SEARCH_QUERIES:
                 search_url = f"{GITHUB_API_BASE}/search/code"
                 params = {"q": f"{query} repo:{repo}"}
-                resp = await client.get(search_url, headers=headers, params=params)
+                try:
+                    resp = await client.get(search_url, headers=headers, params=params)
+                except httpx.TimeoutException:
+                    logger.warning("Code search timed out for query '%s' in %s", query, repo)
+                    continue
 
+                if resp.status_code == 401:
+                    # Bad token — skip remaining queries, go to tree fallback
+                    logger.warning("GitHub token invalid for code search, skipping to tree scan")
+                    code_search_failed = True
+                    break
                 if resp.status_code == 403:
                     logger.warning("GitHub code search rate limited for repo %s", repo)
-                    continue
+                    code_search_failed = True
+                    break
+                if resp.status_code == 422:
+                    # Repo not indexed — skip to tree fallback
+                    logger.info("Repo %s not indexed for code search (422)", repo)
+                    code_search_failed = True
+                    break
                 if resp.status_code != 200:
                     logger.warning(
                         "GitHub code search returned %s for query '%s' in %s",
