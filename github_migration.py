@@ -375,6 +375,46 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
     return results
 
 
+def _is_url_only_declaration(snippet: str) -> bool:
+    """Return True if the snippet is a simple variable assignment containing a
+    URL string (e.g. ``const url = "https://api.openai.com/..."``), as opposed
+    to a full HTTP call (``axios.post(...)`` or ``fetch(...)``).
+
+    For URL-only declarations we just swap the URL value; for full HTTP calls
+    we replace the entire call block.
+    """
+    # If the snippet contains an actual HTTP-call function, it's not URL-only
+    http_call_indicators = [
+        "fetch(", "axios.", "requests.", "httpx.", "http.",
+        "URLSession", "HttpClient", "urllib",
+        ".post(", ".get(", ".put(", ".patch(", ".delete(",
+    ]
+    for indicator in http_call_indicators:
+        if indicator in snippet:
+            return False
+    return True
+
+
+def _replace_url_in_snippet(snippet: str, new_url: str, workflow_id: str) -> str:
+    """For URL-only declarations, swap just the provider URL with the OptiML
+    endpoint URL and add a migration comment."""
+    # Match the full URL string (including https:// prefix and quotes)
+    url_pattern = re.compile(
+        r"""(['"])https?://(?:api\.openai\.com|api\.anthropic\.com|api\.mistral\.ai|"""
+        r"""api\.cohere\.ai|api\.together\.xyz|api\.groq\.com|"""
+        r"""generativelanguage\.googleapis\.com)[^'"]*\1"""
+    )
+    m = url_pattern.search(snippet)
+    if m:
+        quote = m.group(1)
+        replaced = snippet[:m.start()] + f'{quote}{new_url}{quote}' + snippet[m.end():]
+        # Prepend a comment on the line before
+        comment_char = "//" if any(kw in snippet for kw in ("let ", "var ", "const ")) else "#"
+        return f'{comment_char} Migrated to OptiML — workflow {workflow_id}\n{replaced}'
+    # Fallback: just return with comment
+    return f'// Migrated to OptiML — workflow {workflow_id}\n{snippet}'
+
+
 def _generate_replacement_code(
     original_snippet: str, workflow_id: str, deployment_id: str, language: str,
     endpoint_url: Optional[str] = None,
@@ -385,8 +425,14 @@ def _generate_replacement_code(
     If *endpoint_url* is provided it overrides the default URL construction.
     """
     url = endpoint_url or f"https://optiml.one/api/public/execute/{deployment_id}"
-    api_key_var = "process.env.OPTIML_API_KEY" if endpoint_url else "OPTIML_API_KEY"
 
+    # ── URL-only declarations (e.g. `let baseURL = "https://..."`) ─────
+    # Just swap the URL value so the rest of the code (URLRequest, fetch
+    # config, etc.) keeps working.
+    if _is_url_only_declaration(original_snippet):
+        return _replace_url_in_snippet(original_snippet, url, workflow_id)
+
+    # ── Full HTTP call replacements ────────────────────────────────────
     if language == "python":
         api_key_expr = 'os.environ["OPTIML_API_KEY"]' if endpoint_url else "OPTIML_API_KEY"
         return (
