@@ -82,8 +82,10 @@ class MigratePresignupRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _github_headers(token: str) -> dict:
+    # GitHub App user-to-server tokens work with both "Bearer" and "token" prefix.
+    # Use "token" which is more universally supported across GitHub API versions.
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -322,6 +324,10 @@ async def github_exchange_token(body: ExchangeTokenRequest):
             resp.raise_for_status()
             data = resp.json()
 
+        # Log full response for debugging (redact token)
+        log_data = {k: (v[:8] + "..." if k == "access_token" and v else v) for k, v in data.items()}
+        logger.info("GitHub token exchange response keys: %s, data: %s", list(data.keys()), log_data)
+
         if "error" in data:
             logger.warning("GitHub token exchange error: %s", data.get("error_description", data["error"]))
             return JSONResponse(
@@ -329,7 +335,13 @@ async def github_exchange_token(body: ExchangeTokenRequest):
                 content={"error": data.get("error_description", data["error"])},
             )
 
-        access_token = data["access_token"]
+        access_token = data.get("access_token", "")
+        if not access_token:
+            logger.error("No access_token in GitHub response: %s", list(data.keys()))
+            return JSONResponse(
+                status_code=400,
+                content={"error": "GitHub did not return an access token. Keys received: " + ", ".join(data.keys())},
+            )
 
         # Fetch the authenticated user's username
         async with httpx.AsyncClient(timeout=10.0) as client:
