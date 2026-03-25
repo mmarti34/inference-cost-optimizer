@@ -348,9 +348,29 @@ async def github_exchange_token(body: ExchangeTokenRequest):
         return JSONResponse(status_code=500, content={"error": f"Token exchange failed: {str(e)}"})
 
 
+# File extensions we care about when scanning repos
+_SCANNABLE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".mts",
+}
+
+# Import-like strings that hint a file might contain AI SDK calls
+_IMPORT_HINTS = [
+    "openai", "anthropic", "genai", "generativeai", "mistral",
+    "cohere", "azure", "together", "groq",
+]
+
+
 @router.post("/github/scan-repo")
 async def github_scan_repo(body: ScanRepoRequest):
-    """Scan a GitHub repo for AI SDK call sites."""
+    """Scan a GitHub repo for AI SDK call sites.
+
+    Strategy:
+    1. Try the GitHub Code Search API first (fast but unreliable — repos may
+       not be indexed).
+    2. If code search returns nothing, fall back to the Git Trees API to list
+       all files, filter to scannable extensions, fetch each file, and scan
+       for AI call patterns directly.
+    """
     repo = body.repo_full_name
     token = body.github_token
     headers = _github_headers(token)
@@ -358,8 +378,8 @@ async def github_scan_repo(body: ScanRepoRequest):
     all_file_paths: set[str] = set()
 
     try:
+        # ── Strategy 1: Code Search API ──────────────────────────────
         async with httpx.AsyncClient(timeout=20.0) as client:
-            # Search for files containing AI SDK imports
             for query in _SEARCH_QUERIES:
                 search_url = f"{GITHUB_API_BASE}/search/code"
                 params = {"q": f"{query} repo:{repo}"}
@@ -379,6 +399,38 @@ async def github_scan_repo(body: ScanRepoRequest):
                 for item in items:
                     all_file_paths.add(item["path"])
 
+        # ── Strategy 2: Git Trees API fallback ───────────────────────
+        if not all_file_paths:
+            logger.info("Code search returned 0 results for %s, falling back to tree scan", repo)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Get default branch
+                repo_resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
+                repo_resp.raise_for_status()
+                default_branch = repo_resp.json().get("default_branch", "main")
+
+                # Get recursive tree
+                tree_resp = await client.get(
+                    f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{default_branch}",
+                    headers=headers,
+                    params={"recursive": "1"},
+                )
+                tree_resp.raise_for_status()
+                tree_data = tree_resp.json()
+
+                for item in tree_data.get("tree", []):
+                    if item.get("type") != "blob":
+                        continue
+                    path = item.get("path", "")
+                    # Skip vendor / dependency / build directories
+                    if any(seg in path.split("/") for seg in (
+                        "node_modules", ".next", "dist", "build", "__pycache__",
+                        ".git", "vendor", "venv", ".venv", "env",
+                    )):
+                        continue
+                    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+                    if ext in _SCANNABLE_EXTENSIONS:
+                        all_file_paths.add(path)
+
         if not all_file_paths:
             return {
                 "repo": repo,
@@ -387,8 +439,12 @@ async def github_scan_repo(body: ScanRepoRequest):
                 "total_calls_found": 0,
             }
 
-        # Fetch raw content for each file and extract call sites
+        # ── For tree-scan, pre-filter by fetching file content ───────
+        # If we have many files (tree scan), do a quick check: only fetch
+        # files whose content likely contains AI imports.
+        # For code-search results, fetch everything (already filtered).
         found_calls: list[dict] = []
+        files_scanned = 0
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             for file_path in all_file_paths:
@@ -402,13 +458,20 @@ async def github_scan_repo(body: ScanRepoRequest):
                     continue
 
                 content = resp.text
+                files_scanned += 1
+
+                # Quick pre-filter: skip files that don't mention any AI SDK
+                content_lower = content.lower()
+                if not any(hint in content_lower for hint in _IMPORT_HINTS):
+                    continue
+
                 calls = _find_calls_in_content(file_path, content)
                 found_calls.extend(calls)
 
         return {
             "repo": repo,
             "found_calls": found_calls,
-            "total_files_scanned": len(all_file_paths),
+            "total_files_scanned": files_scanned,
             "total_calls_found": len(found_calls),
         }
 
