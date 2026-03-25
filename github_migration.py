@@ -9,6 +9,8 @@ GitHub repo scanning and PR-based migration endpoints.
 - POST /github/migrate-presignup — Opens a migration PR without auth (pre-signup)
 """
 
+import asyncio
+import base64
 import json
 import logging
 import os
@@ -418,20 +420,37 @@ async def github_scan_repo(body: ScanRepoRequest):
         # ── Strategy 2: Git Trees API fallback ───────────────────────
         if not all_file_paths:
             logger.info("Code search returned 0 results for %s, falling back to tree scan", repo)
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Get default branch
-                repo_resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
-                repo_resp.raise_for_status()
-                default_branch = repo_resp.json().get("default_branch", "main")
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    # Get default branch
+                    repo_resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
+                    if repo_resp.status_code != 200:
+                        logger.warning("Could not fetch repo info for %s: %s", repo, repo_resp.status_code)
+                        return JSONResponse(
+                            status_code=400,
+                            content={"error": f"Could not access repo: HTTP {repo_resp.status_code}. Check the repo URL and your GitHub permissions."},
+                        )
+                    default_branch = repo_resp.json().get("default_branch", "main")
 
-                # Get recursive tree
-                tree_resp = await client.get(
-                    f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{default_branch}",
-                    headers=headers,
-                    params={"recursive": "1"},
+                    # Get recursive tree
+                    tree_resp = await client.get(
+                        f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{default_branch}",
+                        headers=headers,
+                        params={"recursive": "1"},
+                    )
+                    if tree_resp.status_code != 200:
+                        logger.warning("Could not fetch tree for %s: %s", repo, tree_resp.status_code)
+                        return JSONResponse(
+                            status_code=400,
+                            content={"error": f"Could not read repo file tree: HTTP {tree_resp.status_code}"},
+                        )
+                    tree_data = tree_resp.json()
+            except httpx.TimeoutException:
+                logger.warning("Tree scan timed out for %s", repo)
+                return JSONResponse(
+                    status_code=504,
+                    content={"error": "Scan timed out. The repository may be too large."},
                 )
-                tree_resp.raise_for_status()
-                tree_data = tree_resp.json()
 
                 for item in tree_data.get("tree", []):
                     if item.get("type") != "blob":
@@ -460,7 +479,6 @@ async def github_scan_repo(body: ScanRepoRequest):
         logger.info("Scanning %d files in %s (of %d found)", len(file_list), repo, len(all_file_paths))
 
         # ── Fetch files concurrently (batches of 10) ─────────────────
-        import asyncio
 
         found_calls: list[dict] = []
         files_scanned = 0
@@ -643,7 +661,7 @@ async def github_migrate(
                 file_sha = file_data["sha"]
 
                 # Decode content
-                import base64
+
                 raw_content = base64.b64decode(file_data["content"]).decode("utf-8")
 
                 # Apply replacements (process in reverse line order to preserve positions)
