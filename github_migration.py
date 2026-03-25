@@ -1120,44 +1120,34 @@ async def github_migrate(
             file_changes: dict[str, list[tuple[CallToMigrate, str]]] = {}
 
             for call in body.calls_to_migrate:
-                # Detect if this is an HTTP function snippet (sendRequest etc.)
-                # These don't need their own workflow — they share the URL
-                # declaration's workflow.  Just generate replacement code.
-                snippet_stripped = call.code_snippet.strip()
-                is_function_snippet = (
-                    snippet_stripped.startswith("func ")
-                    or snippet_stripped.startswith("function ")
-                    or snippet_stripped.startswith("async function ")
-                    or snippet_stripped.startswith("def ")
-                    or snippet_stripped.startswith("async def ")
-                )
-
-                if is_function_snippet:
-                    # Generate replacement using the last created workflow
-                    language = _detect_language(call.file_path)
-                    last_wf_id = workflow_id if workflows_created > 0 else "migrated"
-                    last_dep_id = deployment_id if workflows_created > 0 else "migrated"
-                    replacement = _generate_replacement_code(
-                        call.code_snippet, last_wf_id, last_dep_id, language,
-                        is_http_function=True,
-                    )
-                    file_changes.setdefault(call.file_path, []).append((call, replacement))
-                    continue
-
                 # 3a. Parse the snippet using the existing parse logic
                 try:
                     parse_resp = await _run_parse_import(call.code_snippet)
                     parse_body = json.loads(parse_resp.body.decode())
                 except Exception as e:
                     logger.warning("Parse failed for %s:%s — %s", call.file_path, call.line_number, e)
-                    parse_body = {"error": str(e)}
+                    # Fallback: use defaults so we still create a workflow
+                    parse_body = {
+                        "provider": "openai",
+                        "model": _extract_model_from_snippet(call.code_snippet) or "gpt-4o",
+                        "system_prompt": "",
+                        "suggestedName": f"migrated-call-{workflows_created + 1}",
+                        "api_type": "chat",
+                    }
 
                 if "error" in parse_body:
                     logger.warning(
-                        "Skipping call at %s:%s — parse error: %s",
+                        "Parse error for %s:%s — %s, using defaults",
                         call.file_path, call.line_number, parse_body["error"],
                     )
-                    continue
+                    # Use defaults instead of skipping — still create a workflow
+                    parse_body = {
+                        "provider": "openai",
+                        "model": _extract_model_from_snippet(call.code_snippet) or "gpt-4o",
+                        "system_prompt": "",
+                        "suggestedName": f"migrated-call-{workflows_created + 1}",
+                        "api_type": "chat",
+                    }
 
                 suggested_name = parse_body.get("suggestedName", f"migrated-call-{workflows_created + 1}")
                 api_type = parse_body.get("api_type", "chat")
