@@ -415,130 +415,113 @@ def _generate_replacement_code(
     original_snippet: str, workflow_id: str, deployment_id: str, language: str,
     endpoint_url: Optional[str] = None,
 ) -> str:
-    """Generate code that replaces the original AI provider call with an
-    OptiML integration.
+    """Generate code that replaces the original AI provider call with a
+    proper OptiML integration.
 
-    Strategy:
-    - URL-only declarations (``let baseURL = "..."``): swap the URL and
-      API key so downstream code (URLRequest, fetch config) keeps working.
-    - Full HTTP calls: replace with a complete OptiML call using the
-      OpenAI-compatible ``/v1/chat/completions`` endpoint.  This returns
-      the same response shape as OpenAI so ``response.choices[0]...``
-      patterns keep working.
+    The generated code sends just the dynamic user input to the OptiML
+    managed endpoint.  The model, system prompt, temperature, and all
+    other AI parameters are configured in the OptiML workflow — NOT in
+    the code.  This is the core value prop: prompts and model config
+    become manageable, versionable, and A/B-testable without code
+    deploys.
 
-    The endpoint_url for the OpenAI-compat route is always
-    ``https://api.optiml.one/v1/chat/completions`` with the endpoint slug
-    passed as the ``model`` field.
+    For URL-only declarations (``let baseURL = "..."``), we swap the URL
+    to the OptiML public endpoint so the rest of the code keeps working.
+
+    For full HTTP calls (axios, fetch, requests, etc.), we replace with
+    a clean OptiML integration using ``input_text``.
     """
-    # The OptiML OpenAI-compatible endpoint
-    optiml_base = "https://api.optiml.one/v1/chat/completions"
-    # Extract the endpoint slug from the endpoint_url if provided
-    endpoint_slug = deployment_id
-    if endpoint_url:
-        # endpoint_url looks like https://api.optiml.one/api/public/{org}/{slug}
-        endpoint_slug = endpoint_url.rstrip("/").rsplit("/", 1)[-1]
+    url = endpoint_url or f"https://api.optiml.one/api/public/execute/{deployment_id}"
 
     # ── URL-only declarations ──────────────────────────────────────────
     if _is_url_only_declaration(original_snippet):
-        return _replace_url_in_snippet(original_snippet, optiml_base, workflow_id)
+        return _replace_url_in_snippet(original_snippet, url, workflow_id)
 
     # ── Full HTTP call replacements ────────────────────────────────────
-    # Use the same HTTP library the original code uses, pointed at the
-    # OpenAI-compatible endpoint.  The response format matches OpenAI's
-    # (choices[0].message.content) so downstream code keeps working.
+    # Replace with a clean OptiML call.  The AI config (model, prompt,
+    # temperature) lives in the workflow — code just sends user input.
 
     if language == "python":
-        # Detect which library the original code uses
         if "requests." in original_snippet:
             return (
                 f'# Migrated to OptiML — workflow {workflow_id}\n'
-                f'# Docs: https://optiml.one/docs\n'
+                f'# Model, prompt template & parameters are managed in OptiML\n'
+                f'# Edit at: https://optiml.one/studio\n'
                 f'response = requests.post(\n'
-                f'    "{optiml_base}",\n'
-                f'    json={{\n'
-                f'        "model": "{endpoint_slug}",\n'
-                f'        "messages": messages,\n'
-                f'    }},\n'
+                f'    "{url}",\n'
+                f'    json={{"input_text": prompt}},\n'
                 f'    headers={{\n'
                 f'        "Authorization": f"Bearer {{os.environ[\'OPTIML_API_KEY\']}}",\n'
                 f'        "Content-Type": "application/json",\n'
                 f'    }},\n'
                 f'    timeout=30,\n'
-                f')'
+                f')\n'
+                f'result = response.json()["final_output"]'
             )
         else:
-            # Default to httpx (async)
             return (
                 f'# Migrated to OptiML — workflow {workflow_id}\n'
-                f'# Docs: https://optiml.one/docs\n'
+                f'# Model, prompt template & parameters are managed in OptiML\n'
+                f'# Edit at: https://optiml.one/studio\n'
                 f'response = await client.post(\n'
-                f'    "{optiml_base}",\n'
-                f'    json={{\n'
-                f'        "model": "{endpoint_slug}",\n'
-                f'        "messages": messages,\n'
-                f'    }},\n'
+                f'    "{url}",\n'
+                f'    json={{"input_text": prompt}},\n'
                 f'    headers={{\n'
                 f'        "Authorization": f"Bearer {{os.environ[\'OPTIML_API_KEY\']}}",\n'
                 f'        "Content-Type": "application/json",\n'
                 f'    }},\n'
-                f')'
+                f')\n'
+                f'result = response.json()["final_output"]'
             )
 
     elif language == "swift":
         return (
             f'// Migrated to OptiML — workflow {workflow_id}\n'
-            f'// Docs: https://optiml.one/docs\n'
-            f'let optimlURL = URL(string: "{optiml_base}")!\n'
+            f'// Model, prompt template & parameters are managed in OptiML\n'
+            f'// Edit at: https://optiml.one/studio\n'
+            f'let optimlURL = URL(string: "{url}")!\n'
             f'var optimlRequest = URLRequest(url: optimlURL)\n'
             f'optimlRequest.httpMethod = "POST"\n'
             f'optimlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")\n'
             f'optimlRequest.setValue("Bearer \\(ProcessInfo.processInfo.environment["OPTIML_API_KEY"] ?? "")", forHTTPHeaderField: "Authorization")\n'
-            f'let optimlBody: [String: Any] = [\n'
-            f'    "model": "{endpoint_slug}",\n'
-            f'    "messages": [["role": "user", "content": prompt]]\n'
-            f']\n'
-            f'optimlRequest.httpBody = try JSONSerialization.data(withJSONObject: optimlBody)\n'
+            f'optimlRequest.httpBody = try JSONSerialization.data(withJSONObject: ["input_text": prompt])\n'
             f'let (optimlData, _) = try await URLSession.shared.data(for: optimlRequest)\n'
-            f'let optimlResult = try JSONDecoder().decode(OpenAIResponse.self, from: optimlData)'
+            f'let optimlJSON = try JSONSerialization.jsonObject(with: optimlData) as? [String: Any]\n'
+            f'let finalOutput = optimlJSON?["final_output"] as? String ?? ""'
         )
 
     else:
-        # JS/TS — detect axios vs fetch
         if "axios" in original_snippet:
             return (
                 f'// Migrated to OptiML — workflow {workflow_id}\n'
-                f'// Docs: https://optiml.one/docs\n'
+                f'// Model, prompt template & parameters are managed in OptiML\n'
+                f'// Edit at: https://optiml.one/studio\n'
                 f'const response = await axios.post(\n'
-                f'  "{optiml_base}",\n'
-                f'  {{\n'
-                f'    model: "{endpoint_slug}",\n'
-                f'    messages,\n'
-                f'  }},\n'
+                f'  "{url}",\n'
+                f'  {{ input_text: prompt }},\n'
                 f'  {{\n'
                 f'    headers: {{\n'
                 f'      Authorization: `Bearer ${{process.env.OPTIML_API_KEY}}`,\n'
                 f'      "Content-Type": "application/json",\n'
                 f'    }},\n'
                 f'  }}\n'
-                f');'
+                f');\n'
+                f'const result = response.data.final_output;'
             )
         else:
-            # Default to fetch
             return (
                 f'// Migrated to OptiML — workflow {workflow_id}\n'
-                f'// Docs: https://optiml.one/docs\n'
-                f'const response = await fetch("{optiml_base}", {{\n'
+                f'// Model, prompt template & parameters are managed in OptiML\n'
+                f'// Edit at: https://optiml.one/studio\n'
+                f'const response = await fetch("{url}", {{\n'
                 f'  method: "POST",\n'
                 f'  headers: {{\n'
                 f'    "Content-Type": "application/json",\n'
                 f'    Authorization: `Bearer ${{process.env.OPTIML_API_KEY}}`,\n'
                 f'  }},\n'
-                f'  body: JSON.stringify({{\n'
-                f'    model: "{endpoint_slug}",\n'
-                f'    messages,\n'
-                f'  }}),\n'
+                f'  body: JSON.stringify({{ input_text: prompt }}),\n'
                 f'}});\n'
-                f'const result = await response.json();'
+                f'const {{ final_output }} = await response.json();'
             )
 
 
