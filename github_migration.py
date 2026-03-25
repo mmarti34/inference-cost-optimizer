@@ -320,6 +320,30 @@ def _find_enclosing_statement(content: str, match_start: int) -> tuple[int, int]
     return start, i
 
 
+def _fix_downstream_references(content: str) -> str:
+    """Fix downstream code that still references OpenAI-style response shapes
+    after the call site has been migrated to OptiML.
+
+    Common patterns replaced:
+    - ``response.data.choices[0].message.content`` → ``response.data.final_output``
+    - ``response.choices[0].message.content`` → ``response.final_output``
+    - ``json["choices"][0]["message"]["content"]`` → ``json["final_output"]``
+    """
+    replacements = [
+        # JS axios: response.data.choices[0].message.content
+        (re.compile(r'(\w+)\.data\.choices\[0\]\.message\.content'), r'\1.data.final_output'),
+        # JS fetch / generic: var.choices[0].message.content
+        (re.compile(r'(\w+)\.choices\[0\]\.message\.content'), r'\1.final_output'),
+        # Python/Swift dict: ["choices"][0]["message"]["content"]
+        (re.compile(r'\["choices"\]\[0\]\["message"\]\["content"\]'), '["final_output"]'),
+        # Swift optional chain: .choices.first?.message.content
+        (re.compile(r'\.choices\.first\?\.message\.content'), '.final_output'),
+    ]
+    for pattern, repl in replacements:
+        content = pattern.sub(repl, content)
+    return content
+
+
 def _extract_url_var_name(snippet: str) -> Optional[str]:
     """Extract the variable name from a URL-only declaration.
     e.g. ``let baseURL = "https://..."`` → ``baseURL``
@@ -1096,9 +1120,37 @@ async def github_migrate(
             file_changes: dict[str, list[tuple[CallToMigrate, str]]] = {}
 
             for call in body.calls_to_migrate:
+                # Detect if this is an HTTP function snippet (sendRequest etc.)
+                # These don't need their own workflow — they share the URL
+                # declaration's workflow.  Just generate replacement code.
+                snippet_stripped = call.code_snippet.strip()
+                is_function_snippet = (
+                    snippet_stripped.startswith("func ")
+                    or snippet_stripped.startswith("function ")
+                    or snippet_stripped.startswith("async function ")
+                    or snippet_stripped.startswith("def ")
+                    or snippet_stripped.startswith("async def ")
+                )
+
+                if is_function_snippet:
+                    # Generate replacement using the last created workflow
+                    language = _detect_language(call.file_path)
+                    last_wf_id = workflow_id if workflows_created > 0 else "migrated"
+                    last_dep_id = deployment_id if workflows_created > 0 else "migrated"
+                    replacement = _generate_replacement_code(
+                        call.code_snippet, last_wf_id, last_dep_id, language,
+                        is_http_function=True,
+                    )
+                    file_changes.setdefault(call.file_path, []).append((call, replacement))
+                    continue
+
                 # 3a. Parse the snippet using the existing parse logic
-                parse_resp = await _run_parse_import(call.code_snippet)
-                parse_body = json.loads(parse_resp.body.decode())
+                try:
+                    parse_resp = await _run_parse_import(call.code_snippet)
+                    parse_body = json.loads(parse_resp.body.decode())
+                except Exception as e:
+                    logger.warning("Parse failed for %s:%s — %s", call.file_path, call.line_number, e)
+                    parse_body = {"error": str(e)}
 
                 if "error" in parse_body:
                     logger.warning(
@@ -1187,6 +1239,9 @@ async def github_migrate(
                 modified_content = raw_content
                 for call, replacement in sorted(changes, key=lambda c: c[0].line_number, reverse=True):
                     modified_content = _apply_replacement(modified_content, call.code_snippet, replacement)
+
+                # Fix downstream references (e.g. choices[0].message.content → final_output)
+                modified_content = _fix_downstream_references(modified_content)
 
                 # Push updated file
                 encoded = base64.b64encode(modified_content.encode("utf-8")).decode("utf-8")
