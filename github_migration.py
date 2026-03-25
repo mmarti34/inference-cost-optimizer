@@ -74,15 +74,36 @@ def _github_headers(token: str) -> dict:
 
 # Patterns to detect AI SDK call sites
 _CALL_PATTERNS = [
-    # Python OpenAI
+    # OpenAI (Python + JS/TS)
     (re.compile(r"client\.chat\.completions\.create\s*\("), "openai"),
     (re.compile(r"openai\.ChatCompletion\.create\s*\("), "openai"),
     (re.compile(r"openai\.chat\.completions\.create\s*\("), "openai"),
-    # Python / JS Anthropic
+    (re.compile(r"\.chat\.completions\.create\s*\("), "openai"),
+    # Anthropic (Python + JS/TS)
     (re.compile(r"anthropic\.messages\.create\s*\("), "anthropic"),
     (re.compile(r"client\.messages\.create\s*\("), "anthropic"),
-    # JS/TS OpenAI
-    (re.compile(r"openai\.chat\.completions\.create\s*\("), "openai"),
+    (re.compile(r"\.messages\.create\s*\("), "anthropic"),
+    # Google Gemini
+    (re.compile(r"genai\.GenerativeModel\s*\("), "gemini"),
+    (re.compile(r"model\.generate_content\s*\("), "gemini"),
+    (re.compile(r"\.generate_content\s*\("), "gemini"),
+    (re.compile(r"generativeai\.GenerativeModel\s*\("), "gemini"),
+    # Mistral
+    (re.compile(r"mistral\.chat\.complete\s*\("), "mistral"),
+    (re.compile(r"client\.chat\.complete\s*\("), "mistral"),
+    (re.compile(r"MistralClient\s*\("), "mistral"),
+    (re.compile(r"\.chat\.complete\s*\("), "mistral"),
+    # Cohere
+    (re.compile(r"cohere\.chat\s*\("), "cohere"),
+    (re.compile(r"co\.chat\s*\("), "cohere"),
+    (re.compile(r"client\.chat\s*\("), "cohere"),
+    (re.compile(r"CohereClient\s*\("), "cohere"),
+    # Azure OpenAI
+    (re.compile(r"AzureOpenAI\s*\("), "azure_openai"),
+    (re.compile(r"azure_openai\.chat\.completions\.create\s*\("), "azure_openai"),
+    # Together AI / Groq / OpenRouter (OpenAI-compatible)
+    (re.compile(r"Together\s*\("), "together"),
+    (re.compile(r"Groq\s*\("), "groq"),
 ]
 
 # Search queries for the GitHub code search API
@@ -93,6 +114,14 @@ _SEARCH_QUERIES = [
     "import Anthropic",
     "@anthropic-ai/sdk",
     "google.generativeai",
+    "google-genai",
+    "mistralai",
+    "MistralClient",
+    "cohere",
+    "CohereClient",
+    "AzureOpenAI",
+    "together",
+    "groq",
 ]
 
 
