@@ -422,10 +422,21 @@ async def github_scan_repo(body: ScanRepoRequest):
             logger.info("Code search returned 0 results for %s, falling back to tree scan", repo)
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
+                    # Verify token works first
+                    user_resp = await client.get(f"{GITHUB_API_BASE}/user", headers=headers)
+                    logger.info("Token check for %s: user endpoint returned %s", repo, user_resp.status_code)
+                    if user_resp.status_code == 401:
+                        return JSONResponse(
+                            status_code=401,
+                            content={"error": "GitHub token is invalid or expired. Please re-authenticate with GitHub."},
+                        )
+
                     # Get default branch
                     repo_resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
+                    logger.info("Repo info for %s: status=%s", repo, repo_resp.status_code)
                     if repo_resp.status_code != 200:
-                        logger.warning("Could not fetch repo info for %s: %s", repo, repo_resp.status_code)
+                        resp_text = repo_resp.text[:200]
+                        logger.warning("Could not fetch repo info for %s: %s — %s", repo, repo_resp.status_code, resp_text)
                         return JSONResponse(
                             status_code=400,
                             content={"error": f"Could not access repo: HTTP {repo_resp.status_code}. Check the repo URL and your GitHub permissions."},
