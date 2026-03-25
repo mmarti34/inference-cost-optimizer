@@ -232,17 +232,27 @@ def _extract_model_from_snippet(snippet: str) -> Optional[str]:
 def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
     """Scan file content for AI SDK call sites and return structured results."""
     results: list[dict] = []
+    seen_lines: set[int] = set()  # deduplicate by line number
     language = _detect_language(file_path)
 
     for pattern, provider in _CALL_PATTERNS:
         for match in pattern.finditer(content):
-            # Find the opening paren
-            paren_pos = content.index("(", match.start())
-            snippet = _extract_call_block(content, paren_pos)
-            # Include the method call prefix
-            full_snippet = content[match.start() : match.start() + len(match.group()) + len(snippet)]
-
             line_number = content[: match.start()].count("\n") + 1
+            if line_number in seen_lines:
+                continue
+            seen_lines.add(line_number)
+
+            # Find the opening paren
+            paren_pos = content.find("(", match.start())
+            if paren_pos == -1:
+                # URL-only match with no paren — use surrounding context
+                start = max(0, match.start() - 20)
+                end = min(len(content), match.end() + 200)
+                full_snippet = content[start:end]
+            else:
+                snippet = _extract_call_block(content, paren_pos)
+                full_snippet = content[match.start() : match.start() + len(match.group()) + len(snippet)]
+
             model = _extract_model_from_snippet(full_snippet)
 
             results.append({
