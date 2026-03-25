@@ -475,19 +475,19 @@ async def github_scan_repo(body: ScanRepoRequest):
                     content={"error": "Scan timed out. The repository may be too large."},
                 )
 
-                for item in tree_data.get("tree", []):
-                    if item.get("type") != "blob":
-                        continue
-                    path = item.get("path", "")
-                    # Skip vendor / dependency / build directories
-                    if any(seg in path.split("/") for seg in (
-                        "node_modules", ".next", "dist", "build", "__pycache__",
-                        ".git", "vendor", "venv", ".venv", "env",
-                    )):
-                        continue
-                    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
-                    if ext in _SCANNABLE_EXTENSIONS:
-                        all_file_paths.add(path)
+            for item in tree_data.get("tree", []):
+                if item.get("type") != "blob":
+                    continue
+                path = item.get("path", "")
+                # Skip vendor / dependency / build directories
+                if any(seg in path.split("/") for seg in (
+                    "node_modules", ".next", "dist", "build", "__pycache__",
+                    ".git", "vendor", "venv", ".venv", "env",
+                )):
+                    continue
+                ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+                if ext in _SCANNABLE_EXTENSIONS:
+                    all_file_paths.add(path)
 
         if not all_file_paths:
             return {
