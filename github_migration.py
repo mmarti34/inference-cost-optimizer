@@ -229,29 +229,136 @@ def _extract_model_from_snippet(snippet: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _apply_replacement(content: str, old_snippet: str, replacement: str) -> str:
+    """Replace *old_snippet* with *replacement* in *content*, preserving the
+    indentation of the original code."""
+    pos = content.find(old_snippet)
+    if pos == -1:
+        return content
+
+    # Detect indentation: walk back from pos to find the leading whitespace
+    line_start = content.rfind("\n", 0, pos)
+    line_start = line_start + 1 if line_start != -1 else 0
+    indent = ""
+    for ch in content[line_start:pos]:
+        if ch in (" ", "\t"):
+            indent += ch
+        else:
+            break
+
+    # Indent each line of the replacement to match
+    replacement_lines = replacement.split("\n")
+    indented = replacement_lines[0]  # first line inherits position
+    for line in replacement_lines[1:]:
+        indented += "\n" + (indent + line if line.strip() else line)
+
+    return content[:pos] + indented + content[pos + len(old_snippet):]
+
+
+def _find_enclosing_statement(content: str, match_start: int) -> tuple[int, int]:
+    """Find the full statement/expression that encloses a match position.
+
+    Walks backward to find the statement start, counting any open brackets
+    we pass through so the forward scan knows the correct nesting depth.
+    Then walks forward to the end of the statement.  Returns (start, end)
+    indices into *content*.
+    """
+    # Walk backward to find statement start, tracking brackets we cross
+    # so we know how deep we are when we start scanning forward.
+    start = match_start
+    enclosing_depth = 0
+    while start > 0:
+        prev = content[start - 1]
+        if prev in ("\n", ";"):
+            break
+        if prev in (")", "]", "}"):
+            enclosing_depth += 1
+        elif prev in ("(", "[", "{"):
+            if enclosing_depth > 0:
+                enclosing_depth -= 1
+            else:
+                # This open bracket is part of the enclosing statement
+                start -= 1
+                enclosing_depth += 1  # count it for forward scan
+                # Keep going back to find the function call name (e.g. axios.post)
+                while start > 0 and content[start - 1] not in ("\n", ";", "{"):
+                    start -= 1
+                break
+        start -= 1
+
+    # Skip leading newlines
+    while start < match_start and content[start] == "\n":
+        start += 1
+
+    # Count actual bracket depth from start to match_start
+    depth = 0
+    for ch in content[start:match_start]:
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth -= 1
+
+    # Walk forward from match_start to find statement end
+    i = match_start
+    while i < len(content):
+        ch = content[i]
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth -= 1
+            if depth < 0:
+                break
+        elif ch == ";" and depth <= 0:
+            i += 1  # include the semicolon
+            break
+        elif ch == "\n" and depth <= 0:
+            rest = content[i + 1:i + 40].lstrip()
+            if not rest or rest[0] not in (".", ",", ")", "]", "}"):
+                break
+        i += 1
+
+    return start, i
+
+
 def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
     """Scan file content for AI SDK call sites and return structured results."""
     results: list[dict] = []
     seen_lines: set[int] = set()  # deduplicate by line number
     language = _detect_language(file_path)
 
+    # URL-based patterns need special handling — flag them
+    _URL_PATTERNS = {
+        "api.openai.com", "api.anthropic.com", "api.mistral.ai",
+        "api.cohere.ai", "api.together.xyz", "api.groq.com",
+        "generativelanguage.googleapis.com",
+    }
+
     for pattern, provider in _CALL_PATTERNS:
+        is_url_pattern = any(url in pattern.pattern for url in _URL_PATTERNS)
+
         for match in pattern.finditer(content):
             line_number = content[: match.start()].count("\n") + 1
             if line_number in seen_lines:
                 continue
             seen_lines.add(line_number)
 
-            # Find the opening paren
-            paren_pos = content.find("(", match.start())
-            if paren_pos == -1:
-                # URL-only match with no paren — use surrounding context
-                start = max(0, match.start() - 20)
-                end = min(len(content), match.end() + 200)
-                full_snippet = content[start:end]
+            if is_url_pattern:
+                # For URL-based matches, capture the entire enclosing
+                # statement/call (e.g. the full axios.post(...) or the
+                # let baseURL = "..." line) so the replacement replaces
+                # the complete call site, not just the URL fragment.
+                stmt_start, stmt_end = _find_enclosing_statement(content, match.start())
+                full_snippet = content[stmt_start:stmt_end]
             else:
-                snippet = _extract_call_block(content, paren_pos)
-                full_snippet = content[match.start() : match.start() + len(match.group()) + len(snippet)]
+                # SDK-style match — capture from method name through closing paren
+                paren_pos = content.find("(", match.start())
+                if paren_pos == -1:
+                    start = max(0, match.start() - 20)
+                    end = min(len(content), match.end() + 200)
+                    full_snippet = content[start:end]
+                else:
+                    snippet = _extract_call_block(content, paren_pos)
+                    full_snippet = content[match.start() : match.start() + len(match.group()) + len(snippet)]
 
             model = _extract_model_from_snippet(full_snippet)
 
@@ -749,7 +856,7 @@ async def github_migrate(
                 # Apply replacements (process in reverse line order to preserve positions)
                 modified_content = raw_content
                 for call, replacement in sorted(changes, key=lambda c: c[0].line_number, reverse=True):
-                    modified_content = modified_content.replace(call.code_snippet, replacement)
+                    modified_content = _apply_replacement(modified_content, call.code_snippet, replacement)
 
                 # Push updated file
                 encoded = base64.b64encode(modified_content.encode("utf-8")).decode("utf-8")
@@ -892,7 +999,7 @@ async def github_migrate_presignup(body: MigratePresignupRequest):
 
                 modified_content = raw_content
                 for call, replacement in sorted(changes, key=lambda c: c[0].line_number, reverse=True):
-                    modified_content = modified_content.replace(call.code_snippet, replacement)
+                    modified_content = _apply_replacement(modified_content, call.code_snippet, replacement)
 
                 encoded = base64.b64encode(modified_content.encode("utf-8")).decode("utf-8")
                 update_resp = await client.put(
