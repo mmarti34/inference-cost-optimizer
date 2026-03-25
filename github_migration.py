@@ -320,6 +320,60 @@ def _find_enclosing_statement(content: str, match_start: int) -> tuple[int, int]
     return start, i
 
 
+def _extract_url_var_name(snippet: str) -> Optional[str]:
+    """Extract the variable name from a URL-only declaration.
+    e.g. ``let baseURL = "https://..."`` → ``baseURL``
+    """
+    m = re.search(
+        r"""(?:let|var|const|final)\s+(\w+)\s*[:=]\s*['"]https?://""",
+        snippet,
+    )
+    return m.group(1) if m else None
+
+
+def _find_function_using_var(content: str, var_name: str) -> Optional[tuple[int, int, str]]:
+    """Find the function body that uses *var_name* to make an HTTP call.
+
+    Returns (start, end, function_text) or None.
+    Looks for function/method definitions that reference the variable AND
+    contain HTTP call indicators (URLSession, httpBody, httpMethod, fetch,
+    requests, etc.).
+    """
+    # Match function definitions (Swift, JS/TS, Python)
+    func_pattern = re.compile(
+        r'(?:func\s+\w+|(?:async\s+)?function\s+\w+|def\s+\w+|'
+        r'(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?\()'
+        r'[^{]*\{'
+    )
+    http_indicators = [
+        "httpMethod", "httpBody", "URLSession", ".dataTask",
+        "fetch(", ".post(", ".get(", "requests.", "httpx.",
+        "axios.", "HttpClient",
+    ]
+
+    for m in func_pattern.finditer(content):
+        # Find the matching closing brace for this function
+        brace_start = content.index("{", m.start())
+        depth = 0
+        i = brace_start
+        while i < len(content):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        func_body = content[m.start():i + 1]
+
+        # Check if this function uses our URL variable AND makes HTTP calls
+        if var_name in func_body and any(ind in func_body for ind in http_indicators):
+            line_number = content[:m.start()].count("\n") + 1
+            return (m.start(), i + 1, func_body)
+
+    return None
+
+
 def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
     """Scan file content for AI SDK call sites and return structured results."""
     results: list[dict] = []
@@ -334,6 +388,8 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
         r"generativelanguage\.googleapis\.com",
     }
 
+    url_only_vars: list[str] = []  # track URL variable names for second pass
+
     for pattern, provider in _CALL_PATTERNS:
         is_url_pattern = any(url in pattern.pattern for url in _URL_PATTERNS)
 
@@ -344,14 +400,15 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
             seen_lines.add(line_number)
 
             if is_url_pattern:
-                # For URL-based matches, capture the entire enclosing
-                # statement/call (e.g. the full axios.post(...) or the
-                # let baseURL = "..." line) so the replacement replaces
-                # the complete call site, not just the URL fragment.
                 stmt_start, stmt_end = _find_enclosing_statement(content, match.start())
                 full_snippet = content[stmt_start:stmt_end]
+
+                # Track URL-only declarations for second pass
+                if _is_url_only_declaration(full_snippet):
+                    var_name = _extract_url_var_name(full_snippet)
+                    if var_name:
+                        url_only_vars.append(var_name)
             else:
-                # SDK-style match — capture from method name through closing paren
                 paren_pos = content.find("(", match.start())
                 if paren_pos == -1:
                     start = max(0, match.start() - 20)
@@ -371,6 +428,29 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
                 "detected_provider": provider,
                 "detected_model": model,
             })
+
+    # ── Second pass: find HTTP functions that use detected URL variables ──
+    # When we detect a URL-only declaration like `let baseURL = "..."`, the
+    # actual HTTP call (sendRequest, etc.) uses baseURL by name and won't
+    # match URL patterns.  Find those functions and add them as call sites
+    # so the migration replaces the full HTTP function, not just the URL.
+    for var_name in url_only_vars:
+        func_result = _find_function_using_var(content, var_name)
+        if func_result:
+            func_start, func_end, func_text = func_result
+            func_line = content[:func_start].count("\n") + 1
+            if func_line not in seen_lines:
+                seen_lines.add(func_line)
+                model = _extract_model_from_snippet(func_text)
+                results.append({
+                    "file_path": file_path,
+                    "line_number": func_line,
+                    "language": language,
+                    "code_snippet": func_text,
+                    "detected_provider": results[0]["detected_provider"] if results else "openai",
+                    "detected_model": model or (results[0]["detected_model"] if results else None),
+                    "_is_http_function": True,  # flag for replacement generation
+                })
 
     return results
 
@@ -411,9 +491,153 @@ def _replace_url_in_snippet(snippet: str, new_url: str, workflow_id: str) -> str
     return f'// Migrated to OptiML — workflow {workflow_id}\n{snippet}'
 
 
+def _generate_http_function_replacement(
+    original_snippet: str, workflow_id: str, url: str, language: str,
+) -> str:
+    """Generate a replacement for an entire HTTP function (like sendRequest).
+
+    Extracts the function signature (name, params, return type) from the
+    original and generates a clean OptiML version that:
+    - Sends ``input_text`` to the OptiML endpoint
+    - Reads ``final_output`` from the response
+    - Preserves the function's public interface (name, params, completion handler)
+    """
+    if language == "swift":
+        # Extract function name and signature
+        sig_match = re.search(
+            r'func\s+(\w+)\s*\(([^)]*)\)\s*(.*?)\{',
+            original_snippet,
+            re.DOTALL,
+        )
+        if sig_match:
+            func_name = sig_match.group(1)
+            params = sig_match.group(2).strip()
+            rest = sig_match.group(3).strip()
+            # Detect if it uses completion handler or async
+            is_async = "async" in rest
+            has_completion = "completion" in params or "@escaping" in params
+
+            if has_completion:
+                return (
+                    f'// Migrated to OptiML — workflow {workflow_id}\n'
+                    f'// Model, prompt template & parameters are managed in OptiML\n'
+                    f'// Edit at: https://optiml.one/studio\n'
+                    f'func {func_name}({params}) {rest}{{\n'
+                    f'    guard let url = URL(string: "{url}") else {{\n'
+                    f'        completion(.failure(OpenAIError.invalidURL))\n'
+                    f'        return\n'
+                    f'    }}\n'
+                    f'\n'
+                    f'    var request = URLRequest(url: url)\n'
+                    f'    request.httpMethod = "POST"\n'
+                    f'    request.setValue("application/json", forHTTPHeaderField: "Content-Type")\n'
+                    f'    request.setValue("Bearer \\(ProcessInfo.processInfo.environment["OPTIML_API_KEY"] ?? "")", forHTTPHeaderField: "Authorization")\n'
+                    f'\n'
+                    f'    do {{\n'
+                    f'        request.httpBody = try JSONSerialization.data(withJSONObject: ["input_text": prompt])\n'
+                    f'    }} catch {{\n'
+                    f'        completion(.failure(error))\n'
+                    f'        return\n'
+                    f'    }}\n'
+                    f'\n'
+                    f'    URLSession.shared.dataTask(with: request) {{ data, response, error in\n'
+                    f'        if let error = error {{\n'
+                    f'            completion(.failure(OpenAIError.networkError(error)))\n'
+                    f'            return\n'
+                    f'        }}\n'
+                    f'        guard let data = data else {{\n'
+                    f'            completion(.failure(OpenAIError.invalidResponse))\n'
+                    f'            return\n'
+                    f'        }}\n'
+                    f'        do {{\n'
+                    f'            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],\n'
+                    f'               let output = json["final_output"] as? String {{\n'
+                    f'                completion(.success(output))\n'
+                    f'            }} else {{\n'
+                    f'                completion(.failure(OpenAIError.invalidResponse))\n'
+                    f'            }}\n'
+                    f'        }} catch {{\n'
+                    f'            completion(.failure(OpenAIError.decodingError(error)))\n'
+                    f'        }}\n'
+                    f'    }}.resume()\n'
+                    f'}}'
+                )
+
+        # Fallback: generic Swift function replacement
+        return (
+            f'// Migrated to OptiML — workflow {workflow_id}\n'
+            f'// Model, prompt template & parameters are managed in OptiML\n'
+            f'// Edit at: https://optiml.one/studio\n'
+            f'// TODO: Update this function to call OptiML at:\n'
+            f'//   {url}\n'
+            f'// Send: {{"input_text": "<user input>"}}\n'
+            f'// Read: response["final_output"]\n'
+            + original_snippet
+        )
+
+    elif language == "python":
+        # Extract function name
+        func_match = re.search(r'(?:async\s+)?def\s+(\w+)', original_snippet)
+        func_name = func_match.group(1) if func_match else "send_request"
+        is_async = "async " in original_snippet
+
+        if is_async:
+            return (
+                f'# Migrated to OptiML — workflow {workflow_id}\n'
+                f'# Model, prompt template & parameters are managed in OptiML\n'
+                f'# Edit at: https://optiml.one/studio\n'
+                f'async def {func_name}(prompt: str) -> str:\n'
+                f'    async with httpx.AsyncClient(timeout=30.0) as client:\n'
+                f'        response = await client.post(\n'
+                f'            "{url}",\n'
+                f'            json={{"input_text": prompt}},\n'
+                f'            headers={{"Authorization": f"Bearer {{os.environ[\'OPTIML_API_KEY\']}}"}},\n'
+                f'        )\n'
+                f'        return response.json()["final_output"]'
+            )
+        else:
+            return (
+                f'# Migrated to OptiML — workflow {workflow_id}\n'
+                f'# Model, prompt template & parameters are managed in OptiML\n'
+                f'# Edit at: https://optiml.one/studio\n'
+                f'def {func_name}(prompt: str) -> str:\n'
+                f'    response = requests.post(\n'
+                f'        "{url}",\n'
+                f'        json={{"input_text": prompt}},\n'
+                f'        headers={{"Authorization": f"Bearer {{os.environ[\'OPTIML_API_KEY\']}}"}},\n'
+                f'        timeout=30,\n'
+                f'    )\n'
+                f'    return response.json()["final_output"]'
+            )
+
+    else:
+        # JS/TS function replacement
+        func_match = re.search(r'(?:async\s+)?function\s+(\w+)', original_snippet)
+        func_name = func_match.group(1) if func_match else "sendRequest"
+
+        return (
+            f'// Migrated to OptiML — workflow {workflow_id}\n'
+            f'// Model, prompt template & parameters are managed in OptiML\n'
+            f'// Edit at: https://optiml.one/studio\n'
+            f'async function {func_name}(prompt) {{\n'
+            f'  const response = await fetch("{url}", {{\n'
+            f'    method: "POST",\n'
+            f'    headers: {{\n'
+            f'      "Content-Type": "application/json",\n'
+            f'      Authorization: `Bearer ${{process.env.OPTIML_API_KEY}}`,\n'
+            f'    }},\n'
+            f'    body: JSON.stringify({{ input_text: prompt }}),\n'
+            f'  }});\n'
+            f'  const {{ final_output }} = await response.json();\n'
+            f'  return final_output;\n'
+            f'}}'
+        )
+
+
 def _generate_replacement_code(
     original_snippet: str, workflow_id: str, deployment_id: str, language: str,
     endpoint_url: Optional[str] = None,
+    is_http_function: bool = False,
 ) -> str:
     """Generate code that replaces the original AI provider call with a
     proper OptiML integration.
@@ -424,14 +648,26 @@ def _generate_replacement_code(
     the code.  This is the core value prop: prompts and model config
     become manageable, versionable, and A/B-testable without code
     deploys.
-
-    For URL-only declarations (``let baseURL = "..."``), we swap the URL
-    to the OptiML public endpoint so the rest of the code keeps working.
-
-    For full HTTP calls (axios, fetch, requests, etc.), we replace with
-    a clean OptiML integration using ``input_text``.
     """
     url = endpoint_url or f"https://api.optiml.one/api/public/execute/{deployment_id}"
+
+    # ── HTTP function replacement (e.g. sendRequest in Swift) ──────────
+    # When we detect a full function that uses a URL variable to make
+    # HTTP calls, replace the entire function with a clean OptiML version.
+    # Detect by checking if snippet is a function definition or via flag.
+    snippet_stripped = original_snippet.strip()
+    _is_func = (
+        is_http_function
+        or snippet_stripped.startswith("func ")
+        or snippet_stripped.startswith("function ")
+        or snippet_stripped.startswith("async function ")
+        or snippet_stripped.startswith("def ")
+        or snippet_stripped.startswith("async def ")
+    )
+    if _is_func:
+        return _generate_http_function_replacement(
+            original_snippet, workflow_id, url, language,
+        )
 
     # ── URL-only declarations ──────────────────────────────────────────
     if _is_url_only_declaration(original_snippet):
