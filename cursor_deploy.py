@@ -30,6 +30,21 @@ API_TYPE_CONFIG = {
 }
 
 
+def _output_node_response_format(parsed: dict) -> str:
+    """Maps parse-import output_kind + api_type to studio output node response_format."""
+    api_type = (parsed.get("api_type") or "chat").replace("-", "_")
+    if api_type in ("image_generation", "tts", "stt", "embeddings"):
+        return "auto"
+    ok = str(parsed.get("output_kind") or "unknown").lower()
+    if ok in ("json", "json_object"):
+        return "json"
+    if ok == "text":
+        return "text"
+    if ok == "markdown":
+        return "markdown"
+    return "auto"
+
+
 def _slugify(name: str) -> str:
     s = (name or "").strip().lower()
     s = "".join(c if c.isalnum() or c == "-" else "-" for c in s)
@@ -130,7 +145,12 @@ def build_graph_from_parsed(parsed: dict) -> tuple[dict, list[dict]]:
     nodes = [
         {"id": "input", "type": "input", "position": {"x": 100, "y": 200}, "data": {"label": "input", "inputVariables": input_vars}},
         {"id": "ai_1", "type": node_type, "position": {"x": 380, "y": 200}, "data": ai_data},
-        {"id": "output", "type": "output", "position": {"x": 660, "y": 200}, "data": {"label": "output", "response_format": "auto"}},
+        {
+            "id": "output",
+            "type": "output",
+            "position": {"x": 660, "y": 200},
+            "data": {"label": "output", "response_format": _output_node_response_format(parsed)},
+        },
     ]
     edges = [
         {"id": "e1", "source": "input", "target": "ai_1"},
@@ -248,5 +268,6 @@ async def deploy_from_parsed(
         "endpoint_slug": endpoint_slug,
         "endpoint_url": f"https://api.optiml.one/api/public/{org_slug}/{endpoint_slug}",
         "workflow_id": workflow_id,
+        "project_id": project_id,
         "server_key": server_key,
     }
