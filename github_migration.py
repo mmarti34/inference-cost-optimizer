@@ -327,10 +327,11 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
     language = _detect_language(file_path)
 
     # URL-based patterns need special handling — flag them
+    # Use escaped dots to match the regex pattern strings
     _URL_PATTERNS = {
-        "api.openai.com", "api.anthropic.com", "api.mistral.ai",
-        "api.cohere.ai", "api.together.xyz", "api.groq.com",
-        "generativelanguage.googleapis.com",
+        r"api\.openai\.com", r"api\.anthropic\.com", r"api\.mistral\.ai",
+        r"api\.cohere\.ai", r"api\.together\.xyz", r"api\.groq\.com",
+        r"generativelanguage\.googleapis\.com",
     }
 
     for pattern, provider in _CALL_PATTERNS:
