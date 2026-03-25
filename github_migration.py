@@ -1,0 +1,570 @@
+"""github_migration.py
+
+GitHub repo scanning and PR-based migration endpoints.
+
+- GET  /github/auth-url        — Returns GitHub OAuth authorization URL
+- POST /github/exchange-token  — Exchanges OAuth code for access token
+- POST /github/scan-repo       — Scans a repo for AI SDK calls
+- POST /github/migrate         — Creates OptiML workflows and opens a PR
+"""
+
+import json
+import logging
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import List, Optional
+
+import httpx
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from auth_dependency import require_org_member, AuthenticatedUser
+from parse_import import _run_parse_import
+from supabase_client import supabase
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_REDIRECT_URI = "https://optiml.one/api/github/callback"
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+
+class ExchangeTokenRequest(BaseModel):
+    code: str
+
+
+class ScanRepoRequest(BaseModel):
+    github_token: str
+    repo_full_name: str
+
+
+class CallToMigrate(BaseModel):
+    file_path: str
+    code_snippet: str
+    line_number: int
+
+
+class MigrateRequest(BaseModel):
+    github_token: str
+    repo_full_name: str
+    org_id: str
+    calls_to_migrate: List[CallToMigrate]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _github_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+# Patterns to detect AI SDK call sites
+_CALL_PATTERNS = [
+    # Python OpenAI
+    (re.compile(r"client\.chat\.completions\.create\s*\("), "openai"),
+    (re.compile(r"openai\.ChatCompletion\.create\s*\("), "openai"),
+    (re.compile(r"openai\.chat\.completions\.create\s*\("), "openai"),
+    # Python / JS Anthropic
+    (re.compile(r"anthropic\.messages\.create\s*\("), "anthropic"),
+    (re.compile(r"client\.messages\.create\s*\("), "anthropic"),
+    # JS/TS OpenAI
+    (re.compile(r"openai\.chat\.completions\.create\s*\("), "openai"),
+]
+
+# Search queries for the GitHub code search API
+_SEARCH_QUERIES = [
+    "openai",
+    "anthropic",
+    "from openai import",
+    "import Anthropic",
+    "@anthropic-ai/sdk",
+    "google.generativeai",
+]
+
+
+def _detect_language(file_path: str) -> str:
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    mapping = {
+        "py": "python",
+        "js": "javascript",
+        "ts": "typescript",
+        "tsx": "typescript",
+        "jsx": "javascript",
+        "mjs": "javascript",
+    }
+    return mapping.get(ext, "unknown")
+
+
+def _extract_call_block(content: str, start: int) -> str:
+    """Extract the full call expression starting at *start* (the position of the
+    opening paren). Finds the matching closing paren/bracket accounting for
+    nesting and string literals."""
+    openers = {"(": ")", "[": "]", "{": "}"}
+    closers = set(openers.values())
+    stack: list[str] = []
+    i = start
+    in_string: Optional[str] = None
+
+    while i < len(content):
+        ch = content[i]
+
+        # Handle string literals (skip contents)
+        if in_string:
+            if ch == "\\" and i + 1 < len(content):
+                i += 2
+                continue
+            if ch == in_string:
+                in_string = None
+            i += 1
+            continue
+
+        if ch in ('"', "'", "`"):
+            in_string = ch
+            i += 1
+            continue
+
+        if ch in openers:
+            stack.append(openers[ch])
+        elif ch in closers:
+            if stack and stack[-1] == ch:
+                stack.pop()
+            if not stack:
+                return content[start : i + 1]
+        i += 1
+
+    # Fallback: return up to 500 chars
+    return content[start : start + 500]
+
+
+def _extract_model_from_snippet(snippet: str) -> Optional[str]:
+    """Try to pull out the model string from a code snippet."""
+    m = re.search(r"""model\s*[:=]\s*["']([^"']+)["']""", snippet)
+    return m.group(1) if m else None
+
+
+def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
+    """Scan file content for AI SDK call sites and return structured results."""
+    results: list[dict] = []
+    language = _detect_language(file_path)
+
+    for pattern, provider in _CALL_PATTERNS:
+        for match in pattern.finditer(content):
+            # Find the opening paren
+            paren_pos = content.index("(", match.start())
+            snippet = _extract_call_block(content, paren_pos)
+            # Include the method call prefix
+            full_snippet = content[match.start() : match.start() + len(match.group()) + len(snippet)]
+
+            line_number = content[: match.start()].count("\n") + 1
+            model = _extract_model_from_snippet(full_snippet)
+
+            results.append({
+                "file_path": file_path,
+                "line_number": line_number,
+                "language": language,
+                "code_snippet": full_snippet,
+                "detected_provider": provider,
+                "detected_model": model,
+            })
+
+    return results
+
+
+def _generate_replacement_code(
+    original_snippet: str, workflow_id: str, deployment_id: str, language: str
+) -> str:
+    """Generate code that calls the OptiML managed endpoint instead of the
+    original AI provider directly."""
+    if language == "python":
+        return (
+            f'# Migrated to OptiML — workflow {workflow_id}\n'
+            f'response = httpx.post(\n'
+            f'    "https://optiml.one/api/public/execute/{deployment_id}",\n'
+            f'    json={{"input": user_message}},\n'
+            f'    headers={{"Authorization": f"Bearer {{OPTIML_API_KEY}}"}},\n'
+            f'    timeout=30.0,\n'
+            f')\n'
+            f'result = response.json()'
+        )
+    else:
+        # JS/TS
+        return (
+            f'// Migrated to OptiML — workflow {workflow_id}\n'
+            f'const response = await fetch(\n'
+            f'  `https://optiml.one/api/public/execute/{deployment_id}`,\n'
+            f'  {{\n'
+            f'    method: "POST",\n'
+            f'    headers: {{\n'
+            f'      "Content-Type": "application/json",\n'
+            f'      Authorization: `Bearer ${{OPTIML_API_KEY}}`,\n'
+            f'    }},\n'
+            f'    body: JSON.stringify({{ input: userMessage }}),\n'
+            f'  }}\n'
+            f');\n'
+            f'const result = await response.json();'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/github/auth-url")
+async def github_auth_url():
+    """Return a GitHub OAuth authorization URL."""
+    if not GITHUB_CLIENT_ID:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "GitHub OAuth is not configured (GITHUB_CLIENT_ID missing)."},
+        )
+
+    state = str(uuid.uuid4())
+    url = (
+        f"https://github.com/login/oauth/authorize"
+        f"?client_id={GITHUB_CLIENT_ID}"
+        f"&redirect_uri={GITHUB_REDIRECT_URI}"
+        f"&scope=repo"
+        f"&state={state}"
+    )
+    return {"auth_url": url, "state": state}
+
+
+@router.post("/github/exchange-token")
+async def github_exchange_token(body: ExchangeTokenRequest):
+    """Exchange a GitHub OAuth code for an access token."""
+    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "GitHub OAuth is not configured."},
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                json={
+                    "client_id": GITHUB_CLIENT_ID,
+                    "client_secret": GITHUB_CLIENT_SECRET,
+                    "code": body.code,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        if "error" in data:
+            logger.warning("GitHub token exchange error: %s", data.get("error_description", data["error"]))
+            return JSONResponse(
+                status_code=400,
+                content={"error": data.get("error_description", data["error"])},
+            )
+
+        access_token = data["access_token"]
+
+        # Fetch the authenticated user's username
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            user_resp = await client.get(
+                f"{GITHUB_API_BASE}/user",
+                headers=_github_headers(access_token),
+            )
+            user_resp.raise_for_status()
+            github_username = user_resp.json().get("login", "")
+
+        return {"access_token": access_token, "github_username": github_username}
+
+    except httpx.HTTPStatusError as e:
+        logger.error("GitHub API error during token exchange: %s %s", e.response.status_code, e.response.text)
+        return JSONResponse(status_code=502, content={"error": "GitHub API error during token exchange."})
+    except Exception as e:
+        logger.error("Unexpected error during GitHub token exchange: %s", e)
+        return JSONResponse(status_code=500, content={"error": f"Token exchange failed: {str(e)}"})
+
+
+@router.post("/github/scan-repo")
+async def github_scan_repo(body: ScanRepoRequest):
+    """Scan a GitHub repo for AI SDK call sites."""
+    repo = body.repo_full_name
+    token = body.github_token
+    headers = _github_headers(token)
+
+    all_file_paths: set[str] = set()
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            # Search for files containing AI SDK imports
+            for query in _SEARCH_QUERIES:
+                search_url = f"{GITHUB_API_BASE}/search/code"
+                params = {"q": f"{query} repo:{repo}"}
+                resp = await client.get(search_url, headers=headers, params=params)
+
+                if resp.status_code == 403:
+                    logger.warning("GitHub code search rate limited for repo %s", repo)
+                    continue
+                if resp.status_code != 200:
+                    logger.warning(
+                        "GitHub code search returned %s for query '%s' in %s",
+                        resp.status_code, query, repo,
+                    )
+                    continue
+
+                items = resp.json().get("items", [])
+                for item in items:
+                    all_file_paths.add(item["path"])
+
+        if not all_file_paths:
+            return {
+                "repo": repo,
+                "found_calls": [],
+                "total_files_scanned": 0,
+                "total_calls_found": 0,
+            }
+
+        # Fetch raw content for each file and extract call sites
+        found_calls: list[dict] = []
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for file_path in all_file_paths:
+                content_url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}"
+                resp = await client.get(content_url, headers={
+                    **headers,
+                    "Accept": "application/vnd.github.raw+json",
+                })
+                if resp.status_code != 200:
+                    logger.warning("Could not fetch %s from %s: %s", file_path, repo, resp.status_code)
+                    continue
+
+                content = resp.text
+                calls = _find_calls_in_content(file_path, content)
+                found_calls.extend(calls)
+
+        return {
+            "repo": repo,
+            "found_calls": found_calls,
+            "total_files_scanned": len(all_file_paths),
+            "total_calls_found": len(found_calls),
+        }
+
+    except httpx.HTTPStatusError as e:
+        logger.error("GitHub API error scanning repo %s: %s", repo, e.response.text)
+        return JSONResponse(status_code=502, content={"error": f"GitHub API error: {e.response.status_code}"})
+    except Exception as e:
+        logger.error("Unexpected error scanning repo %s: %s", repo, e)
+        return JSONResponse(status_code=500, content={"error": f"Scan failed: {str(e)}"})
+
+
+@router.post("/github/migrate")
+async def github_migrate(
+    body: MigrateRequest,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Create OptiML workflows for each AI call and open a PR with migrated code."""
+    repo = body.repo_full_name
+    token = body.github_token
+    org_id = body.org_id
+    headers = _github_headers(token)
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    branch_name = f"optiml-migration-{timestamp}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # ------------------------------------------------------------------
+            # 1. Get the default branch SHA to base our new branch on
+            # ------------------------------------------------------------------
+            repo_resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
+            repo_resp.raise_for_status()
+            repo_data = repo_resp.json()
+            default_branch = repo_data.get("default_branch", "main")
+
+            ref_resp = await client.get(
+                f"{GITHUB_API_BASE}/repos/{repo}/git/ref/heads/{default_branch}",
+                headers=headers,
+            )
+            ref_resp.raise_for_status()
+            base_sha = ref_resp.json()["object"]["sha"]
+
+            # ------------------------------------------------------------------
+            # 2. Create the new branch
+            # ------------------------------------------------------------------
+            create_ref_resp = await client.post(
+                f"{GITHUB_API_BASE}/repos/{repo}/git/refs",
+                headers=headers,
+                json={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
+            )
+            create_ref_resp.raise_for_status()
+
+            # ------------------------------------------------------------------
+            # 3. Process each call: parse → create workflow → create deployment
+            #    → generate replacement code
+            # ------------------------------------------------------------------
+            workflows_created = 0
+            # Group changes by file path so we update each file once
+            file_changes: dict[str, list[tuple[CallToMigrate, str]]] = {}
+
+            for call in body.calls_to_migrate:
+                # 3a. Parse the snippet using the existing parse logic
+                parse_resp = await _run_parse_import(call.code_snippet)
+                parse_body = json.loads(parse_resp.body.decode())
+
+                if "error" in parse_body:
+                    logger.warning(
+                        "Skipping call at %s:%s — parse error: %s",
+                        call.file_path, call.line_number, parse_body["error"],
+                    )
+                    continue
+
+                suggested_name = parse_body.get("suggestedName", f"migrated-call-{workflows_created + 1}")
+                api_type = parse_body.get("api_type", "chat")
+
+                # 3b. Create a workflow in Supabase
+                workflow_data = {
+                    "org_id": org_id,
+                    "name": suggested_name,
+                    "description": f"Auto-migrated from {repo} — {call.file_path}:{call.line_number}",
+                    "graph": {
+                        "nodes": [
+                            {"id": "input", "type": "input"},
+                            {
+                                "id": "ai-step",
+                                "type": "ai",
+                                "config": {
+                                    "provider": parse_body.get("provider", "openai"),
+                                    "model": parse_body.get("model", "gpt-4o"),
+                                    "system_prompt": parse_body.get("system_prompt", ""),
+                                    "temperature": parse_body.get("temperature"),
+                                    "max_tokens": parse_body.get("max_tokens"),
+                                    "api_type": api_type,
+                                },
+                            },
+                        ],
+                        "edges": [{"from": "input", "to": "ai-step"}],
+                    },
+                    "status": "active",
+                    "created_by": auth_user.user_id,
+                }
+
+                wf_result = supabase.table("workflows").insert(workflow_data).execute()
+                if not wf_result.data:
+                    logger.error("Failed to create workflow for %s:%s", call.file_path, call.line_number)
+                    continue
+
+                workflow_id = wf_result.data[0]["id"]
+                workflows_created += 1
+
+                # 3c. Create a deployment for the workflow
+                deployment_data = {
+                    "workflow_id": workflow_id,
+                    "org_id": org_id,
+                    "status": "active",
+                    "created_by": auth_user.user_id,
+                }
+
+                dep_result = supabase.table("deployments").insert(deployment_data).execute()
+                deployment_id = dep_result.data[0]["id"] if dep_result.data else workflow_id
+
+                # 3d. Generate replacement code
+                language = _detect_language(call.file_path)
+                replacement = _generate_replacement_code(
+                    call.code_snippet, workflow_id, deployment_id, language,
+                )
+
+                file_changes.setdefault(call.file_path, []).append((call, replacement))
+
+            # ------------------------------------------------------------------
+            # 4. For each modified file, fetch current content and apply changes,
+            #    then update on the new branch via the GitHub Contents API.
+            # ------------------------------------------------------------------
+            for file_path, changes in file_changes.items():
+                # Fetch current file content + SHA
+                file_resp = await client.get(
+                    f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}",
+                    headers=headers,
+                    params={"ref": branch_name},
+                )
+                file_resp.raise_for_status()
+                file_data = file_resp.json()
+                file_sha = file_data["sha"]
+
+                # Decode content
+                import base64
+                raw_content = base64.b64decode(file_data["content"]).decode("utf-8")
+
+                # Apply replacements (process in reverse line order to preserve positions)
+                modified_content = raw_content
+                for call, replacement in sorted(changes, key=lambda c: c[0].line_number, reverse=True):
+                    modified_content = modified_content.replace(call.code_snippet, replacement)
+
+                # Push updated file
+                encoded = base64.b64encode(modified_content.encode("utf-8")).decode("utf-8")
+                update_resp = await client.put(
+                    f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}",
+                    headers=headers,
+                    json={
+                        "message": f"chore(optiml): migrate AI call in {file_path}",
+                        "content": encoded,
+                        "sha": file_sha,
+                        "branch": branch_name,
+                    },
+                )
+                update_resp.raise_for_status()
+
+            # ------------------------------------------------------------------
+            # 5. Open a pull request
+            # ------------------------------------------------------------------
+            owner = repo.split("/")[0]
+            pr_body = (
+                "## Migrate AI calls to OptiML managed endpoints\n\n"
+                f"This PR was auto-generated by [OptiML](https://optiml.one) to migrate "
+                f"**{workflows_created}** AI call(s) to managed OptiML workflows.\n\n"
+                "### What changed\n"
+                "Each direct AI provider call (OpenAI, Anthropic, etc.) has been replaced with a call "
+                "to your OptiML deployment endpoint. This gives you:\n\n"
+                "- **Version control** — roll back to any previous prompt or model config\n"
+                "- **A/B testing** — experiment with models and prompts without code changes\n"
+                "- **Knowledge base** — attach context assets to enrich responses\n"
+                "- **Cost tracking** — per-call cost and latency analytics\n"
+                "- **Human-in-the-loop** — optional approval gates for sensitive calls\n\n"
+                "### Next steps\n"
+                f"1. Set the `OPTIML_API_KEY` environment variable in your deployment\n"
+                f"2. Visit [OptiML Dashboard](https://optiml.one/dashboard) to configure your workflows\n"
+                "3. Review the changes in this PR and merge when ready\n"
+            )
+
+            pr_resp = await client.post(
+                f"{GITHUB_API_BASE}/repos/{repo}/pulls",
+                headers=headers,
+                json={
+                    "title": "Migrate AI calls to OptiML managed endpoints",
+                    "body": pr_body,
+                    "head": branch_name,
+                    "base": default_branch,
+                },
+            )
+            pr_resp.raise_for_status()
+            pr_url = pr_resp.json().get("html_url", "")
+
+        return {"pr_url": pr_url, "workflows_created": workflows_created}
+
+    except httpx.HTTPStatusError as e:
+        logger.error("GitHub API error during migration for %s: %s %s", repo, e.response.status_code, e.response.text)
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"GitHub API error: {e.response.status_code} — {e.response.text[:200]}"},
+        )
+    except Exception as e:
+        logger.error("Unexpected error during migration for %s: %s", repo, e)
+        return JSONResponse(status_code=500, content={"error": f"Migration failed: {str(e)}"})

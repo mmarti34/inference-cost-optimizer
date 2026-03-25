@@ -48,10 +48,12 @@ from context_asset_management import router as context_asset_management_router
 from hitl_management import router as hitl_management_router
 from webhook_management import router as webhook_management_router
 from routers.public_execution import router as public_execution_router
+from routers.openai_compat import router as openai_compat_router
 from parse_import import router as parse_import_router
 from cursor_tokens import router as cursor_tokens_router
 from cursor_deploy import router as cursor_deploy_router
 from workflow_draft_generator import router as workflow_draft_generator_router
+from github_migration import router as github_migration_router
 from middleware.observability_middleware import ObservabilityMiddleware
 from utils.observability import log_request, log_span, generate_request_id, generate_trace_id
 
@@ -143,6 +145,7 @@ app.include_router(parse_import_router, prefix="/api")
 app.include_router(cursor_tokens_router)
 app.include_router(cursor_deploy_router)
 app.include_router(public_execution_router, prefix="/api/public", tags=["public"])
+app.include_router(openai_compat_router)
 app.include_router(custom_model_router, prefix="/api")
 app.include_router(model_registry_router, prefix="/api")
 app.include_router(alert_management_router, prefix="/api")
@@ -151,6 +154,7 @@ app.include_router(hitl_management_router, prefix="/api")
 app.include_router(webhook_management_router, prefix="/api")
 app.include_router(context_asset_management_router, prefix="/api")
 app.include_router(workflow_draft_generator_router, prefix="/api")
+app.include_router(github_migration_router, prefix="/api")
 
 # Health check endpoint for Railway
 @app.get("/health")
