@@ -6,6 +6,7 @@ GitHub repo scanning and PR-based migration endpoints.
 - POST /github/exchange-token  — Exchanges OAuth code for access token
 - POST /github/scan-repo       — Scans a repo for AI SDK calls
 - POST /github/migrate         — Creates OptiML workflows and opens a PR
+- POST /github/migrate-presignup — Opens a migration PR without auth (pre-signup)
 """
 
 import json
@@ -58,6 +59,20 @@ class MigrateRequest(BaseModel):
     repo_full_name: str
     org_id: str
     calls_to_migrate: List[CallToMigrate]
+
+
+class CallToMigratePresignup(BaseModel):
+    file_path: str
+    code_snippet: str
+    line_number: int
+    endpoint_slug: str
+
+
+class MigratePresignupRequest(BaseModel):
+    github_token: str
+    repo_full_name: str
+    org_name: str
+    calls_to_migrate: List[CallToMigratePresignup]
 
 
 # ---------------------------------------------------------------------------
@@ -214,32 +229,41 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
 
 
 def _generate_replacement_code(
-    original_snippet: str, workflow_id: str, deployment_id: str, language: str
+    original_snippet: str, workflow_id: str, deployment_id: str, language: str,
+    endpoint_url: Optional[str] = None,
 ) -> str:
     """Generate code that calls the OptiML managed endpoint instead of the
-    original AI provider directly."""
+    original AI provider directly.
+
+    If *endpoint_url* is provided it overrides the default URL construction.
+    """
+    url = endpoint_url or f"https://optiml.one/api/public/execute/{deployment_id}"
+    api_key_var = "process.env.OPTIML_API_KEY" if endpoint_url else "OPTIML_API_KEY"
+
     if language == "python":
+        api_key_expr = 'os.environ["OPTIML_API_KEY"]' if endpoint_url else "OPTIML_API_KEY"
         return (
             f'# Migrated to OptiML — workflow {workflow_id}\n'
             f'response = httpx.post(\n'
-            f'    "https://optiml.one/api/public/execute/{deployment_id}",\n'
+            f'    "{url}",\n'
             f'    json={{"input": user_message}},\n'
-            f'    headers={{"Authorization": f"Bearer {{OPTIML_API_KEY}}"}},\n'
+            f'    headers={{"Authorization": f"Bearer {{{api_key_expr}}}"}},\n'
             f'    timeout=30.0,\n'
             f')\n'
             f'result = response.json()'
         )
     else:
         # JS/TS
+        api_key_js = "process.env.OPTIML_API_KEY" if endpoint_url else "OPTIML_API_KEY"
         return (
             f'// Migrated to OptiML — workflow {workflow_id}\n'
             f'const response = await fetch(\n'
-            f'  `https://optiml.one/api/public/execute/{deployment_id}`,\n'
+            f'  `{url}`,\n'
             f'  {{\n'
             f'    method: "POST",\n'
             f'    headers: {{\n'
             f'      "Content-Type": "application/json",\n'
-            f'      Authorization: `Bearer ${{OPTIML_API_KEY}}`,\n'
+            f'      Authorization: `Bearer ${{{api_key_js}}}`,\n'
             f'    }},\n'
             f'    body: JSON.stringify({{ input: userMessage }}),\n'
             f'  }}\n'
@@ -596,4 +620,149 @@ async def github_migrate(
         )
     except Exception as e:
         logger.error("Unexpected error during migration for %s: %s", repo, e)
+        return JSONResponse(status_code=500, content={"error": f"Migration failed: {str(e)}"})
+
+
+@router.post("/github/migrate-presignup")
+async def github_migrate_presignup(body: MigratePresignupRequest):
+    """Create a migration PR without requiring authentication or creating
+    Supabase workflows/deployments.  Uses placeholder endpoint URLs based on
+    org_name and endpoint_slug so the user can sign up later to activate them."""
+    repo = body.repo_full_name
+    token = body.github_token
+    org_name = body.org_name
+    headers = _github_headers(token)
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    branch_name = f"optiml-migration-{timestamp}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # ------------------------------------------------------------------
+            # 1. Get the default branch SHA to base our new branch on
+            # ------------------------------------------------------------------
+            repo_resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
+            repo_resp.raise_for_status()
+            repo_data = repo_resp.json()
+            default_branch = repo_data.get("default_branch", "main")
+
+            ref_resp = await client.get(
+                f"{GITHUB_API_BASE}/repos/{repo}/git/ref/heads/{default_branch}",
+                headers=headers,
+            )
+            ref_resp.raise_for_status()
+            base_sha = ref_resp.json()["object"]["sha"]
+
+            # ------------------------------------------------------------------
+            # 2. Create the new branch
+            # ------------------------------------------------------------------
+            create_ref_resp = await client.post(
+                f"{GITHUB_API_BASE}/repos/{repo}/git/refs",
+                headers=headers,
+                json={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
+            )
+            create_ref_resp.raise_for_status()
+
+            # ------------------------------------------------------------------
+            # 3. Process each call: generate replacement code using slug-based
+            #    endpoint URLs (no Supabase interaction)
+            # ------------------------------------------------------------------
+            calls_processed = 0
+            file_changes: dict[str, list[tuple[CallToMigratePresignup, str]]] = {}
+
+            for call in body.calls_to_migrate:
+                endpoint_url = f"https://api.optiml.one/api/public/{org_name}/{call.endpoint_slug}"
+                language = _detect_language(call.file_path)
+                replacement = _generate_replacement_code(
+                    call.code_snippet,
+                    workflow_id=call.endpoint_slug,
+                    deployment_id=call.endpoint_slug,
+                    language=language,
+                    endpoint_url=endpoint_url,
+                )
+                file_changes.setdefault(call.file_path, []).append((call, replacement))
+                calls_processed += 1
+
+            # ------------------------------------------------------------------
+            # 4. For each modified file, fetch current content, apply changes,
+            #    and push to the new branch.
+            # ------------------------------------------------------------------
+            import base64
+
+            for file_path, changes in file_changes.items():
+                file_resp = await client.get(
+                    f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}",
+                    headers=headers,
+                    params={"ref": branch_name},
+                )
+                file_resp.raise_for_status()
+                file_data = file_resp.json()
+                file_sha = file_data["sha"]
+
+                raw_content = base64.b64decode(file_data["content"]).decode("utf-8")
+
+                modified_content = raw_content
+                for call, replacement in sorted(changes, key=lambda c: c[0].line_number, reverse=True):
+                    modified_content = modified_content.replace(call.code_snippet, replacement)
+
+                encoded = base64.b64encode(modified_content.encode("utf-8")).decode("utf-8")
+                update_resp = await client.put(
+                    f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}",
+                    headers=headers,
+                    json={
+                        "message": f"chore(optiml): migrate AI call in {file_path}",
+                        "content": encoded,
+                        "sha": file_sha,
+                        "branch": branch_name,
+                    },
+                )
+                update_resp.raise_for_status()
+
+            # ------------------------------------------------------------------
+            # 5. Open a pull request
+            # ------------------------------------------------------------------
+            pr_body = (
+                "## Migrate AI calls to OptiML managed endpoints\n\n"
+                f"This PR was auto-generated by [OptiML](https://optiml.one) to migrate "
+                f"**{calls_processed}** AI call(s) to managed OptiML endpoints.\n\n"
+                "### What changed\n"
+                "Each direct AI provider call (OpenAI, Anthropic, etc.) has been replaced with a call "
+                "to your OptiML endpoint. This gives you:\n\n"
+                "- **Version control** — roll back to any previous prompt or model config\n"
+                "- **A/B testing** — experiment with models and prompts without code changes\n"
+                "- **Knowledge base** — attach context assets to enrich responses\n"
+                "- **Cost tracking** — per-call cost and latency analytics\n"
+                "- **Human-in-the-loop** — optional approval gates for sensitive calls\n\n"
+                "### ⚠️ Action required\n"
+                "These endpoints are **not yet active**. To activate them:\n\n"
+                "1. **Sign up** at [optiml.one](https://optiml.one) and create your organization\n"
+                "2. Set the `OPTIML_API_KEY` environment variable in your deployment "
+                "(use `process.env.OPTIML_API_KEY`)\n"
+                "3. Visit the [OptiML Dashboard](https://optiml.one/dashboard) to configure and "
+                "activate your endpoints\n"
+                "4. Review the changes in this PR and merge when ready\n"
+            )
+
+            pr_resp = await client.post(
+                f"{GITHUB_API_BASE}/repos/{repo}/pulls",
+                headers=headers,
+                json={
+                    "title": "Migrate AI calls to OptiML managed endpoints",
+                    "body": pr_body,
+                    "head": branch_name,
+                    "base": default_branch,
+                },
+            )
+            pr_resp.raise_for_status()
+            pr_url = pr_resp.json().get("html_url", "")
+
+        return {"pr_url": pr_url, "calls_migrated": calls_processed}
+
+    except httpx.HTTPStatusError as e:
+        logger.error("GitHub API error during presignup migration for %s: %s %s", repo, e.response.status_code, e.response.text)
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"GitHub API error: {e.response.status_code} — {e.response.text[:200]}"},
+        )
+    except Exception as e:
+        logger.error("Unexpected error during presignup migration for %s: %s", repo, e)
         return JSONResponse(status_code=500, content={"error": f"Migration failed: {str(e)}"})
