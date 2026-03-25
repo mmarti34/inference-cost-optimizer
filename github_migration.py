@@ -123,6 +123,20 @@ _CALL_PATTERNS = [
     # Together AI / Groq / OpenRouter (OpenAI-compatible)
     (re.compile(r"Together\s*\("), "together"),
     (re.compile(r"Groq\s*\("), "groq"),
+    # Swift / mobile — OpenAI via URLSession or Swift SDK
+    (re.compile(r"api\.openai\.com/v1/chat/completions"), "openai"),
+    (re.compile(r"api\.openai\.com/v1/completions"), "openai"),
+    (re.compile(r"api\.anthropic\.com/v1/messages"), "anthropic"),
+    (re.compile(r"generativelanguage\.googleapis\.com"), "gemini"),
+    (re.compile(r"OpenAI\s*\(\s*apiToken"), "openai"),
+    (re.compile(r"\.chats\s*\(\s*query"), "openai"),
+    # Generic HTTP calls to AI provider endpoints
+    (re.compile(r"api\.openai\.com"), "openai"),
+    (re.compile(r"api\.anthropic\.com"), "anthropic"),
+    (re.compile(r"api\.mistral\.ai"), "mistral"),
+    (re.compile(r"api\.cohere\.ai"), "cohere"),
+    (re.compile(r"api\.together\.xyz"), "together"),
+    (re.compile(r"api\.groq\.com"), "groq"),
 ]
 
 # Search queries for the GitHub code search API
@@ -153,6 +167,17 @@ def _detect_language(file_path: str) -> str:
         "tsx": "typescript",
         "jsx": "javascript",
         "mjs": "javascript",
+        "swift": "swift",
+        "kt": "kotlin",
+        "java": "java",
+        "go": "go",
+        "rb": "ruby",
+        "rs": "rust",
+        "cs": "csharp",
+        "php": "php",
+        "dart": "dart",
+        "r": "r",
+        "scala": "scala",
     }
     return mapping.get(ext, "unknown")
 
@@ -256,8 +281,21 @@ def _generate_replacement_code(
             f')\n'
             f'result = response.json()'
         )
+    elif language == "swift":
+        return (
+            f'// Migrated to OptiML — workflow {workflow_id}\n'
+            f'let optimlURL = URL(string: "{url}")!\n'
+            f'var optimlRequest = URLRequest(url: optimlURL)\n'
+            f'optimlRequest.httpMethod = "POST"\n'
+            f'optimlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")\n'
+            f'optimlRequest.setValue("Bearer \\(optimlAPIKey)", forHTTPHeaderField: "Authorization")\n'
+            f'let optimlBody: [String: Any] = ["input": userMessage]\n'
+            f'optimlRequest.httpBody = try JSONSerialization.data(withJSONObject: optimlBody)\n'
+            f'let (optimlData, _) = try await URLSession.shared.data(for: optimlRequest)\n'
+            f'let optimlResult = try JSONDecoder().decode([String: Any].self, from: optimlData)'
+        )
     else:
-        # JS/TS
+        # JS/TS and other languages — use fetch-style code
         api_key_js = "process.env.OPTIML_API_KEY" if endpoint_url else "OPTIML_API_KEY"
         return (
             f'// Migrated to OptiML — workflow {workflow_id}\n'
@@ -365,12 +403,17 @@ async def github_exchange_token(body: ExchangeTokenRequest):
 # File extensions we care about when scanning repos
 _SCANNABLE_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".mts",
+    ".swift", ".kt", ".java", ".go", ".rb", ".rs", ".cs",
+    ".php", ".dart", ".r", ".R", ".scala",
 }
 
 # Import-like strings that hint a file might contain AI SDK calls
 _IMPORT_HINTS = [
     "openai", "anthropic", "genai", "generativeai", "mistral",
     "cohere", "azure", "together", "groq",
+    "api.openai.com", "api.anthropic.com", "api.mistral.ai",
+    "api.cohere.ai", "api.together.xyz", "api.groq.com",
+    "generativelanguage.googleapis.com",
 ]
 
 
