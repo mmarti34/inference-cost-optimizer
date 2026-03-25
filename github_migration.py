@@ -439,34 +439,45 @@ async def github_scan_repo(body: ScanRepoRequest):
                 "total_calls_found": 0,
             }
 
-        # ── For tree-scan, pre-filter by fetching file content ───────
-        # If we have many files (tree scan), do a quick check: only fetch
-        # files whose content likely contains AI imports.
-        # For code-search results, fetch everything (already filtered).
+        # Cap at 150 files to avoid timeout on large repos
+        file_list = list(all_file_paths)[:150]
+        logger.info("Scanning %d files in %s (of %d found)", len(file_list), repo, len(all_file_paths))
+
+        # ── Fetch files concurrently (batches of 10) ─────────────────
+        import asyncio
+
         found_calls: list[dict] = []
         files_scanned = 0
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            for file_path in all_file_paths:
-                content_url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}"
+        async def _fetch_and_scan(client: httpx.AsyncClient, file_path: str) -> list[dict]:
+            content_url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{file_path}"
+            try:
                 resp = await client.get(content_url, headers={
                     **headers,
                     "Accept": "application/vnd.github.raw+json",
                 })
                 if resp.status_code != 200:
-                    logger.warning("Could not fetch %s from %s: %s", file_path, repo, resp.status_code)
-                    continue
-
+                    return []
                 content = resp.text
-                files_scanned += 1
-
                 # Quick pre-filter: skip files that don't mention any AI SDK
                 content_lower = content.lower()
                 if not any(hint in content_lower for hint in _IMPORT_HINTS):
-                    continue
+                    return []
+                return _find_calls_in_content(file_path, content)
+            except Exception:
+                return []
 
-                calls = _find_calls_in_content(file_path, content)
-                found_calls.extend(calls)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Process in batches of 10 concurrent requests
+            batch_size = 10
+            for i in range(0, len(file_list), batch_size):
+                batch = file_list[i : i + batch_size]
+                results = await asyncio.gather(
+                    *[_fetch_and_scan(client, fp) for fp in batch]
+                )
+                for result in results:
+                    files_scanned += 1
+                    found_calls.extend(result)
 
         return {
             "repo": repo,
