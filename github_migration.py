@@ -426,6 +426,8 @@ async def github_scan_repo(body: ScanRepoRequest):
                     continue
 
                 items = resp.json().get("items", [])
+                if items:
+                    logger.info("Code search found %d files for query '%s' in %s", len(items), query, repo)
                 for item in items:
                     all_file_paths.add(item["path"])
 
@@ -475,7 +477,10 @@ async def github_scan_repo(body: ScanRepoRequest):
                     content={"error": "Scan timed out. The repository may be too large."},
                 )
 
-            for item in tree_data.get("tree", []):
+            tree_items = tree_data.get("tree", [])
+            blob_count = sum(1 for it in tree_items if it.get("type") == "blob")
+            logger.info("Tree for %s: %d total items, %d blobs", repo, len(tree_items), blob_count)
+            for item in tree_items:
                 if item.get("type") != "blob":
                     continue
                 path = item.get("path", "")
@@ -488,6 +493,7 @@ async def github_scan_repo(body: ScanRepoRequest):
                 ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
                 if ext in _SCANNABLE_EXTENSIONS:
                     all_file_paths.add(path)
+            logger.info("Found %d scannable files in %s", len(all_file_paths), repo)
 
         if not all_file_paths:
             return {
