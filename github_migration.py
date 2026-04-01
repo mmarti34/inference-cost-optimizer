@@ -225,8 +225,66 @@ def _extract_call_block(content: str, start: int) -> str:
 
 def _extract_model_from_snippet(snippet: str) -> Optional[str]:
     """Try to pull out the model string from a code snippet."""
-    m = re.search(r"""model\s*[:=]\s*["']([^"']+)["']""", snippet)
+    m = re.search(r"""["']?model["']?\s*[:=]\s*["']([^"']+)["']""", snippet)
     return m.group(1) if m else None
+
+
+def _extract_config_from_snippet(snippet: str) -> dict:
+    """Extract model, system prompt, temperature, and max_tokens from a code snippet.
+
+    Used as a fallback when _run_parse_import fails or for function-level
+    snippets where the LLM parser may struggle.
+    """
+    config: dict = {}
+
+    # Model
+    model = _extract_model_from_snippet(snippet)
+    if model:
+        config["model"] = model
+
+    # Temperature — handles both key: value and key = value, quoted or unquoted keys
+    m = re.search(r"""["']?temperature["']?\s*[:=]\s*([0-9.]+)""", snippet)
+    if m:
+        try:
+            config["temperature"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # Max tokens
+    m = re.search(r"""["']?max.?tokens["']?\s*[:=]\s*(\d+)""", snippet, re.IGNORECASE)
+    if m:
+        try:
+            config["max_tokens"] = int(m.group(1))
+        except ValueError:
+            pass
+
+    # System prompt — look for system/developer role content in messages arrays
+    # Pattern 1: {"role": "system", "content": "..."} or Swift ["role": "system", "content": "..."]
+    m = re.search(
+        r"""["']role["']\s*[:=]\s*["'](?:system|developer|instructions)["']"""
+        r""".*?["']content["']\s*[:=]\s*["']([^"']+)["']""",
+        snippet, re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        config["system_prompt"] = m.group(1)
+    else:
+        # Pattern 2: Anthropic-style  system="..." or system: "..."
+        m = re.search(r"""system\s*[:=]\s*["']([^"']+)["']""", snippet)
+        if m:
+            config["system_prompt"] = m.group(1)
+
+    # Provider detection
+    snippet_lower = snippet.lower()
+    if "anthropic" in snippet_lower or "claude" in snippet_lower:
+        config["provider"] = "anthropic"
+    elif "gemini" in snippet_lower or "generativeai" in snippet_lower:
+        config["provider"] = "gemini"
+    elif "mistral" in snippet_lower:
+        config["provider"] = "mistral"
+    else:
+        config["provider"] = "openai"
+
+    return config
 
 
 def _apply_replacement(content: str, old_snippet: str, replacement: str) -> str:
@@ -1121,30 +1179,34 @@ async def github_migrate(
 
             for call in body.calls_to_migrate:
                 # 3a. Parse the snippet using the existing parse logic
+                extracted = _extract_config_from_snippet(call.code_snippet)
+
                 try:
                     parse_resp = await _run_parse_import(call.code_snippet)
                     parse_body = json.loads(parse_resp.body.decode())
                 except Exception as e:
-                    logger.warning("Parse failed for %s:%s — %s", call.file_path, call.line_number, e)
-                    # Fallback: use defaults so we still create a workflow
+                    logger.warning("Parse failed for %s:%s — %s, using regex extraction", call.file_path, call.line_number, e)
                     parse_body = {
-                        "provider": "openai",
-                        "model": _extract_model_from_snippet(call.code_snippet) or "gpt-4o",
-                        "system_prompt": "",
+                        "provider": extracted.get("provider", "openai"),
+                        "model": extracted.get("model", "gpt-4o"),
+                        "system_prompt": extracted.get("system_prompt", ""),
+                        "temperature": extracted.get("temperature"),
+                        "max_tokens": extracted.get("max_tokens"),
                         "suggestedName": f"migrated-call-{workflows_created + 1}",
                         "api_type": "chat",
                     }
 
                 if "error" in parse_body:
                     logger.warning(
-                        "Parse error for %s:%s — %s, using defaults",
+                        "Parse error for %s:%s — %s, using regex extraction",
                         call.file_path, call.line_number, parse_body["error"],
                     )
-                    # Use defaults instead of skipping — still create a workflow
                     parse_body = {
-                        "provider": "openai",
-                        "model": _extract_model_from_snippet(call.code_snippet) or "gpt-4o",
-                        "system_prompt": "",
+                        "provider": extracted.get("provider", "openai"),
+                        "model": extracted.get("model", "gpt-4o"),
+                        "system_prompt": extracted.get("system_prompt", ""),
+                        "temperature": extracted.get("temperature"),
+                        "max_tokens": extracted.get("max_tokens"),
                         "suggestedName": f"migrated-call-{workflows_created + 1}",
                         "api_type": "chat",
                     }
