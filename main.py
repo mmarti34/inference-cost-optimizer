@@ -54,6 +54,7 @@ from cursor_tokens import router as cursor_tokens_router
 from cursor_deploy import router as cursor_deploy_router
 from workflow_draft_generator import router as workflow_draft_generator_router
 from github_migration import router as github_migration_router
+from synthetic_mind.router import router as synthetic_mind_router
 from middleware.observability_middleware import ObservabilityMiddleware
 from utils.observability import log_request, log_span, generate_request_id, generate_trace_id
 
@@ -155,6 +156,7 @@ app.include_router(webhook_management_router, prefix="/api")
 app.include_router(context_asset_management_router, prefix="/api")
 app.include_router(workflow_draft_generator_router, prefix="/api")
 app.include_router(github_migration_router, prefix="/api")
+app.include_router(synthetic_mind_router, prefix="/api")
 
 # Health check endpoint for Railway
 @app.get("/health")
