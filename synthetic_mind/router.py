@@ -7,7 +7,7 @@ GET  /api/synthetic-mind/memories          — list active memories for an org
 POST /api/synthetic-mind/forget            — run forgetting cycle
 """
 import logging
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
 
@@ -21,6 +21,10 @@ from synthetic_mind.prompt_assembler import generate_memory_summary
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/synthetic-mind", tags=["synthetic-mind"])
+
+# Secret for cron-triggered consolidation (no user auth needed)
+import os
+CRON_SECRET = os.getenv("SM_CRON_SECRET", "sm-cron-default-secret")
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +65,68 @@ class ForgetResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.post("/consolidate-cron")
+async def cron_consolidation(request: Request):
+    """
+    Cron-triggered consolidation for ALL orgs with unconsolidated observations.
+    Secured by SM_CRON_SECRET header, no user auth needed.
+    Called by Railway cron or external scheduler.
+    """
+    secret = request.headers.get("x-sm-cron-secret", "")
+    if secret != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+
+    try:
+        # Find all orgs with unconsolidated observations
+        r = supabase.table("sm_observations").select(
+            "org_id", count="exact"
+        ).eq("consolidated", False).execute()
+
+        org_ids = list({row["org_id"] for row in (r.data or [])})
+        if not org_ids:
+            return {"message": "No unconsolidated observations", "orgs_processed": 0}
+
+        results = []
+        for org_id in org_ids:
+            stats = consolidate_org(org_id)
+            run_forgetting_cycle(org_id)
+            results.append({"org_id": org_id, **stats})
+
+        return {
+            "message": f"Consolidated {len(org_ids)} orgs",
+            "orgs_processed": len(org_ids),
+            "results": results,
+        }
+    except Exception as e:
+        logger.error("Cron consolidation failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/observations")
+async def list_observations(
+    org_id: str,
+    limit: int = 50,
+    endpoint_slug: Optional[str] = None,
+    user=Depends(require_auth),
+):
+    """List recent observations for an org."""
+    _verify_org_access(user, org_id)
+    try:
+        query = (
+            supabase.table("sm_observations")
+            .select("*")
+            .eq("org_id", org_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if endpoint_slug:
+            query = query.eq("endpoint_slug", endpoint_slug)
+        r = query.execute()
+        return {"observations": r.data or [], "count": len(r.data or [])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/consolidate", response_model=ConsolidateResponse)
 async def trigger_consolidation(body: ConsolidateRequest, user=Depends(require_auth)):
