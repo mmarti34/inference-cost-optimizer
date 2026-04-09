@@ -117,14 +117,43 @@ def build_observation(
 # Persistence (fire-and-forget)
 # ---------------------------------------------------------------------------
 
+# Auto-consolidation threshold: consolidate after this many unconsolidated
+# observations accumulate for an org. Keeps the mind fresh without manual triggers.
+AUTO_CONSOLIDATE_THRESHOLD = 50
+
+
 def _save_observation_sync(obs: dict[str, Any]) -> None:
-    """Insert observation into DB. Never raises."""
+    """Insert observation into DB, then auto-consolidate if threshold reached. Never raises."""
     try:
         if not obs.get("org_id"):
             return
         supabase.table("sm_observations").insert(obs).execute()
+
+        # Auto-consolidation: check if we've hit the threshold
+        _maybe_auto_consolidate(obs["org_id"])
     except Exception as e:
         logger.warning("sm_observations insert failed: %s", e, exc_info=False)
+
+
+def _maybe_auto_consolidate(org_id: str) -> None:
+    """Run consolidation if unconsolidated observations exceed threshold."""
+    try:
+        r = (
+            supabase.table("sm_observations")
+            .select("id", count="exact")
+            .eq("org_id", org_id)
+            .eq("consolidated", False)
+            .execute()
+        )
+        count = r.count or 0
+        if count >= AUTO_CONSOLIDATE_THRESHOLD:
+            from synthetic_mind.consolidation import consolidate_org
+            from synthetic_mind.forgetting import run_forgetting_cycle
+            logger.info("Auto-consolidating org %s (%d observations)", org_id, count)
+            consolidate_org(org_id)
+            run_forgetting_cycle(org_id)
+    except Exception as e:
+        logger.warning("Auto-consolidation check failed: %s", e, exc_info=False)
 
 
 async def observe_request(
