@@ -38,6 +38,7 @@ from conversation_service import (
 from routing.resolver import resolve_version, resolve_version_and_deployment, get_promoted_deployment_by_version
 from api_request_logger import log_api_request, get_api_request_log_sync, update_api_request_log_metrics
 from auto_grading import grade_response
+from synthetic_mind.observer import observe_request as sm_observe_request
 
 router = APIRouter()
 
@@ -474,6 +475,28 @@ async def public_execute(
                     input_text=(body.input_text or "").strip() if body.input_text else "",
                 )
             )
+
+        # ── Synthetic Mind: observe this request/response asynchronously ──
+        _node_results = result.get("node_results") or []
+        _first_ai = next((n for n in _node_results if n.get("type") in ("ai-step", "model")), None)
+        asyncio.create_task(
+            sm_observe_request(
+                request_id=request_id,
+                org_id=ctx.org_id,
+                workflow_id=workflow_id,
+                endpoint_slug=slug_clean,
+                input_text=input_text,
+                output_text=result.get("final_output"),
+                node_results=_node_results,
+                total_cost=result.get("total_cost"),
+                total_latency_ms=result.get("total_latency"),
+                input_tokens=(_first_ai or {}).get("input_tokens", 0),
+                output_tokens=(_first_ai or {}).get("tokens", 0),
+                model=(_first_ai or {}).get("model"),
+                provider=(_first_ai or {}).get("provider"),
+                success=True,
+            )
+        )
 
         return {
             **result,
