@@ -1558,8 +1558,9 @@ def execute_workflow(
             if ctx_result and ctx_result["injection_location"] == "prepend_to_system":
                 prompt_text = ctx_result["final_text"] + "\n\n" + prompt_text
             # --- End context injection ---
-            # --- Synthetic Mind: inject memory summary (production only) ---
-            if execution_mode == "production" and org_id and workflow_id:
+            # --- Synthetic Mind: inject memory summary (production only, if enabled) ---
+            _sm_enabled = data.get("syntheticMindEnabled", True)
+            if _sm_enabled and execution_mode == "production" and org_id and workflow_id:
                 try:
                     _mem_summary = _sm_generate_memory_summary(
                         org_id, workflow_id=workflow_id, endpoint_slug=endpoint_slug,
