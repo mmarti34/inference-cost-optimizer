@@ -28,9 +28,11 @@ def generate_memory_summary(
     """
     Generate a compact memory summary for injection into the system prompt.
 
-    Returns a string like:
-      [CONTEXT: endpoint=recipe-gen, typical_model=gpt-4o, avg_cost=$0.003,
-       common_entities=[recipe, nutrition, vegan], avg_input=450tok]
+    Produces a human-readable context block that helps the LLM understand:
+    - What this endpoint does (purpose, domain)
+    - What users typically ask about (topics, intents)
+    - Common question patterns
+    - Relevant infrastructure context (model, cost only if noteworthy)
 
     Returns None if no relevant memories exist yet.
     """
@@ -46,40 +48,62 @@ def generate_memory_summary(
     if not memories:
         return None
 
-    # Build summary parts
-    parts: list[str] = []
-
-    if endpoint_slug:
-        parts.append(f"endpoint={endpoint_slug}")
-
+    # Organize memories by predicate for structured assembly
+    mem_by_pred: dict[str, dict] = {}
     for mem in memories:
         pred = mem.get("predicate", "")
         obj = mem.get("object", {})
+        if isinstance(obj, dict):
+            mem_by_pred[pred] = obj
 
-        if pred == "most_used_model" and isinstance(obj, dict):
-            parts.append(f"typical_model={obj.get('model', '?')}")
-        elif pred == "average_cost_per_call" and isinstance(obj, dict):
-            avg = obj.get("avg_cost", 0)
-            parts.append(f"avg_cost=${avg:.4f}")
-        elif pred == "typical_token_usage" and isinstance(obj, dict):
-            parts.append(f"avg_input={obj.get('avg_input_tokens', 0)}tok")
-            parts.append(f"avg_output={obj.get('avg_output_tokens', 0)}tok")
-        elif pred == "common_entities" and isinstance(obj, dict):
-            ents = obj.get("entities", [])[:5]
-            if ents:
-                parts.append(f"common_entities=[{', '.join(ents)}]")
-        elif pred == "error_rate" and isinstance(obj, dict):
-            rate = obj.get("rate", 0)
-            if rate > 0.05:
-                parts.append(f"error_rate={rate:.1%}")
+    sections: list[str] = []
 
-    if not parts:
+    # 1. Endpoint purpose (most valuable — tells the LLM what it's doing)
+    purpose = mem_by_pred.get("endpoint_purpose", {})
+    if purpose.get("description"):
+        sections.append(purpose["description"])
+
+    # 2. Common topics (what users ask about)
+    topics = mem_by_pred.get("common_topics", {})
+    topic_list = topics.get("topics", [])
+    if topic_list:
+        sections.append(f"Frequently discussed: {', '.join(topic_list[:10])}.")
+
+    # 3. Intent distribution (why users call)
+    intents = mem_by_pred.get("intent_distribution", {})
+    dist = intents.get("distribution", {})
+    if dist:
+        intent_parts = []
+        for intent, pct in sorted(dist.items(), key=lambda x: -x[1]):
+            label = intent.replace("_", " ")
+            intent_parts.append(f"{label} ({pct:.0%})")
+        sections.append(f"User intent breakdown: {', '.join(intent_parts)}.")
+
+    # 4. Common question patterns (specific examples of what users ask)
+    q_patterns = mem_by_pred.get("common_question_patterns", {})
+    patterns = q_patterns.get("patterns", [])
+    if patterns:
+        examples = "; ".join(p for p in patterns[:5])
+        sections.append(f"Frequent questions: {examples}.")
+
+    # 5. Light infrastructure context (only if noteworthy)
+    model_info = mem_by_pred.get("most_used_model", {})
+    error_info = mem_by_pred.get("error_rate", {})
+    infra_parts = []
+    if model_info.get("model"):
+        infra_parts.append(f"model={model_info['model']}")
+    if error_info.get("rate", 0) > 0.05:
+        infra_parts.append(f"error_rate={error_info['rate']:.1%}")
+    if infra_parts:
+        sections.append(f"Infrastructure: {', '.join(infra_parts)}.")
+
+    if not sections:
         return None
 
-    summary = "[CONTEXT: " + ", ".join(parts) + "]"
+    summary = "[LEARNED CONTEXT]\n" + "\n".join(sections)
 
     # Truncate if too long
     if len(summary) > MAX_SUMMARY_TOKENS * 4:
-        summary = summary[: MAX_SUMMARY_TOKENS * 4 - 3] + "...]"
+        summary = summary[: MAX_SUMMARY_TOKENS * 4 - 3] + "..."
 
     return summary

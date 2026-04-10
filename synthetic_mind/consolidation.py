@@ -34,11 +34,13 @@ def _extract_patterns(observations: list[dict]) -> list[dict]:
     """
     Extract patterns from a batch of observations.
 
-    Phase 1: Simple frequency-based pattern extraction.
-    - Most common models used per workflow/endpoint
-    - Average token counts and costs
-    - Common entities across requests
-    - Input/output length distributions
+    Extracts both infrastructure stats AND content understanding:
+    - Model/cost/token patterns (infrastructure)
+    - Common topics and keywords (what users ask about)
+    - Intent distribution (why users call this endpoint)
+    - Endpoint purpose (inferred from content patterns)
+    - Frequent question patterns (what specific things users ask)
+    - Common entities mentioned in content
     """
     patterns: list[dict] = []
 
@@ -51,6 +53,8 @@ def _extract_patterns(observations: list[dict]) -> list[dict]:
     for slug, obs_group in by_endpoint.items():
         if len(obs_group) < 3:
             continue
+
+        # --- Infrastructure patterns (kept from phase 1) ---
 
         # Model usage pattern
         model_counts = Counter(o.get("model") for o in obs_group if o.get("model"))
@@ -92,21 +96,6 @@ def _extract_patterns(observations: list[dict]) -> list[dict]:
                 "evidence": [o["id"] for o in obs_group[:10]],
             })
 
-        # Entity frequency across observations
-        entity_counts: Counter = Counter()
-        for o in obs_group:
-            for e in (o.get("entities_mentioned") or []):
-                entity_counts[e] += 1
-        common_entities = [e for e, c in entity_counts.most_common(10) if c >= 2]
-        if common_entities:
-            patterns.append({
-                "memory_type": "entity",
-                "subject": f"endpoint:{slug}",
-                "predicate": "common_entities",
-                "object": {"entities": common_entities},
-                "evidence": [o["id"] for o in obs_group[:10]],
-            })
-
         # Error rate
         errors = [o for o in obs_group if o.get("observation_type") == "error"]
         if errors:
@@ -122,7 +111,174 @@ def _extract_patterns(observations: list[dict]) -> list[dict]:
                 "evidence": [o["id"] for o in errors[:10]],
             })
 
+        # --- Content understanding patterns (new) ---
+
+        # Topic extraction from entities_mentioned (which now includes keywords)
+        topic_counts: Counter = Counter()
+        for o in obs_group:
+            for entity in (o.get("entities_mentioned") or []):
+                topic_counts[entity] += 1
+
+        # Split into model/provider entities vs content topics
+        _model_providers = {"openai", "anthropic", "google", "gemini", "groq", "together",
+                           "mistral", "cohere", "deepseek", "fireworks"}
+        content_topics = [(t, c) for t, c in topic_counts.most_common(30)
+                         if t not in _model_providers
+                         and not any(t.startswith(p) for p in ("gpt-", "claude-", "gemini-", "llama", "mistral-"))
+                         and c >= 2]
+        top_topics = [t for t, _ in content_topics[:15]]
+
+        if top_topics:
+            patterns.append({
+                "memory_type": "abstraction",
+                "subject": f"endpoint:{slug}",
+                "predicate": "common_topics",
+                "object": {
+                    "topics": top_topics,
+                    "topic_counts": {t: c for t, c in content_topics[:15]},
+                    "sample_size": len(obs_group),
+                },
+                "evidence": [o["id"] for o in obs_group[:10]],
+            })
+
+        # Intent distribution from input summaries
+        intent_counts: Counter = Counter()
+        for o in obs_group:
+            summary = o.get("input_summary") or ""
+            intent = _classify_intent_from_summary(summary)
+            intent_counts[intent] += 1
+
+        if intent_counts:
+            total_intents = sum(intent_counts.values())
+            intent_dist = {
+                intent: round(count / total_intents, 3)
+                for intent, count in intent_counts.most_common()
+                if count / total_intents >= 0.05  # only include intents ≥5%
+            }
+            top_intent = intent_counts.most_common(1)[0][0]
+            patterns.append({
+                "memory_type": "abstraction",
+                "subject": f"endpoint:{slug}",
+                "predicate": "intent_distribution",
+                "object": {
+                    "distribution": intent_dist,
+                    "primary_intent": top_intent,
+                    "sample_size": total_intents,
+                },
+                "evidence": [o["id"] for o in obs_group[:10]],
+            })
+
+        # Endpoint purpose — inferred from top topics + intent distribution
+        purpose = _infer_endpoint_purpose(top_topics, intent_counts, slug)
+        if purpose:
+            patterns.append({
+                "memory_type": "abstraction",
+                "subject": f"endpoint:{slug}",
+                "predicate": "endpoint_purpose",
+                "object": {"description": purpose, "sample_size": len(obs_group)},
+                "evidence": [o["id"] for o in obs_group[:10]],
+            })
+
+        # Frequent question patterns — extract representative questions
+        question_patterns = _extract_question_patterns(obs_group)
+        if question_patterns:
+            patterns.append({
+                "memory_type": "procedure",
+                "subject": f"endpoint:{slug}",
+                "predicate": "common_question_patterns",
+                "object": {
+                    "patterns": question_patterns,
+                    "sample_size": len(obs_group),
+                },
+                "evidence": [o["id"] for o in obs_group[:10]],
+            })
+
     return patterns
+
+
+def _classify_intent_from_summary(text: str) -> str:
+    """Classify user intent from an observation's input summary."""
+    if not text:
+        return "unknown"
+    t = text.lower().strip()
+    if any(w in t for w in ["how do i", "how to", "walk me through", "can you show", "steps to"]):
+        return "how_to"
+    if any(w in t for w in ["price", "pricing", "cost", "plan", "tier", "upgrade", "billing", "subscribe"]):
+        return "pricing"
+    if any(w in t for w in ["error", "bug", "broken", "not working", "can't", "won't", "issue", "problem", "help", "fix", "stuck", "failing", "disappeared", "stopped"]):
+        return "troubleshooting"
+    if any(w in t for w in ["what is", "what's", "does it", "do you", "is there", "can i", "support"]):
+        return "feature_question"
+    if any(w in t for w in ["hello", "hi ", "hey", "new user", "just signed", "getting started"]):
+        return "onboarding"
+    return "general"
+
+
+def _infer_endpoint_purpose(topics: list[str], intents: Counter, slug: str) -> Optional[str]:
+    """Infer what this endpoint is for based on topics and intents."""
+    if not topics and not intents:
+        return None
+
+    top_intent = intents.most_common(1)[0][0] if intents else "general"
+    topic_str = ", ".join(topics[:8]) if topics else "various topics"
+
+    # Build a human-readable purpose description
+    intent_labels = {
+        "how_to": "instructional/how-to",
+        "pricing": "pricing and billing",
+        "troubleshooting": "troubleshooting and support",
+        "feature_question": "feature discovery",
+        "onboarding": "user onboarding",
+        "general": "general assistance",
+    }
+    intent_desc = intent_labels.get(top_intent, "general assistance")
+
+    return f"Handles {intent_desc} queries. Common topics: {topic_str}."
+
+
+def _extract_question_patterns(obs_group: list[dict]) -> list[str]:
+    """
+    Extract representative question patterns from observations.
+    Groups similar questions and returns the most common patterns.
+    """
+    # Collect first sentences from input summaries as question patterns
+    raw_questions: list[str] = []
+    for o in obs_group:
+        summary = o.get("input_summary") or ""
+        if not summary:
+            continue
+        # Take first sentence/question
+        for sep in ["?", ".", "!"]:
+            idx = summary.find(sep)
+            if idx > 0:
+                raw_questions.append(summary[:idx + 1].strip())
+                break
+        else:
+            raw_questions.append(summary[:100].strip())
+
+    if not raw_questions:
+        return []
+
+    # Group by leading words to find patterns
+    pattern_groups: dict[str, int] = Counter()
+    for q in raw_questions:
+        words = q.lower().split()
+        if len(words) >= 3:
+            # Use first 3-4 words as the pattern key
+            key_len = min(4, len(words))
+            key = " ".join(words[:key_len])
+            pattern_groups[key] += 1
+
+    # Return patterns that appeared at least twice, with example
+    result = []
+    for pattern, count in pattern_groups.most_common(10):
+        if count >= 2:
+            # Find a representative full question for this pattern
+            for q in raw_questions:
+                if q.lower().startswith(pattern):
+                    result.append(f"{q} ({count}x)")
+                    break
+    return result[:8]
 
 
 # ---------------------------------------------------------------------------
