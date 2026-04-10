@@ -31,7 +31,8 @@ from model_target import ModelTarget
 from provider_resilience import call_with_resilience
 from context_runtime import resolve_node_context, build_context_trace
 from context_embeddings import search_similar as _search_kb
-from synthetic_mind.prompt_assembler import generate_memory_summary as _sm_generate_memory_summary
+# SM v1 prompt injection removed — v2 compresses context sources instead
+# (prompt_assembler.py still used by the /synthetic-mind/stats dashboard)
 
 _logger = logging.getLogger(__name__)
 
@@ -1558,18 +1559,6 @@ def execute_workflow(
             if ctx_result and ctx_result["injection_location"] == "prepend_to_system":
                 prompt_text = ctx_result["final_text"] + "\n\n" + prompt_text
             # --- End context injection ---
-            # --- Synthetic Mind: inject memory summary (production only, if enabled) ---
-            _sm_enabled = data.get("syntheticMindEnabled", True)
-            if _sm_enabled and execution_mode == "production" and org_id and workflow_id:
-                try:
-                    _mem_summary = _sm_generate_memory_summary(
-                        org_id, workflow_id=workflow_id, endpoint_slug=endpoint_slug,
-                    )
-                    if _mem_summary:
-                        prompt_text = _mem_summary + "\n\n" + prompt_text
-                except Exception:
-                    pass  # never block execution for memory summary
-            # --- End Synthetic Mind ---
             model_node = {"id": node_id, "type": "model", "data": {**data, "modelName": data.get("modelName") or "gpt-3.5-turbo", "provider": data.get("provider") or "OpenAI"}}
             _t0_ai_step = time.perf_counter()
             try:
