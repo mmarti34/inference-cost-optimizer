@@ -238,7 +238,7 @@ def _verify_org_access(user, org_id: str) -> None:
             supabase.table("organization_members")
             .select("id")
             .eq("user_id", user_id)
-            .eq("organization_id", org_id)
+            .eq("org_id", org_id)
             .limit(1)
             .execute()
         )
