@@ -201,15 +201,18 @@ def _classify_intent_from_summary(text: str) -> str:
     if not text:
         return "unknown"
     t = text.lower().strip()
-    if any(w in t for w in ["how do i", "how to", "walk me through", "can you show", "steps to"]):
+    if any(w in t for w in ["how do i", "how to", "walk me through", "can you show", "steps to", "how does"]):
         return "how_to"
-    if any(w in t for w in ["price", "pricing", "cost", "plan", "tier", "upgrade", "billing", "subscribe"]):
+    if any(w in t for w in ["price", "pricing", "cost", "plan", "tier", "upgrade", "billing", "subscribe", "pay", "refund"]):
         return "pricing"
-    if any(w in t for w in ["error", "bug", "broken", "not working", "can't", "won't", "issue", "problem", "help", "fix", "stuck", "failing", "disappeared", "stopped"]):
+    if any(w in t for w in ["error", "bug", "broken", "not working", "can't", "won't", "issue",
+                            "problem", "help me", "fix", "stuck", "failing", "disappeared", "stopped",
+                            "not syncing", "slow", "loading", "crash", "wrong"]):
         return "troubleshooting"
-    if any(w in t for w in ["what is", "what's", "does it", "do you", "is there", "can i", "support"]):
+    if any(w in t for w in ["what is", "what's", "what are", "does it", "do you", "does ",
+                            "is there", "can i", "can you", "support", "have a", "have an"]):
         return "feature_question"
-    if any(w in t for w in ["hello", "hi ", "hey", "new user", "just signed", "getting started"]):
+    if any(w in t for w in ["hello", "hi ", "hi!", "hey", "new user", "just signed", "getting started", "where do i start"]):
         return "onboarding"
     return "general"
 
