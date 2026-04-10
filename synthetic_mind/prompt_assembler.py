@@ -5,12 +5,13 @@ Assembles the thinnest possible prompt by referencing accumulated
 understanding instead of resending raw context.
 
 Phase 1: Memory summary generation (injected as system context).
-Prompt thinning (delta computation) comes in Phase 3.
+Phase 3: Agent prior knowledge generation from cross-run tool patterns.
 """
 import logging
 from typing import Any, Optional
 
 from synthetic_mind.scopes import load_scoped_memories
+from synthetic_mind.memory_store import get_active_memories
 
 logger = logging.getLogger(__name__)
 
@@ -107,3 +108,80 @@ def generate_memory_summary(
         summary = summary[: MAX_SUMMARY_TOKENS * 4 - 3] + "..."
 
     return summary
+
+
+# Max chars for agent prior knowledge block
+MAX_PRIOR_KNOWLEDGE_CHARS = 1500
+
+
+def generate_agent_prior_knowledge(
+    org_id: str,
+    *,
+    workflow_id: Optional[str] = None,
+    scope_value: Optional[str] = None,
+) -> Optional[str]:
+    """
+    SM v2 Phase 3: Generate a prior knowledge block for agent nodes.
+
+    Fetches consolidated tool knowledge from past agent runs and formats
+    it as a compact reference the agent can use to avoid redundant tool calls.
+
+    Returns None if no relevant prior knowledge exists.
+    The agent decides whether to use this or re-call tools — not forced.
+    """
+    try:
+        memories = get_active_memories(
+            org_id,
+            workflow_id=workflow_id,
+            memory_type="procedure",
+            min_confidence=0.5,
+            limit=20,
+        )
+
+        if not memories:
+            return None
+
+        # Filter to agent tool prior knowledge
+        tool_memories = [
+            m for m in memories
+            if m.get("predicate") == "prior_knowledge"
+            and (m.get("subject") or "").startswith("agent_tool:")
+        ]
+
+        if not tool_memories:
+            return None
+
+        lines: list[str] = []
+        for mem in tool_memories:
+            obj = mem.get("object", {})
+            if not isinstance(obj, dict):
+                continue
+            tool_name = obj.get("tool_name", "")
+            input_key = obj.get("input_key", "")
+            output_summary = obj.get("output_summary", "")
+            call_count = obj.get("call_count", 0)
+
+            if not output_summary:
+                continue
+
+            if tool_name == "get_knowledge_asset" and input_key:
+                lines.append(f"- Asset {input_key}: {output_summary}")
+            elif tool_name == "search_knowledge_base" and input_key:
+                lines.append(f"- KB search \"{input_key}\": {output_summary}")
+            else:
+                lines.append(f"- {tool_name}: {output_summary}")
+
+        if not lines:
+            return None
+
+        block = "[PRIOR TOOL KNOWLEDGE]\n" + "\n".join(lines)
+
+        # Truncate if too long
+        if len(block) > MAX_PRIOR_KNOWLEDGE_CHARS:
+            block = block[:MAX_PRIOR_KNOWLEDGE_CHARS - 3] + "..."
+
+        return block
+
+    except Exception as e:
+        logger.warning("Failed to generate agent prior knowledge: %s", e)
+        return None

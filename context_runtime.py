@@ -7,6 +7,7 @@ collects sources, packages them, and returns injectable text with trace metadata
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any
@@ -15,6 +16,9 @@ from openai import OpenAI
 from supabase_client import supabase
 
 logger = logging.getLogger(__name__)
+
+# Rough token estimate (same as conversation_service)
+_CHARS_PER_TOKEN = 4
 
 
 def resolve_node_context(
@@ -54,6 +58,10 @@ def resolve_node_context(
     candidates = _collect_sources(sources_config, context, org_id, deployment_id=deployment_id)
     if not candidates:
         return None
+
+    # SM v2 Phase 2: try to replace raw KB candidates with a consolidated summary
+    _sm_scope_value = (variables or {}).get("_sm_scope_value")
+    candidates = _maybe_use_kb_consolidation(candidates, org_id, scope_value=_sm_scope_value)
 
     packaged = _package_context(candidates, packaging_config, org_id=org_id)
 
@@ -255,6 +263,95 @@ def _summarize_context(text: str, max_chars: int, org_id: str | None = None) -> 
     except Exception:
         logger.exception("Summarization failed (org=%s), falling back to truncation", org_id)
         return text[:max_chars]
+
+
+def _maybe_use_kb_consolidation(
+    candidates: list[dict],
+    org_id: str,
+    scope_value: str | None = None,
+) -> list[dict]:
+    """
+    SM v2 Phase 2: replace raw KB asset candidates with a consolidated summary
+    if one exists with sufficient confidence. Returns the (possibly modified)
+    candidates list.
+
+    Only replaces knowledge_asset candidates — inline_text and previous_node_output
+    are left untouched. If consolidation isn't found or wouldn't save tokens,
+    returns the original candidates unchanged. Zero risk.
+    """
+    # Separate KB assets from other source types
+    kb_candidates = [c for c in candidates if c["source_type"] == "knowledge_asset" and c.get("source_ref")]
+    other_candidates = [c for c in candidates if c["source_type"] != "knowledge_asset" or not c.get("source_ref")]
+
+    if len(kb_candidates) < 1:
+        return candidates  # Nothing to consolidate
+
+    asset_ids = [c["source_ref"] for c in kb_candidates]
+
+    try:
+        from synthetic_mind.memory_store import get_kb_consolidation, bump_kb_consolidation_hit
+
+        consolidation = get_kb_consolidation(org_id, asset_ids, min_confidence=0.7, scope_value=scope_value)
+        if not consolidation:
+            return candidates
+
+        # Validate freshness: check asset_versions_hash
+        current_hash = _compute_asset_versions_hash(asset_ids, org_id)
+        if current_hash and consolidation.get("asset_versions_hash") != current_hash:
+            logger.info("SM KB consolidation stale (hash mismatch), serving raw candidates")
+            return candidates
+
+        # Check compression ratio — only use if it actually saves tokens
+        consolidated_tokens = max(1, len(consolidation["consolidated_text"]) // _CHARS_PER_TOKEN)
+        raw_tokens = sum(max(1, c["estimated_chars"] // _CHARS_PER_TOKEN) for c in kb_candidates)
+
+        if consolidated_tokens >= raw_tokens * 0.8:
+            return candidates  # Not enough savings
+
+        # Replace KB candidates with consolidated text
+        bump_kb_consolidation_hit(consolidation["id"])
+
+        consolidated_candidate = {
+            "source_type": "knowledge_asset",
+            "label": "Consolidated Knowledge",
+            "raw_text": consolidation["consolidated_text"],
+            "source_ref": f"sm_consolidation:{consolidation['id']}",
+            "required": False,
+            "estimated_chars": len(consolidation["consolidated_text"]),
+        }
+
+        logger.info(
+            "SM KB consolidation: %d raw tokens → %d consolidated (%d%% saved), org=%s",
+            raw_tokens, consolidated_tokens,
+            int((1 - consolidated_tokens / max(raw_tokens, 1)) * 100),
+            org_id[:8],
+        )
+
+        return other_candidates + [consolidated_candidate]
+
+    except Exception as e:
+        logger.warning("SM KB consolidation lookup failed, using raw candidates: %s", e)
+        return candidates
+
+
+def _compute_asset_versions_hash(asset_ids: list[str], org_id: str) -> str | None:
+    """Compute a hash of updated_at timestamps for a set of assets to detect staleness."""
+    if not asset_ids:
+        return None
+    try:
+        result = (
+            supabase.table("context_assets")
+            .select("id, updated_at")
+            .in_("id", asset_ids)
+            .eq("org_id", org_id)
+            .execute()
+        )
+        if not result.data:
+            return None
+        timestamps = sorted(f"{r['id']}:{r['updated_at']}" for r in result.data)
+        return hashlib.sha256("|".join(timestamps).encode()).hexdigest()[:16]
+    except Exception:
+        return None
 
 
 def _package_context(

@@ -288,3 +288,105 @@ def complete_consolidation_run(
         }).eq("id", run_id).execute()
     except Exception as e:
         logger.warning("Failed to complete consolidation run: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# KB Consolidations (SM v2 Phase 2)
+# ---------------------------------------------------------------------------
+
+def get_kb_consolidation(
+    org_id: str,
+    asset_ids: list[str],
+    min_confidence: float = 0.7,
+    scope_value: Optional[str] = None,
+) -> dict | None:
+    """
+    Look up an existing KB consolidation for a set of asset IDs.
+    When scope_value is provided, only returns consolidations for that scope.
+    Returns the consolidation record if found and valid, None otherwise.
+    """
+    if not asset_ids:
+        return None
+    sorted_ids = sorted(asset_ids)
+    try:
+        query = (
+            supabase.table("sm_kb_consolidations")
+            .select("*")
+            .eq("org_id", org_id)
+            .contains("asset_ids", sorted_ids)
+            .gte("confidence", min_confidence)
+            .order("confidence", desc=True)
+            .limit(1)
+        )
+        if scope_value:
+            query = query.eq("scope_value", scope_value)
+        else:
+            query = query.is_("scope_value", "null")
+        r = query.execute()
+        if r.data and len(r.data) > 0:
+            rec = r.data[0]
+            # Check that asset_ids match exactly (contains is superset check)
+            if sorted(rec.get("asset_ids", [])) == sorted_ids:
+                return rec
+    except Exception as e:
+        logger.warning("Failed to lookup KB consolidation: %s", e)
+    return None
+
+
+def upsert_kb_consolidation(
+    org_id: str,
+    asset_ids: list[str],
+    consolidated_text: str,
+    raw_token_count: int,
+    consolidated_token_count: int,
+    asset_versions_hash: str,
+    scope_value: Optional[str] = None,
+) -> str | None:
+    """Create or update a KB consolidation record. Returns record ID."""
+    sorted_ids = sorted(asset_ids)
+    try:
+        # Check for existing (scoped)
+        existing = get_kb_consolidation(org_id, sorted_ids, min_confidence=0.0, scope_value=scope_value)
+        if existing:
+            supabase.table("sm_kb_consolidations").update({
+                "consolidated_text": consolidated_text,
+                "raw_token_count": raw_token_count,
+                "consolidated_token_count": consolidated_token_count,
+                "asset_versions_hash": asset_versions_hash,
+                "confidence": min(1.0, existing.get("confidence", 0.5) + 0.1),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", existing["id"]).execute()
+            return existing["id"]
+        else:
+            row = {
+                "org_id": org_id,
+                "asset_ids": sorted_ids,
+                "consolidated_text": consolidated_text,
+                "raw_token_count": raw_token_count,
+                "consolidated_token_count": consolidated_token_count,
+                "confidence": 0.5,
+                "hit_count": 0,
+                "asset_versions_hash": asset_versions_hash,
+            }
+            if scope_value:
+                row["scope_value"] = scope_value
+            r = supabase.table("sm_kb_consolidations").insert(row).execute()
+            if r.data and len(r.data) > 0:
+                return r.data[0]["id"]
+    except Exception as e:
+        logger.warning("Failed to upsert KB consolidation: %s", e)
+    return None
+
+
+def bump_kb_consolidation_hit(consolidation_id: str) -> None:
+    """Increment hit count and boost confidence when a consolidation is served."""
+    try:
+        rec = supabase.table("sm_kb_consolidations").select("hit_count, confidence").eq("id", consolidation_id).limit(1).execute()
+        if rec.data:
+            supabase.table("sm_kb_consolidations").update({
+                "hit_count": (rec.data[0].get("hit_count") or 0) + 1,
+                "confidence": min(1.0, (rec.data[0].get("confidence") or 0.5) + 0.05),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", consolidation_id).execute()
+    except Exception as e:
+        logger.warning("Failed to bump KB consolidation hit: %s", e)

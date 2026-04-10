@@ -346,6 +346,20 @@ async def public_execute(
 
         input_text = (body.input_text or "").strip() if body.input_text is not None else ""
 
+        # 7c. SM scope key: resolve the context scope identifier from workflow config + variables
+        # If the workflow builder configured a scope_key (e.g. "concert_id", "customer_id"),
+        # extract the value from the caller's variables. This scopes SM consolidation per-entity.
+        _sm_scope_key = None
+        _sm_scope_value = None
+        _gj_metadata = graph_json.get("metadata") or {}
+        if isinstance(_gj_metadata, dict):
+            _sm_scope_key = _gj_metadata.get("sm_scope_key") or _gj_metadata.get("scope_key")
+        if not _sm_scope_key:
+            # Also check top-level graph_json for scope_key
+            _sm_scope_key = graph_json.get("sm_scope_key")
+        if _sm_scope_key and variables and isinstance(variables, dict):
+            _sm_scope_value = str(variables.get(_sm_scope_key, "")).strip() or None
+
         # 7b. Conversation: load history and build prefix when conversation_id is set
         conversation_prefix = None
         conversation_id = None
@@ -440,6 +454,10 @@ async def public_execute(
         # Run synchronous workflow in a thread so we don't block the event loop
         # (provider calls can take seconds; blocking would stall all other requests).
         _execution_started = True
+        # Inject SM scope value into variables for context_runtime to use
+        _exec_vars = dict(variables) if variables else {}
+        if _sm_scope_value:
+            _exec_vars["_sm_scope_value"] = _sm_scope_value
         result = await asyncio.to_thread(
             execute_workflow,
             graph_json,
@@ -450,7 +468,7 @@ async def public_execute(
             dep_slug,
             dep_version,
             "production",
-            variables,
+            _exec_vars if _exec_vars else variables,
             experiment_id,
             variant_name,
             resolved_version,
@@ -514,6 +532,8 @@ async def public_execute(
                 model=(_first_ai or {}).get("model"),
                 provider=(_first_ai or {}).get("provider"),
                 success=True,
+                scope_key=_sm_scope_key,
+                scope_value=_sm_scope_value,
             )
         )
 

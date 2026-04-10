@@ -21,6 +21,7 @@ from synthetic_mind.memory_store import (
     start_consolidation_run,
     complete_consolidation_run,
     decay_confidence,
+    upsert_kb_consolidation,
 )
 
 logger = logging.getLogger(__name__)
@@ -356,4 +357,225 @@ def consolidate_org(org_id: str) -> dict[str, int]:
                 run_id, **stats, status="failed", error_message=str(e)
             )
 
+    # Phase 2: consolidate KB patterns from observations that tracked asset usage
+    try:
+        _consolidate_kb_patterns(org_id, observations)
+    except Exception as e:
+        logger.warning("KB pattern consolidation failed for org %s: %s", org_id, e)
+
+    # Phase 3: consolidate agent tool patterns
+    try:
+        _consolidate_agent_tool_patterns(org_id, observations)
+    except Exception as e:
+        logger.warning("Agent tool pattern consolidation failed for org %s: %s", org_id, e)
+
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: KB Context Consolidation
+# ---------------------------------------------------------------------------
+
+def _consolidate_kb_patterns(org_id: str, observations: list[dict]) -> None:
+    """
+    Find recurring KB asset combinations across observations and generate
+    consolidated summaries. Only creates consolidations when the same set
+    of assets has been retrieved 3+ times.
+    """
+    import hashlib
+    import os
+    from supabase_client import supabase
+
+    # Count (org, scope_value, asset_set) combos from observations that recorded kb_asset_ids
+    # Key: (scope_value, asset_ids_key) → list of occurrences
+    asset_set_counts: dict[tuple, list[list[str]]] = defaultdict(list)
+    scope_values: dict[tuple, str | None] = {}
+    for obs in observations:
+        metadata = obs.get("metadata") or {}
+        if isinstance(metadata, str):
+            continue
+        kb_ids = metadata.get("kb_asset_ids") or []
+        if not kb_ids or len(kb_ids) < 1:
+            continue
+        obs_scope = metadata.get("scope_value")
+        asset_key = "|".join(sorted(kb_ids))
+        combo_key = (obs_scope, asset_key)
+        asset_set_counts[combo_key].append(kb_ids)
+        scope_values[combo_key] = obs_scope
+
+    for combo_key, occurrences in asset_set_counts.items():
+        if len(occurrences) < 3:
+            continue  # Need 3+ hits before consolidating
+
+        asset_ids = sorted(occurrences[0])
+        scope_value = scope_values.get(combo_key)
+
+        # Check if consolidation already exists (scoped)
+        from synthetic_mind.memory_store import get_kb_consolidation
+        existing = get_kb_consolidation(org_id, asset_ids, min_confidence=0.0, scope_value=scope_value)
+        if existing:
+            # Already consolidated — confidence gets bumped via hits at serve time
+            continue
+
+        # Fetch raw asset content
+        try:
+            result = (
+                supabase.table("context_assets")
+                .select("id, name, content, updated_at")
+                .in_("id", asset_ids)
+                .eq("org_id", org_id)
+                .execute()
+            )
+            if not result.data or len(result.data) != len(asset_ids):
+                continue
+        except Exception:
+            continue
+
+        # Compute versions hash for staleness detection
+        timestamps = sorted(f"{r['id']}:{r['updated_at']}" for r in result.data)
+        versions_hash = hashlib.sha256("|".join(timestamps).encode()).hexdigest()[:16]
+
+        # Build combined text
+        raw_parts = []
+        raw_chars = 0
+        for asset in result.data:
+            content = asset.get("content") or ""
+            raw_parts.append(f"## {asset.get('name', 'Asset')}\n{content}")
+            raw_chars += len(content)
+
+        if raw_chars < 200:
+            continue  # Too short to bother consolidating
+
+        combined = "\n\n---\n\n".join(raw_parts)
+        raw_token_count = max(1, raw_chars // 4)
+
+        # Call gpt-4o-mini to consolidate
+        summary = _call_kb_consolidator(combined, raw_chars)
+        if not summary:
+            continue
+
+        consolidated_token_count = max(1, len(summary) // 4)
+
+        # Only store if we actually save tokens (at least 2x compression)
+        if consolidated_token_count > raw_token_count // 2:
+            continue
+
+        upsert_kb_consolidation(
+            org_id=org_id,
+            asset_ids=asset_ids,
+            consolidated_text=summary,
+            raw_token_count=raw_token_count,
+            consolidated_token_count=consolidated_token_count,
+            asset_versions_hash=versions_hash,
+            scope_value=scope_value,
+        )
+
+        logger.info(
+            "KB consolidation created: %d assets, %d→%d tokens, org=%s",
+            len(asset_ids), raw_token_count, consolidated_token_count, org_id[:8],
+        )
+
+
+def _call_kb_consolidator(combined_text: str, raw_chars: int) -> Optional[str]:
+    """Call gpt-4o-mini to compress multiple KB assets into a consolidated summary."""
+    import os
+    api_key = os.environ.get("SYSTEM_OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        target_chars = max(200, raw_chars // 4)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Compress the following knowledge base content into a concise summary of about {target_chars} characters. "
+                        "Preserve ALL key facts, data points, rules, procedures, and important details. "
+                        "This summary will replace the raw content in future LLM calls, "
+                        "so it must contain everything needed to answer questions accurately. "
+                        "Be factual and precise — do not generalize or lose specifics."
+                    ),
+                },
+                {"role": "user", "content": combined_text},
+            ],
+            max_tokens=target_chars // 3,
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("KB consolidation summarizer failed: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Agent Cross-Run Memory
+# ---------------------------------------------------------------------------
+
+def _consolidate_agent_tool_patterns(org_id: str, observations: list[dict]) -> None:
+    """
+    Extract tool usage patterns from agent observations and store as memory units.
+    When an agent reads the same file or searches the same KB multiple times across
+    runs, we consolidate what it learned into reusable prior knowledge.
+    """
+    # Collect agent tool call data from observations
+    tool_usage: dict[str, list[dict]] = defaultdict(list)  # tool_name → [calls]
+
+    for obs in observations:
+        metadata = obs.get("metadata") or {}
+        if isinstance(metadata, str):
+            continue
+        agent_tools = metadata.get("agent_tool_calls") or []
+        for tool_call in agent_tools:
+            tool_name = tool_call.get("tool_name", "")
+            if not tool_name:
+                continue
+            tool_usage[tool_name].append(tool_call)
+
+    if not tool_usage:
+        return
+
+    # For file-reading tools, consolidate repeated reads of same files
+    for tool_name in ("get_knowledge_asset", "search_knowledge_base"):
+        calls = tool_usage.get(tool_name, [])
+        if len(calls) < 2:
+            continue
+
+        # Group by the input (asset_id or query)
+        by_input: dict[str, list[dict]] = defaultdict(list)
+        for call in calls:
+            input_key = call.get("input_key", "")
+            if input_key:
+                by_input[input_key].append(call)
+
+        for input_key, repeated_calls in by_input.items():
+            if len(repeated_calls) < 2:
+                continue
+
+            # Extract common output patterns
+            outputs = [c.get("output_summary", "") for c in repeated_calls if c.get("output_summary")]
+            if not outputs:
+                continue
+
+            # Store as a memory unit for agent prior knowledge
+            unit = {
+                "id": str(uuid.uuid4()),
+                "memory_type": "procedure",
+                "org_id": org_id,
+                "subject": f"agent_tool:{tool_name}",
+                "predicate": "prior_knowledge",
+                "object": {
+                    "tool_name": tool_name,
+                    "input_key": input_key,
+                    "call_count": len(repeated_calls),
+                    "output_summary": outputs[0][:500],  # Use first output as representative
+                },
+                "evidence": [c.get("observation_id", "") for c in repeated_calls[:10]],
+                "confidence": min(1.0, 0.4 + len(repeated_calls) * 0.1),
+            }
+            upsert_memory_unit(unit)

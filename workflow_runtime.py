@@ -708,7 +708,7 @@ def get_pending_yield(yield_id: str) -> ToolYieldRequest | None:
         return _pending_tool_yields.get(yield_id)
 
 
-def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str, event_queue: _queue_mod.Queue | None = None, context_text: str | None = None) -> dict:
+def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str, event_queue: _queue_mod.Queue | None = None, context_text: str | None = None, workflow_id: str | None = None, scope_value: str | None = None) -> dict:
     """
     Execute an autonomous agent with reasoning trace.
 
@@ -896,6 +896,14 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
     agent_system = _AGENT_SYSTEM_TEMPLATE
     if context_text:
         agent_system = agent_system + "\n\n--- Context ---\n" + context_text
+    # SM v2 Phase 3: inject prior tool knowledge from past agent runs
+    try:
+        from synthetic_mind.prompt_assembler import generate_agent_prior_knowledge
+        _prior = generate_agent_prior_knowledge(org_id, workflow_id=workflow_id, scope_value=scope_value)
+        if _prior:
+            agent_system = agent_system + "\n\n" + _prior
+    except Exception:
+        pass  # Never block agent execution for SM failures
     if user_sys:
         agent_system = agent_system + "\n" + user_sys
 
@@ -1731,7 +1739,7 @@ def execute_workflow(
             # --- End context injection ---
             _t0_agent = time.perf_counter()
             try:
-                result = _execute_agent_node(node_id, node, prompt_text, org_id, context_text=_ctx_for_agent)
+                result = _execute_agent_node(node_id, node, prompt_text, org_id, context_text=_ctx_for_agent, workflow_id=workflow_id, scope_value=(variables or {}).get("_sm_scope_value"))
             except HTTPException as e:
                 _fail_ms = int((time.perf_counter() - _t0_agent) * 1000)
                 _record_latency_fact(

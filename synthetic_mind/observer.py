@@ -131,6 +131,8 @@ def build_observation(
     provider: Optional[str] = None,
     success: bool = True,
     error_message: Optional[str] = None,
+    scope_key: Optional[str] = None,
+    scope_value: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build an observation record ready for DB insertion."""
 
@@ -150,6 +152,10 @@ def build_observation(
     seen = set(input_keywords)
     keywords = input_keywords + [k for k in output_keywords if k not in seen]
     intent = _classify_intent(input_text)
+
+    # Extract KB asset IDs and agent tool calls from node_results for Phase 2/3
+    kb_asset_ids = _extract_kb_asset_ids(node_results)
+    agent_tool_calls = _extract_agent_tool_calls(node_results)
 
     return {
         "id": str(uuid.uuid4()),
@@ -175,8 +181,71 @@ def build_observation(
         "metadata": {
             "intent": intent,
             "keywords": keywords[:10],
+            "kb_asset_ids": kb_asset_ids,
+            "agent_tool_calls": agent_tool_calls,
+            "scope_key": scope_key,
+            "scope_value": scope_value,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# SM v2: Extract KB and agent tool data from node_results
+# ---------------------------------------------------------------------------
+
+def _extract_kb_asset_ids(node_results: list[dict] | None) -> list[str]:
+    """Extract KB asset IDs from context_trace in node_results."""
+    if not node_results:
+        return []
+    asset_ids: list[str] = []
+    for nr in node_results:
+        trace = nr.get("context_trace") or {}
+        if not trace.get("enabled"):
+            continue
+        for item in (trace.get("items_used") or []):
+            ref = item.get("source_ref") or ""
+            # Skip consolidation refs and non-asset refs
+            if ref and not ref.startswith("sm_consolidation:") and item.get("source_type") == "knowledge_asset":
+                asset_ids.append(ref)
+    return sorted(set(asset_ids))
+
+
+def _extract_agent_tool_calls(node_results: list[dict] | None) -> list[dict]:
+    """Extract agent tool call summaries from reasoning_steps in node_results."""
+    if not node_results:
+        return []
+    tool_calls: list[dict] = []
+    for nr in node_results:
+        if nr.get("type") != "agent":
+            continue
+        for step in (nr.get("reasoning_steps") or []):
+            if step.get("type") != "act":
+                continue
+            tool_name = step.get("tool_name", "")
+            tool_input = step.get("tool_input") or {}
+            # Build a compact record for consolidation
+            input_key = ""
+            if tool_name == "get_knowledge_asset":
+                input_key = tool_input.get("asset_id", "")
+            elif tool_name == "search_knowledge_base":
+                input_key = tool_input.get("query", "")[:100]
+
+            # Find the corresponding observe step for output summary
+            output_summary = ""
+            step_num = step.get("step")
+            if step_num is not None:
+                for obs_step in (nr.get("reasoning_steps") or []):
+                    if obs_step.get("type") == "observe" and obs_step.get("step") == step_num:
+                        output_summary = _summarize(obs_step.get("content", ""), 200)
+                        break
+
+            tool_calls.append({
+                "tool_name": tool_name,
+                "input_key": input_key,
+                "output_summary": output_summary,
+                "observation_id": nr.get("node_id", ""),
+            })
+    return tool_calls[:20]  # Cap to prevent bloat
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +312,8 @@ async def observe_request(
     provider: Optional[str] = None,
     success: bool = True,
     error_message: Optional[str] = None,
+    scope_key: Optional[str] = None,
+    scope_value: Optional[str] = None,
 ) -> None:
     """
     Async entry point — build observation and persist.
@@ -266,6 +337,8 @@ async def observe_request(
         provider=provider,
         success=success,
         error_message=error_message,
+        scope_key=scope_key,
+        scope_value=scope_value,
     )
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _save_observation_sync, obs)

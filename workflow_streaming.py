@@ -385,7 +385,7 @@ async def stream_workflow_async(
 
                     def _run_agent():
                         from workflow_runtime import _execute_agent_node
-                        return _execute_agent_node(node_id, node, prompt_text, org_id, event_queue=event_queue, context_text=_agent_context_text)
+                        return _execute_agent_node(node_id, node, prompt_text, org_id, event_queue=event_queue, context_text=_agent_context_text, workflow_id=workflow_id, scope_value=(variables or {}).get("_sm_scope_value"))
 
                     # Run agent in a thread; read events from queue in real time
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
