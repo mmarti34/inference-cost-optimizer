@@ -360,16 +360,25 @@ async def public_execute(
                     for n in (graph_json.get("nodes") or [])
                 )
                 # SM v2: use compressed history (summary + recent turns) when available
-                if _has_agent:
-                    conversation_prefix = compress_history_prefix(
-                        turns, conversation_id,
-                        max_tokens=AGENT_MAX_TOKENS, max_turns=AGENT_MAX_TURNS,
-                        is_agent=True,
-                    )
-                else:
-                    conversation_prefix = compress_history_prefix(
-                        turns, conversation_id,
-                    )
+                try:
+                    if _has_agent:
+                        conversation_prefix = compress_history_prefix(
+                            turns, conversation_id,
+                            max_tokens=AGENT_MAX_TOKENS, max_turns=AGENT_MAX_TURNS,
+                            is_agent=True,
+                        )
+                    else:
+                        conversation_prefix = compress_history_prefix(
+                            turns, conversation_id,
+                        )
+                except Exception:
+                    # Fallback to raw formatting if compression fails
+                    if _has_agent:
+                        trimmed = trim_history_to_fit(turns, max_tokens=AGENT_MAX_TOKENS, max_turns=AGENT_MAX_TURNS)
+                        conversation_prefix = format_agent_history_as_prefix(trimmed)
+                    else:
+                        trimmed = trim_history_to_fit(turns)
+                        conversation_prefix = format_history_as_prefix(trimmed)
 
         # 8. Stream or execute
         if body.stream:
@@ -472,9 +481,8 @@ async def public_execute(
             save_conversation_turn(conversation_id, n + 1, "assistant", result["final_output"], assistant_vars, request_id, resolved_version)
             update_conversation_updated_at(conversation_id)
             # SM v2: generate/update history summary async (for next request's compression)
-            asyncio.create_task(
-                asyncio.get_event_loop().run_in_executor(None, generate_history_summary, conversation_id)
-            )
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, generate_history_summary, conversation_id)
 
         if result.get("final_output"):
             asyncio.create_task(
