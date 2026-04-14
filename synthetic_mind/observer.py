@@ -274,9 +274,8 @@ def _save_observation_sync(obs: dict[str, Any]) -> None:
     try:
         if not obs.get("org_id"):
             return
-        # Extract metadata before insert (not a DB column yet, stored in entities)
-        obs_copy = {k: v for k, v in obs.items() if k != "metadata"}
-        supabase.table("sm_observations").insert(obs_copy).execute()
+        # metadata IS a DB column (JSONB) — save it for consolidation phases 2-4
+        supabase.table("sm_observations").insert(obs).execute()
 
         # Auto-consolidation: check if we've hit the threshold
         _maybe_auto_consolidate(obs["org_id"])
