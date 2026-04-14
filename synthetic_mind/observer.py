@@ -157,6 +157,16 @@ def build_observation(
     kb_asset_ids = _extract_kb_asset_ids(node_results)
     agent_tool_calls = _extract_agent_tool_calls(node_results)
 
+    # SM v2 Phase 4: capture variable content hash + char count for variable consolidation
+    # When scope_key is set, we track the variable data so the consolidation engine
+    # can detect repeated large variable payloads and consolidate them.
+    variable_chars = 0
+    variable_hash = None
+    if scope_value and input_text:
+        variable_chars = len(input_text)
+        import hashlib as _hl
+        variable_hash = _hl.sha256(input_text.encode()).hexdigest()[:16]
+
     return {
         "id": str(uuid.uuid4()),
         "request_id": request_id,
@@ -185,6 +195,8 @@ def build_observation(
             "agent_tool_calls": agent_tool_calls,
             "scope_key": scope_key,
             "scope_value": scope_value,
+            "variable_hash": variable_hash,
+            "variable_chars": variable_chars,
         },
     }
 

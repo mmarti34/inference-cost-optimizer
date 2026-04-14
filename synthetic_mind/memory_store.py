@@ -390,3 +390,94 @@ def bump_kb_consolidation_hit(consolidation_id: str) -> None:
             }).eq("id", consolidation_id).execute()
     except Exception as e:
         logger.warning("Failed to bump KB consolidation hit: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Variable Consolidation (Phase 4: scope-based variable compression)
+# ---------------------------------------------------------------------------
+
+def get_variable_consolidation(
+    org_id: str,
+    endpoint_slug: str,
+    scope_value: str,
+    min_confidence: float = 0.7,
+) -> dict | None:
+    """
+    Look up a consolidated variable summary for a given scope value.
+    E.g. for scope_key=concert_id, scope_value=taylor-swift-eras-tour-la,
+    returns the pre-built summary of reviews for that concert.
+    """
+    if not scope_value or not endpoint_slug:
+        return None
+    try:
+        r = (
+            supabase.table("sm_variable_consolidations")
+            .select("*")
+            .eq("org_id", org_id)
+            .eq("endpoint_slug", endpoint_slug)
+            .eq("scope_value", scope_value)
+            .gte("confidence", min_confidence)
+            .order("confidence", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if r.data and len(r.data) > 0:
+            return r.data[0]
+    except Exception as e:
+        logger.warning("Failed to lookup variable consolidation: %s", e)
+    return None
+
+
+def upsert_variable_consolidation(
+    org_id: str,
+    endpoint_slug: str,
+    scope_value: str,
+    consolidated_text: str,
+    raw_token_count: int,
+    consolidated_token_count: int,
+    variable_hash: str,
+) -> str | None:
+    """Create or update a variable consolidation record."""
+    try:
+        existing = get_variable_consolidation(org_id, endpoint_slug, scope_value, min_confidence=0.0)
+        if existing:
+            supabase.table("sm_variable_consolidations").update({
+                "consolidated_text": consolidated_text,
+                "raw_token_count": raw_token_count,
+                "consolidated_token_count": consolidated_token_count,
+                "variable_hash": variable_hash,
+                "confidence": min(1.0, existing.get("confidence", 0.5) + 0.1),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", existing["id"]).execute()
+            return existing["id"]
+        else:
+            r = supabase.table("sm_variable_consolidations").insert({
+                "org_id": org_id,
+                "endpoint_slug": endpoint_slug,
+                "scope_value": scope_value,
+                "consolidated_text": consolidated_text,
+                "raw_token_count": raw_token_count,
+                "consolidated_token_count": consolidated_token_count,
+                "confidence": 0.8,
+                "hit_count": 0,
+                "variable_hash": variable_hash,
+            }).execute()
+            if r.data and len(r.data) > 0:
+                return r.data[0]["id"]
+    except Exception as e:
+        logger.warning("Failed to upsert variable consolidation: %s", e)
+    return None
+
+
+def bump_variable_consolidation_hit(consolidation_id: str) -> None:
+    """Increment hit count when a variable consolidation is served."""
+    try:
+        rec = supabase.table("sm_variable_consolidations").select("hit_count, confidence").eq("id", consolidation_id).limit(1).execute()
+        if rec.data:
+            supabase.table("sm_variable_consolidations").update({
+                "hit_count": (rec.data[0].get("hit_count") or 0) + 1,
+                "confidence": min(1.0, (rec.data[0].get("confidence") or 0.5) + 0.05),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", consolidation_id).execute()
+    except Exception as e:
+        logger.warning("Failed to bump variable consolidation hit: %s", e)

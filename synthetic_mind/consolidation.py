@@ -22,6 +22,8 @@ from synthetic_mind.memory_store import (
     complete_consolidation_run,
     decay_confidence,
     upsert_kb_consolidation,
+    get_variable_consolidation,
+    upsert_variable_consolidation,
 )
 
 logger = logging.getLogger(__name__)
@@ -369,6 +371,12 @@ def consolidate_org(org_id: str) -> dict[str, int]:
     except Exception as e:
         logger.warning("Agent tool pattern consolidation failed for org %s: %s", org_id, e)
 
+    # Phase 4: consolidate variable data by scope
+    try:
+        _consolidate_variable_patterns(org_id, observations)
+    except Exception as e:
+        logger.warning("Variable pattern consolidation failed for org %s: %s", org_id, e)
+
     return stats
 
 
@@ -579,3 +587,119 @@ def _consolidate_agent_tool_patterns(org_id: str, observations: list[dict]) -> N
                 "confidence": min(1.0, 0.4 + len(repeated_calls) * 0.1),
             }
             upsert_memory_unit(unit)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Variable Consolidation by Scope
+# ---------------------------------------------------------------------------
+
+def _consolidate_variable_patterns(org_id: str, observations: list[dict]) -> None:
+    """
+    Find repeated variable payloads for the same scope_value and consolidate them.
+    When the same concert_id (or other scope) sends the same reviews 3+ times,
+    generate a compact summary that can replace the raw variable data.
+    """
+    # Group by (endpoint_slug, scope_value, variable_hash)
+    scope_groups: dict[tuple, list[dict]] = defaultdict(list)
+
+    for obs in observations:
+        metadata = obs.get("metadata") or {}
+        if isinstance(metadata, str):
+            continue
+        scope_value = metadata.get("scope_value")
+        variable_hash = metadata.get("variable_hash")
+        variable_chars = metadata.get("variable_chars", 0)
+        endpoint_slug = obs.get("endpoint_slug")
+
+        if not scope_value or not variable_hash or not endpoint_slug:
+            continue
+        if variable_chars < 200:
+            continue  # Too short to bother consolidating
+
+        key = (endpoint_slug, scope_value, variable_hash)
+        scope_groups[key].append(obs)
+
+    for (endpoint_slug, scope_value, variable_hash), obs_group in scope_groups.items():
+        if len(obs_group) < 3:
+            continue  # Need 3+ hits before consolidating
+
+        # Check if consolidation already exists
+        existing = get_variable_consolidation(org_id, endpoint_slug, scope_value, min_confidence=0.0)
+        if existing and existing.get("variable_hash") == variable_hash:
+            continue  # Already consolidated with same content
+
+        # Use the input_summary from observations to build consolidated version
+        # The input_summary contains the truncated variable content
+        input_summaries = [o.get("input_summary", "") for o in obs_group if o.get("input_summary")]
+        if not input_summaries:
+            continue
+
+        # Use the longest input_summary as representative content
+        representative = max(input_summaries, key=len)
+        raw_chars = obs_group[0].get("metadata", {}).get("variable_chars", len(representative))
+        raw_token_count = max(1, raw_chars // 4)
+
+        # Call gpt-4o-mini to consolidate the variable content
+        summary = _call_variable_consolidator(representative, raw_chars)
+        if not summary:
+            continue
+
+        consolidated_token_count = max(1, len(summary) // 4)
+
+        # Only store if we save at least 40% of tokens
+        if consolidated_token_count > raw_token_count * 0.6:
+            continue
+
+        upsert_variable_consolidation(
+            org_id=org_id,
+            endpoint_slug=endpoint_slug,
+            scope_value=scope_value,
+            consolidated_text=summary,
+            raw_token_count=raw_token_count,
+            consolidated_token_count=consolidated_token_count,
+            variable_hash=variable_hash,
+        )
+
+        logger.info(
+            "Variable consolidation created: %s/%s, %d→%d tokens, org=%s",
+            endpoint_slug, scope_value[:20],
+            raw_token_count, consolidated_token_count, org_id[:8],
+        )
+
+
+def _call_variable_consolidator(content: str, raw_chars: int) -> Optional[str]:
+    """Call gpt-4o-mini to compress variable content into a consolidated summary."""
+    import os
+    api_key = os.environ.get("SYSTEM_OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        target_chars = max(150, raw_chars // 3)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Compress the following content into about {target_chars} characters. "
+                        "This is variable data being sent to an LLM. Your summary will REPLACE "
+                        "the original content in future calls. Preserve ALL key facts, names, "
+                        "numbers, sentiments, specific details, and complaints. "
+                        "Be precise and factual — do not generalize or lose specifics. "
+                        "Format as a dense but readable summary."
+                    ),
+                },
+                {"role": "user", "content": content},
+            ],
+            max_tokens=target_chars // 3,
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("Variable consolidation summarizer failed: %s", e)
+        return None

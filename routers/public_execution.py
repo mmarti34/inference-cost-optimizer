@@ -9,10 +9,13 @@ Enterprise org-scoped routing: org_slug identifies the tenant; API key must belo
 - Every request (success or failure) is logged to api_request_log for metrics.
 """
 import asyncio
+import logging
 import re
 import time
 import uuid
 from fastapi import APIRouter, HTTPException, Header, Request
+
+logger = logging.getLogger(__name__)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -359,6 +362,44 @@ async def public_execute(
             _sm_scope_key = graph_json.get("sm_scope_key")
         if _sm_scope_key and variables and isinstance(variables, dict):
             _sm_scope_value = str(variables.get(_sm_scope_key, "")).strip() or None
+
+        # 7d. SM Phase 4: replace large variable content with consolidated summary
+        # When a scope_value is resolved and we have a consolidation for it,
+        # swap out the raw variable data with the compact summary. This is where
+        # token savings happen for non-KB, non-chat workflows (e.g. concert reviews).
+        _sm_vars_replaced = False
+        if _sm_scope_value and variables and isinstance(variables, dict):
+            try:
+                from synthetic_mind.memory_store import get_variable_consolidation, bump_variable_consolidation_hit
+                _vc = get_variable_consolidation(ctx.org_id, dep_slug, _sm_scope_value)
+                if _vc and _vc.get("consolidated_text"):
+                    # Find the largest non-scope variable and replace it
+                    _largest_var = None
+                    _largest_len = 0
+                    for vk, vv in variables.items():
+                        if vk == _sm_scope_key or vk.startswith("_sm_"):
+                            continue
+                        vlen = len(str(vv))
+                        if vlen > _largest_len and vlen > 200:
+                            _largest_var = vk
+                            _largest_len = vlen
+                    if _largest_var:
+                        _raw_tokens = max(1, _largest_len // 4)
+                        _cons_tokens = max(1, len(_vc["consolidated_text"]) // 4)
+                        # Only replace if it actually saves tokens (>30%)
+                        if _cons_tokens < _raw_tokens * 0.7:
+                            variables = dict(variables)
+                            variables[_largest_var] = _vc["consolidated_text"]
+                            _sm_vars_replaced = True
+                            bump_variable_consolidation_hit(_vc["id"])
+                            logger.info(
+                                "SM variable consolidation: %s=%s, %d→%d tokens (%d%% saved)",
+                                _sm_scope_key, _sm_scope_value[:20],
+                                _raw_tokens, _cons_tokens,
+                                int((1 - _cons_tokens / max(_raw_tokens, 1)) * 100),
+                            )
+            except Exception:
+                pass  # Never block execution for SM failures
 
         # 7b. Conversation: load history and build prefix when conversation_id is set
         conversation_prefix = None
