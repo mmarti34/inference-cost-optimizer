@@ -557,6 +557,23 @@ async def public_execute(
         # ── Synthetic Mind: observe this request/response asynchronously ──
         _node_results = result.get("node_results") or []
         _first_ai = next((n for n in _node_results if n.get("type") in ("ai-step", "model")), None)
+
+        # SM Phase 4: capture the actual variable content for consolidation.
+        # input_text is often just a command ("summarize"); the real data lives in variables.
+        _sm_variable_content = None
+        if _sm_scope_value and variables and isinstance(variables, dict):
+            _largest_var = None
+            _largest_len = 0
+            for vk, vv in variables.items():
+                if vk == _sm_scope_key or vk.startswith("_sm_"):
+                    continue
+                vlen = len(str(vv))
+                if vlen > _largest_len and vlen > 200:
+                    _largest_var = vk
+                    _largest_len = vlen
+            if _largest_var:
+                _sm_variable_content = str(variables[_largest_var])[:5000]
+
         asyncio.create_task(
             sm_observe_request(
                 request_id=request_id,
@@ -575,6 +592,7 @@ async def public_execute(
                 success=True,
                 scope_key=_sm_scope_key,
                 scope_value=_sm_scope_value,
+                variable_content=_sm_variable_content,
             )
         )
 

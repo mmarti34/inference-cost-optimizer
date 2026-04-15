@@ -628,14 +628,18 @@ def _consolidate_variable_patterns(org_id: str, observations: list[dict]) -> Non
         if existing and existing.get("variable_hash") == variable_hash:
             continue  # Already consolidated with same content
 
-        # Use the input_summary from observations to build consolidated version
-        # The input_summary contains the truncated variable content
-        input_summaries = [o.get("input_summary", "") for o in obs_group if o.get("input_summary")]
-        if not input_summaries:
+        # Use variable_text from metadata (the actual variable content, not input_summary
+        # which is just a truncated version of the command like "summarize")
+        variable_texts = [
+            (o.get("metadata") or {}).get("variable_text", "")
+            for o in obs_group
+            if (o.get("metadata") or {}).get("variable_text")
+        ]
+        if not variable_texts:
             continue
 
-        # Use the longest input_summary as representative content
-        representative = max(input_summaries, key=len)
+        # Use the longest variable text as representative content
+        representative = max(variable_texts, key=len)
         raw_chars = obs_group[0].get("metadata", {}).get("variable_chars", len(representative))
         raw_token_count = max(1, raw_chars // 4)
 

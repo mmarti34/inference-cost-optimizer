@@ -133,6 +133,7 @@ def build_observation(
     error_message: Optional[str] = None,
     scope_key: Optional[str] = None,
     scope_value: Optional[str] = None,
+    variable_content: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build an observation record ready for DB insertion."""
 
@@ -157,15 +158,19 @@ def build_observation(
     kb_asset_ids = _extract_kb_asset_ids(node_results)
     agent_tool_calls = _extract_agent_tool_calls(node_results)
 
-    # SM v2 Phase 4: capture variable content hash + char count for variable consolidation
-    # When scope_key is set, we track the variable data so the consolidation engine
-    # can detect repeated large variable payloads and consolidate them.
+    # SM v2 Phase 4: capture variable content hash + char count for variable consolidation.
+    # variable_content is the actual data (e.g. reviews) — NOT input_text which is just
+    # the command ("summarize"). We hash the variable content and store a generous
+    # truncation so the consolidation engine can generate summaries.
     variable_chars = 0
     variable_hash = None
-    if scope_value and input_text:
-        variable_chars = len(input_text)
+    variable_text = None
+    if scope_value and variable_content:
+        variable_chars = len(variable_content)
         import hashlib as _hl
-        variable_hash = _hl.sha256(input_text.encode()).hexdigest()[:16]
+        variable_hash = _hl.sha256(variable_content.encode()).hexdigest()[:16]
+        # Store up to 3000 chars of the actual variable content for consolidation
+        variable_text = variable_content[:3000]
 
     return {
         "id": str(uuid.uuid4()),
@@ -197,6 +202,7 @@ def build_observation(
             "scope_value": scope_value,
             "variable_hash": variable_hash,
             "variable_chars": variable_chars,
+            "variable_text": variable_text,
         },
     }
 
@@ -325,6 +331,7 @@ async def observe_request(
     error_message: Optional[str] = None,
     scope_key: Optional[str] = None,
     scope_value: Optional[str] = None,
+    variable_content: Optional[str] = None,
 ) -> None:
     """
     Async entry point — build observation and persist.
@@ -350,6 +357,7 @@ async def observe_request(
         error_message=error_message,
         scope_key=scope_key,
         scope_value=scope_value,
+        variable_content=variable_content,
     )
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _save_observation_sync, obs)
