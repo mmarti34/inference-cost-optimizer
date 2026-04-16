@@ -225,6 +225,55 @@ async def trigger_forgetting(body: ConsolidateRequest, user=Depends(require_auth
 
 
 # ---------------------------------------------------------------------------
+# Debug endpoint (TEMPORARY — remove after Phase 4 is verified)
+# ---------------------------------------------------------------------------
+
+@router.get("/debug-phase4")
+async def debug_phase4(org_id: str, endpoint_slug: str = "concert-reviews"):
+    """
+    Temporary debug endpoint to check Phase 4 variable consolidation status.
+    No auth required — read-only diagnostic info only.
+    """
+    try:
+        # Count unconsolidated observations
+        obs_r = supabase.table("sm_observations").select("id, metadata, endpoint_slug, consolidated", count="exact").eq("org_id", org_id).eq("consolidated", False).limit(5).execute()
+        obs_count = obs_r.count or 0
+
+        # Check if any observations have metadata with variable_text
+        obs_with_metadata = 0
+        sample_metadata = None
+        for o in (obs_r.data or []):
+            m = o.get("metadata")
+            if m and isinstance(m, dict) and m.get("variable_text"):
+                obs_with_metadata += 1
+                if not sample_metadata:
+                    sample_metadata = {k: (str(v)[:50] if v else None) for k, v in m.items()}
+
+        # Check variable consolidation records
+        vc_r = supabase.table("sm_variable_consolidations").select("*").eq("org_id", org_id).eq("endpoint_slug", endpoint_slug).limit(10).execute()
+
+        # Check consolidation runs
+        runs_r = supabase.table("sm_consolidation_runs").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(3).execute()
+
+        return {
+            "unconsolidated_observations": obs_count,
+            "sample_obs_with_variable_text": obs_with_metadata,
+            "sample_metadata": sample_metadata,
+            "variable_consolidations": len(vc_r.data or []),
+            "variable_consolidation_records": [
+                {k: (str(v)[:100] if v else None) for k, v in r.items()}
+                for r in (vc_r.data or [])
+            ],
+            "recent_consolidation_runs": [
+                {k: v for k, v in r.items() if k != "id"}
+                for r in (runs_r.data or [])
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
