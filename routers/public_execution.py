@@ -371,7 +371,9 @@ async def public_execute(
         if _sm_scope_value and variables and isinstance(variables, dict):
             try:
                 from synthetic_mind.memory_store import get_variable_consolidation, bump_variable_consolidation_hit
+                logger.info("SM Phase 4 lookup: org=%s, slug=%s, scope=%s", ctx.org_id[:8], dep_slug, _sm_scope_value[:30])
                 _vc = get_variable_consolidation(ctx.org_id, dep_slug, _sm_scope_value)
+                logger.info("SM Phase 4 result: %s", "FOUND" if _vc else "NOT FOUND")
                 if _vc and _vc.get("consolidated_text"):
                     # Find the largest non-scope variable and replace it
                     _largest_var = None

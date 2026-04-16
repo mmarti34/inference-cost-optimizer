@@ -599,12 +599,22 @@ def _consolidate_variable_patterns(org_id: str, observations: list[dict]) -> Non
     When the same concert_id (or other scope) sends the same reviews 3+ times,
     generate a compact summary that can replace the raw variable data.
     """
+    logger.info("Phase 4: checking %d observations for variable patterns", len(observations))
+
     # Group by (endpoint_slug, scope_value, variable_hash)
     scope_groups: dict[tuple, list[dict]] = defaultdict(list)
+
+    _skipped_no_metadata = 0
+    _skipped_no_scope = 0
+    _skipped_short = 0
 
     for obs in observations:
         metadata = obs.get("metadata") or {}
         if isinstance(metadata, str):
+            _skipped_no_metadata += 1
+            continue
+        if not metadata:
+            _skipped_no_metadata += 1
             continue
         scope_value = metadata.get("scope_value")
         variable_hash = metadata.get("variable_hash")
@@ -612,21 +622,34 @@ def _consolidate_variable_patterns(org_id: str, observations: list[dict]) -> Non
         endpoint_slug = obs.get("endpoint_slug")
 
         if not scope_value or not variable_hash or not endpoint_slug:
+            _skipped_no_scope += 1
             continue
         if variable_chars < 200:
-            continue  # Too short to bother consolidating
+            _skipped_short += 1
+            continue
 
         key = (endpoint_slug, scope_value, variable_hash)
         scope_groups[key].append(obs)
 
+    logger.info(
+        "Phase 4: %d scope groups found (skipped: %d no-metadata, %d no-scope, %d short)",
+        len(scope_groups), _skipped_no_metadata, _skipped_no_scope, _skipped_short,
+    )
+
     for (endpoint_slug, scope_value, variable_hash), obs_group in scope_groups.items():
+        logger.info(
+            "Phase 4: group (%s, %s, %s) has %d observations",
+            endpoint_slug, scope_value[:30], variable_hash[:8], len(obs_group),
+        )
         if len(obs_group) < 3:
-            continue  # Need 3+ hits before consolidating
+            logger.info("Phase 4: skipping group — only %d hits (need 3+)", len(obs_group))
+            continue
 
         # Check if consolidation already exists
         existing = get_variable_consolidation(org_id, endpoint_slug, scope_value, min_confidence=0.0)
         if existing and existing.get("variable_hash") == variable_hash:
-            continue  # Already consolidated with same content
+            logger.info("Phase 4: skipping group — already consolidated")
+            continue
 
         # Use variable_text from metadata (the actual variable content, not input_summary
         # which is just a truncated version of the command like "summarize")
@@ -636,6 +659,7 @@ def _consolidate_variable_patterns(org_id: str, observations: list[dict]) -> Non
             if (o.get("metadata") or {}).get("variable_text")
         ]
         if not variable_texts:
+            logger.info("Phase 4: skipping group — no variable_text in metadata")
             continue
 
         # Use the longest variable text as representative content
@@ -644,14 +668,22 @@ def _consolidate_variable_patterns(org_id: str, observations: list[dict]) -> Non
         raw_token_count = max(1, raw_chars // 4)
 
         # Call gpt-4o-mini to consolidate the variable content
+        logger.info("Phase 4: calling gpt-4o-mini for %s/%s (%d chars)", endpoint_slug, scope_value[:20], raw_chars)
         summary = _call_variable_consolidator(representative, raw_chars)
         if not summary:
+            logger.warning("Phase 4: gpt-4o-mini returned no summary for %s/%s", endpoint_slug, scope_value[:20])
             continue
 
         consolidated_token_count = max(1, len(summary) // 4)
+        logger.info(
+            "Phase 4: consolidation result for %s/%s: %d→%d tokens (%.0f%% reduction)",
+            endpoint_slug, scope_value[:20], raw_token_count, consolidated_token_count,
+            (1 - consolidated_token_count / max(raw_token_count, 1)) * 100,
+        )
 
         # Only store if we save at least 40% of tokens
         if consolidated_token_count > raw_token_count * 0.6:
+            logger.info("Phase 4: skipping — not enough savings (need 40%%)")
             continue
 
         upsert_variable_consolidation(

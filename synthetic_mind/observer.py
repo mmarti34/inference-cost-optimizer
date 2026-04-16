@@ -272,7 +272,7 @@ def _extract_agent_tool_calls(node_results: list[dict] | None) -> list[dict]:
 
 # Auto-consolidation threshold: consolidate after this many unconsolidated
 # observations accumulate for an org. Keeps the mind fresh without manual triggers.
-AUTO_CONSOLIDATE_THRESHOLD = 50
+AUTO_CONSOLIDATE_THRESHOLD = 10
 
 
 def _save_observation_sync(obs: dict[str, Any]) -> None:
