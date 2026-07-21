@@ -54,6 +54,7 @@ class CallToMigrate(BaseModel):
     file_path: str
     code_snippet: str
     line_number: int
+    endpoint_slug: Optional[str] = None
 
 
 class MigrateRequest(BaseModel):
@@ -89,6 +90,31 @@ def _github_headers(token: str) -> dict:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def _slugify(name: str) -> str:
+    """Match the frontend/public-endpoint org-slug fallback: trim, lower,
+    whitespace -> '-', drop non [a-z0-9-], collapse '-', strip leading/trailing '-'.
+    Must stay in sync with routers/public_execution._slugify so generated
+    endpoint URLs resolve."""
+    if not name:
+        return ""
+    s = name.strip().lower()
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9-]", "", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def _slug_from_path(file_path: str) -> str:
+    """Derive a default endpoint slug from a file path, e.g.
+    ``services/ai_service.ts`` -> ``ai-service``."""
+    file_name = file_path.rsplit("/", 1)[-1]
+    without_ext = re.sub(r"\.[^.]+$", "", file_name)
+    # camelCase -> hyphen
+    without_ext = re.sub(r"([a-z])([A-Z])", r"\1-\2", without_ext)
+    slug = _slugify(without_ext.replace("_", "-"))
+    return slug or "endpoint"
 
 
 # Patterns to detect AI SDK call sites
@@ -497,8 +523,11 @@ def _find_calls_in_content(file_path: str, content: str) -> list[dict]:
                     end = min(len(content), match.end() + 200)
                     full_snippet = content[start:end]
                 else:
+                    # _extract_call_block returns content[paren_pos : end + 1],
+                    # so the call ends at paren_pos + len(snippet). Slice from the
+                    # match start (the call name) to that end — no off-by-one.
                     snippet = _extract_call_block(content, paren_pos)
-                    full_snippet = content[match.start() : match.start() + len(match.group()) + len(snippet)]
+                    full_snippet = content[match.start() : paren_pos + len(snippet)]
 
             model = _extract_model_from_snippet(full_snippet)
 
@@ -731,7 +760,11 @@ def _generate_replacement_code(
     become manageable, versionable, and A/B-testable without code
     deploys.
     """
-    url = endpoint_url or f"https://api.optiml.one/api/public/execute/{deployment_id}"
+    # NOTE: The public production route is POST /api/public/{org_slug}/{endpoint_slug}.
+    # Callers must pass endpoint_url built with that scheme. The fallback below
+    # treats deployment_id as an endpoint slug only so we never emit a completely
+    # invalid URL, but callers should always supply endpoint_url.
+    url = endpoint_url or f"https://api.optiml.one/api/public/{deployment_id}"
 
     # ── HTTP function replacement (e.g. sendRequest in Swift) ──────────
     # When we detect a full function that uses a URL variable to make
@@ -841,6 +874,69 @@ def _generate_replacement_code(
                 f'}});\n'
                 f'const {{ final_output }} = await response.json();'
             )
+
+
+def _build_migration_graph(
+    provider: str,
+    model: str,
+    system_prompt: str,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> tuple[dict, list]:
+    """Build a workflow graph identical in shape to what the Studio workflow
+    builder produces for a chat assistant (input -> ai-step -> output).
+
+    Node IDs, node types and ``data`` keys mirror
+    ``lib/workflowTemplates.chatAssistantGraph`` and are what
+    ``workflow_runtime.execute_workflow`` reads:
+
+    - the ``input`` node just carries the caller's ``input_text``;
+    - the ``ai-step`` node reads ``taskDescription`` / ``systemInstructions`` /
+      ``provider`` / ``modelName`` and substitutes ``{{input}}`` with the
+      caller's ``input_text`` at execution time;
+    - the ``output`` node returns ``final_output``.
+
+    Returns ``(graph_json, variables)``. Variables stay empty because the
+    public endpoint drives execution with ``input_text`` (not named vars),
+    matching the generated migration code which POSTs ``{"input_text": ...}``.
+    """
+    prov = (provider or "openai").lower().replace(" ", "") or "openai"
+    graph = {
+        "nodes": [
+            {
+                "id": "input-1",
+                "type": "input",
+                "position": {"x": 50, "y": 200},
+                "data": {"label": "user message"},
+            },
+            {
+                "id": "ai-step-1",
+                "type": "ai-step",
+                "position": {"x": 300, "y": 200},
+                "data": {
+                    "taskDescription": "{{input}}",
+                    "provider": prov,
+                    "modelName": model or "gpt-4o",
+                    "systemInstructions": system_prompt or "",
+                    "temperature": temperature if temperature is not None else 0.7,
+                    "maxTokens": max_tokens or 1024,
+                    "outputFormat": "text",
+                },
+            },
+            {
+                "id": "output-1",
+                "type": "output",
+                "position": {"x": 550, "y": 200},
+                "data": {"label": "response", "response_format": "auto"},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": "input-1", "target": "ai-step-1"},
+            {"id": "e2", "source": "ai-step-1", "target": "output-1"},
+        ],
+    }
+    variables: list = []
+    return graph, variables
 
 
 # ---------------------------------------------------------------------------
@@ -1170,15 +1266,81 @@ async def github_migrate(
             create_ref_resp.raise_for_status()
 
             # ------------------------------------------------------------------
-            # 3. Process each call: parse → create workflow → create deployment
+            # 3. Resolve the org slug (for building public endpoint URLs) and a
+            #    project to attach the migrated workflows to.
+            # ------------------------------------------------------------------
+            org_slug = _slugify(org_id) or org_id
+            try:
+                org_row = (
+                    supabase.table("organizations")
+                    .select("slug, name")
+                    .eq("id", org_id)
+                    .single()
+                    .execute()
+                )
+                if org_row.data:
+                    org_slug = (
+                        (org_row.data.get("slug") or "").strip()
+                        or _slugify(org_row.data.get("name") or "")
+                        or org_id
+                    )
+            except Exception as e:
+                logger.warning("Could not resolve org slug for %s (%s); using org_id", org_id, e)
+
+            project_id: Optional[str] = None
+            try:
+                proj = (
+                    supabase.table("projects")
+                    .select("id")
+                    .eq("org_id", org_id)
+                    .limit(1)
+                    .execute()
+                )
+                if proj.data:
+                    project_id = proj.data[0]["id"]
+                else:
+                    new_proj = (
+                        supabase.table("projects")
+                        .insert({"org_id": org_id, "name": "GitHub Migration"})
+                        .execute()
+                    )
+                    if new_proj.data:
+                        project_id = new_proj.data[0]["id"]
+            except Exception as e:
+                logger.error("Could not resolve/create project for org %s: %s", org_id, e)
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "Could not resolve a project to hold the migrated workflows."},
+                )
+
+            # Seed slug set with existing endpoint slugs so we never collide with
+            # an already-deployed endpoint in this org.
+            used_slugs: set[str] = set()
+            try:
+                existing_deps = (
+                    supabase.table("workflow_deployments")
+                    .select("endpoint_slug")
+                    .eq("org_id", org_id)
+                    .execute()
+                )
+                for row in (existing_deps.data or []):
+                    s = (row.get("endpoint_slug") or "").strip()
+                    if s:
+                        used_slugs.add(s)
+            except Exception:
+                pass
+
+            # ------------------------------------------------------------------
+            # 4. Process each call: parse → create workflow → promote deployment
             #    → generate replacement code
             # ------------------------------------------------------------------
             workflows_created = 0
+            now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             # Group changes by file path so we update each file once
             file_changes: dict[str, list[tuple[CallToMigrate, str]]] = {}
 
             for call in body.calls_to_migrate:
-                # 3a. Parse the snippet using the existing parse logic
+                # 4a. Parse the snippet using the existing parse logic
                 extracted = _extract_config_from_snippet(call.code_snippet)
 
                 try:
@@ -1186,6 +1348,14 @@ async def github_migrate(
                     parse_body = json.loads(parse_resp.body.decode())
                 except Exception as e:
                     logger.warning("Parse failed for %s:%s — %s, using regex extraction", call.file_path, call.line_number, e)
+                    parse_body = {}
+
+                if not parse_body or "error" in parse_body:
+                    if parse_body.get("error"):
+                        logger.warning(
+                            "Parse error for %s:%s — %s, using regex extraction",
+                            call.file_path, call.line_number, parse_body["error"],
+                        )
                     parse_body = {
                         "provider": extracted.get("provider", "openai"),
                         "model": extracted.get("model", "gpt-4o"),
@@ -1193,77 +1363,78 @@ async def github_migrate(
                         "temperature": extracted.get("temperature"),
                         "max_tokens": extracted.get("max_tokens"),
                         "suggestedName": f"migrated-call-{workflows_created + 1}",
-                        "api_type": "chat",
                     }
 
-                if "error" in parse_body:
-                    logger.warning(
-                        "Parse error for %s:%s — %s, using regex extraction",
-                        call.file_path, call.line_number, parse_body["error"],
-                    )
-                    parse_body = {
-                        "provider": extracted.get("provider", "openai"),
-                        "model": extracted.get("model", "gpt-4o"),
-                        "system_prompt": extracted.get("system_prompt", ""),
-                        "temperature": extracted.get("temperature"),
-                        "max_tokens": extracted.get("max_tokens"),
-                        "suggestedName": f"migrated-call-{workflows_created + 1}",
-                        "api_type": "chat",
-                    }
+                provider = parse_body.get("provider") or "openai"
+                model = parse_body.get("model") or "gpt-4o"
+                system_prompt = parse_body.get("system_prompt") or ""
+                temperature = parse_body.get("temperature")
+                max_tokens = parse_body.get("max_tokens")
+                suggested_name = parse_body.get("suggestedName") or f"migrated-call-{workflows_created + 1}"
 
-                suggested_name = parse_body.get("suggestedName", f"migrated-call-{workflows_created + 1}")
-                api_type = parse_body.get("api_type", "chat")
+                # 4b. Resolve a unique endpoint slug (client-provided or derived)
+                base_slug = _slugify(call.endpoint_slug or "") or _slug_from_path(call.file_path)
+                endpoint_slug = base_slug
+                _n = 2
+                while endpoint_slug in used_slugs:
+                    endpoint_slug = f"{base_slug}-{_n}"
+                    _n += 1
+                used_slugs.add(endpoint_slug)
 
-                # 3b. Create a workflow in Supabase
+                # 4c. Build a runtime-compatible graph and create the workflow
+                graph_json, variables = _build_migration_graph(
+                    provider, model, system_prompt, temperature, max_tokens,
+                )
                 workflow_data = {
                     "org_id": org_id,
+                    "project_id": project_id,
                     "name": suggested_name,
-                    "description": f"Auto-migrated from {repo} — {call.file_path}:{call.line_number}",
-                    "graph": {
-                        "nodes": [
-                            {"id": "input", "type": "input"},
-                            {
-                                "id": "ai-step",
-                                "type": "ai",
-                                "config": {
-                                    "provider": parse_body.get("provider", "openai"),
-                                    "model": parse_body.get("model", "gpt-4o"),
-                                    "system_prompt": parse_body.get("system_prompt", ""),
-                                    "temperature": parse_body.get("temperature"),
-                                    "max_tokens": parse_body.get("max_tokens"),
-                                    "api_type": api_type,
-                                },
-                            },
-                        ],
-                        "edges": [{"from": "input", "to": "ai-step"}],
-                    },
-                    "status": "active",
-                    "created_by": auth_user.user_id,
+                    "slug": _slugify(suggested_name) or endpoint_slug,
+                    "graph_json": graph_json,
+                    "variables": variables,
                 }
 
-                wf_result = supabase.table("workflows").insert(workflow_data).execute()
+                try:
+                    wf_result = supabase.table("workflows").insert(workflow_data).execute()
+                except Exception as e:
+                    logger.error("Failed to create workflow for %s:%s — %s", call.file_path, call.line_number, e)
+                    continue
                 if not wf_result.data:
                     logger.error("Failed to create workflow for %s:%s", call.file_path, call.line_number)
                     continue
 
                 workflow_id = wf_result.data[0]["id"]
-                workflows_created += 1
 
-                # 3c. Create a deployment for the workflow
+                # 4d. Create a promoted deployment so the endpoint is live
+                #     immediately. The public route
+                #     (POST /api/public/{org_slug}/{endpoint_slug}) only serves
+                #     deployments with status='promoted'.
                 deployment_data = {
                     "workflow_id": workflow_id,
                     "org_id": org_id,
-                    "status": "active",
-                    "created_by": auth_user.user_id,
+                    "version": 1,
+                    "endpoint_slug": endpoint_slug,
+                    "graph_json": graph_json,
+                    "status": "promoted",
+                    "promoted_at": now_iso,
                 }
+                if project_id is not None:
+                    deployment_data["project_id"] = project_id
 
-                dep_result = supabase.table("deployments").insert(deployment_data).execute()
-                deployment_id = dep_result.data[0]["id"] if dep_result.data else workflow_id
+                try:
+                    supabase.table("workflow_deployments").insert(deployment_data).execute()
+                except Exception as e:
+                    logger.error("Failed to create deployment for %s:%s — %s", call.file_path, call.line_number, e)
+                    continue
 
-                # 3d. Generate replacement code
+                workflows_created += 1
+
+                # 4e. Generate replacement code pointing at the live endpoint
+                endpoint_url = f"https://api.optiml.one/api/public/{org_slug}/{endpoint_slug}"
                 language = _detect_language(call.file_path)
                 replacement = _generate_replacement_code(
-                    call.code_snippet, workflow_id, deployment_id, language,
+                    call.code_snippet, workflow_id, endpoint_slug, language,
+                    endpoint_url=endpoint_url,
                 )
 
                 file_changes.setdefault(call.file_path, []).append((call, replacement))
