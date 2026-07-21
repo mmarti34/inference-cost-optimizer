@@ -18,6 +18,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends
@@ -945,21 +946,29 @@ def _build_migration_graph(
 
 
 @router.get("/github/auth-url")
-async def github_auth_url():
-    """Return a GitHub OAuth authorization URL."""
+async def github_auth_url(redirect_path: str = "/"):
+    """Return a GitHub OAuth authorization URL.
+
+    `redirect_path` is the in-app path the user should land back on after the
+    OAuth round-trip (e.g. "/quick-deploy"). It is encoded into the OAuth
+    `state` param — which GitHub echoes back to our callback — so the callback
+    can return the user to where they started instead of always the homepage.
+    """
     if not GITHUB_CLIENT_ID:
         return JSONResponse(
             status_code=503,
             content={"error": "GitHub OAuth is not configured (GITHUB_CLIENT_ID missing)."},
         )
 
-    state = str(uuid.uuid4())
+    # Only allow same-origin relative paths to prevent open-redirects.
+    safe_path = redirect_path if redirect_path.startswith("/") and not redirect_path.startswith("//") else "/"
+    state = f"{uuid.uuid4().hex}::{safe_path}"
     url = (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
         f"&redirect_uri={GITHUB_REDIRECT_URI}"
         f"&scope=repo"
-        f"&state={state}"
+        f"&state={quote(state, safe='')}"
     )
     return {"auth_url": url, "state": state}
 
