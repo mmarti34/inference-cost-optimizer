@@ -666,12 +666,15 @@ _AGENT_SYSTEM_TEMPLATE = (
 
 class ToolYieldRequest:
     """Represents a pending client-side tool execution waiting for external result."""
-    __slots__ = ("yield_id", "tool_name", "arguments", "event", "result", "latency_ms")
+    __slots__ = ("yield_id", "tool_name", "arguments", "event", "result", "latency_ms", "org_id")
 
-    def __init__(self, yield_id: str, tool_name: str, arguments: dict):
+    def __init__(self, yield_id: str, tool_name: str, arguments: dict, org_id: str | None = None):
         self.yield_id = yield_id
         self.tool_name = tool_name
         self.arguments = arguments
+        # Tenant this yield belongs to. The resume endpoint refuses a caller
+        # whose API key is scoped to a different org.
+        self.org_id = org_id
         self.event = threading.Event()
         self.result: str = ""
         self.latency_ms: int = 0
@@ -686,15 +689,22 @@ _yield_lock = threading.Lock()
 _TOOL_YIELD_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
-def resume_tool_yield(yield_id: str, result: str, latency_ms: int = 0) -> bool:
+def resume_tool_yield(yield_id: str, result: str, latency_ms: int = 0, org_id: str | None = None) -> bool:
     """Resume a pending client-side tool yield with the external result.
 
     Called by the POST /api/public/tool-result/{yield_id} endpoint.
     Returns True if the yield_id was found and resumed.
+
+    When ``org_id`` is supplied (the org the caller's API key is scoped to) it
+    must match the org the yield was created for, so an authenticated caller
+    from one tenant cannot feed a result into another tenant's paused agent.
     """
     with _yield_lock:
         req = _pending_tool_yields.get(yield_id)
     if not req:
+        return False
+    if org_id is not None and req.org_id is not None and str(req.org_id) != str(org_id):
+        _logger.warning("Cross-tenant tool-result rejected for yield_id=%s", yield_id)
         return False
     req.result = result
     req.latency_ms = latency_ms
@@ -842,7 +852,7 @@ def _execute_agent_node(node_id: str, node: dict, prompt_text: str, org_id: str,
                 return err, 0
 
             yield_id = str(_uuid_mod.uuid4())
-            yield_req = ToolYieldRequest(yield_id, name, arguments)
+            yield_req = ToolYieldRequest(yield_id, name, arguments, org_id=org_id)
             with _yield_lock:
                 _pending_tool_yields[yield_id] = yield_req
 
@@ -1055,141 +1065,20 @@ def _execute_model_node_safe(node_id: str, node: dict, prompt_text: str, org_id:
 OPTIMIZER_THRESHOLD = 25
 
 
-def _infer_provider(model: str) -> str:
-    """Infer provider from model name."""
-    m = (model or "").strip().lower()
-    if m.startswith("gpt") or m.startswith("o1") or m.startswith("o3"):
-        return "openai"
-    if m.startswith("claude"):
-        return "anthropic"
-    if m.startswith("gemini"):
-        return "gemini"
-    if m.startswith("mistral") or m.startswith("mixtral"):
-        return "mistral"
-    if m.startswith("command"):
-        return "cohere"
-    return "openai"
-
-
-def _get_model_performance_history(org_id: str, workflow_id: str, limit: int = 200) -> list[dict]:
-    """
-    Get historical AI step results for this workflow from workflow_runs.node_results.
-    Returns list of { "model", "provider", "cost", "latency_ms", "error" }.
-    """
-    if not workflow_id or not org_id:
-        return []
-    history: list[dict] = []
-    try:
-        resp = (
-            supabase.table("workflow_runs")
-            .select("node_results,created_at")
-            .eq("org_id", org_id)
-            .eq("workflow_id", workflow_id)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-    except Exception:
-        return []
-    data = getattr(resp, "data", None) or []
-    for run in data:
-        node_results = run.get("node_results") or []
-        if not isinstance(node_results, list):
-            continue
-        for step in node_results:
-            if not isinstance(step, dict):
-                continue
-            stype = (step.get("type") or "").lower()
-            if stype not in ("ai-step", "model", "optimizer", "tool_call"):
-                continue
-            model = step.get("model")
-            if not model:
-                continue
-            cost = float(step.get("cost_usd") or step.get("cost") or 0)
-            latency_ms = int(step.get("latency_ms") or 0)
-            provider = (step.get("provider") or _infer_provider(model)).strip().lower()
-            err = step.get("error") or (step.get("status") == "error")
-            history.append({
-                "model": str(model).strip(),
-                "provider": provider,
-                "cost": cost,
-                "latency_ms": latency_ms,
-                "error": bool(err),
-            })
-    return history
-
-
-def _select_optimal_model(
-    history: list[dict],
-    priority: str,
-    max_cost: float | None,
-    max_latency: int | None,
-    allowed_models: list[str] | None,
-    excluded_models: list[str] | None,
-) -> tuple[str, str, str]:
-    """
-    Given historical performance and constraints, pick the best model.
-    Returns (model, provider, reason).
-    """
-    from collections import defaultdict
-
-    stats: dict[str, dict] = defaultdict(lambda: {"costs": [], "latencies": [], "errors": 0, "total": 0})
-    for h in history:
-        model = h.get("model") or ""
-        if not model:
-            continue
-        stats[model]["costs"].append(h.get("cost") or 0)
-        stats[model]["latencies"].append(h.get("latency_ms") or 0)
-        stats[model]["total"] += 1
-        if h.get("error"):
-            stats[model]["errors"] += 1
-
-    candidates = []
-    for model, s in stats.items():
-        if allowed_models and model not in allowed_models:
-            continue
-        if excluded_models and model in excluded_models:
-            continue
-        avg_cost = sum(s["costs"]) / len(s["costs"]) if s["costs"] else 999.0
-        avg_latency = int(sum(s["latencies"]) / len(s["latencies"])) if s["latencies"] else 99999
-        error_rate = (s["errors"] / s["total"]) if s["total"] > 0 else 1.0
-        if max_cost is not None and avg_cost > max_cost:
-            continue
-        if max_latency is not None and avg_latency > max_latency:
-            continue
-        if error_rate > 0.2:
-            continue
-        candidates.append({
-            "model": model,
-            "provider": _infer_provider(model),
-            "avg_cost": avg_cost,
-            "avg_latency": avg_latency,
-            "error_rate": error_rate,
-            "runs": s["total"],
-        })
-
-    if not candidates:
-        return ("gpt-4o-mini", "openai", "fallback: no candidates met constraints")
-
-    priority = (priority or "cheapest").lower()
-    if priority == "cheapest":
-        candidates.sort(key=lambda c: c["avg_cost"])
-        winner = candidates[0]
-        return (winner["model"], winner["provider"], f"cheapest at ${winner['avg_cost']:.4f}/call avg")
-    if priority == "fastest":
-        candidates.sort(key=lambda c: c["avg_latency"])
-        winner = candidates[0]
-        return (winner["model"], winner["provider"], f"fastest at {winner['avg_latency']}ms avg")
-    if priority == "quality":
-        candidates.sort(key=lambda c: (c["error_rate"], c["avg_latency"]))
-        winner = candidates[0]
-        return (
-            winner["model"],
-            winner["provider"],
-            f"highest quality at {int((1 - winner['error_rate']) * 100)}% success rate",
-        )
-    winner = candidates[0]
-    return (winner["model"], winner["provider"], "default selection")
+# ── Model performance history ───────────────────────────────────────────────
+# These three helpers MOVED to optimization/evidence.py so there is exactly one
+# implementation shared with the optimization layer's candidate generators.
+# They are imported back here under their original private names, so every
+# existing call site in this module keeps working unchanged.
+#
+# The import is local to avoid a cycle: optimization.benchmark imports
+# execute_workflow from this module, so optimization/__init__.py is kept
+# import-light and optimization.evidence imports nothing from here.
+from optimization.evidence import (  # noqa: E402
+    infer_provider as _infer_provider,
+    get_model_performance_history as _get_model_performance_history,
+    select_optimal_model as _select_optimal_model,
+)
 
 
 def _evaluate_condition(operator: str, value: str, previous_output: str) -> bool:
@@ -1206,27 +1095,51 @@ def _evaluate_condition(operator: str, value: str, previous_output: str) -> bool
     return False
 
 
-# Relative latency rank for "fastest" strategy (lower = faster). Unknown models get 999.
-_LATENCY_RANK: dict[str, int] = {
-    "gpt-3.5-turbo": 1,
-    "gpt-4o-mini": 2,
-    "claude-3-haiku": 1,
-    "claude-3-5-haiku": 1,
-    "gemini-1.5-flash": 1,
-    "mistral-3.1-small": 2,
-    "gpt-4o": 4,
-    "gpt-4-turbo": 3,
-    "claude-3-sonnet": 3,
-    "claude-3-5-sonnet": 3,
-    "claude-3-opus": 5,
-    "gpt-4": 4,
-    "gemini-1.5-pro": 3,
+# Relative latency rank for the "fastest" router strategy (lower = faster).
+#
+# This replaces a hardcoded 13-entry table of 2024-era model names whose ranks
+# were guesses and which had drifted out of date (it contained ids like
+# "mistral-3.1-small" that nothing in the app ever produces, while every dated
+# or newer model id fell through to the 999 bucket). The tier now comes from
+# the `category` field in shared/providers.json, which is maintained alongside
+# pricing, so adding a model keeps "fastest" working instead of silently
+# degrading it to "pick the first edge".
+#
+# This is still a coarse prior, not a measurement. Real per-model latency is
+# being collected in routing_latency_facts; when there is enough of it, rank
+# from observed p50 for the org and treat this as the cold-start fallback.
+_CATEGORY_LATENCY_RANK: dict[str, int] = {
+    "fast": 1,
+    "balanced": 2,
+    "flagship": 4,
+    "reasoning": 5,
 }
+_UNKNOWN_LATENCY_RANK = 999
 
 
 def _latency_rank(provider: str, model: str) -> int:
-    key = (model or "").strip().lower()
-    return _LATENCY_RANK.get(key, 999)
+    """Latency tier for (provider, model). Unknown models sort last."""
+    name = (model or "").strip()
+    if not name:
+        return _UNKNOWN_LATENCY_RANK
+    try:
+        from utils.pricing import get_all_providers, get_provider_for_model
+        prov = (provider or "").strip().lower() or (get_provider_for_model(name) or "")
+        models = (get_all_providers().get(prov) or {}).get("models") or {}
+        entry = models.get(name)
+        if entry is None:
+            lowered = name.lower()
+            for mid, spec in models.items():
+                if mid.lower() == lowered or lowered.startswith(mid.lower()):
+                    entry = spec
+                    break
+        if entry is None:
+            return _UNKNOWN_LATENCY_RANK
+        return _CATEGORY_LATENCY_RANK.get(
+            str(entry.get("category") or "").lower(), _UNKNOWN_LATENCY_RANK
+        )
+    except Exception:
+        return _UNKNOWN_LATENCY_RANK
 
 
 def _select_router_edge(edges: list[dict], nodes_by_id: dict, strategy: str, prompt_text: str) -> str | None:

@@ -3,7 +3,9 @@
 ## ✅ Your Connection Info is Ready!
 
 Your `.env` file now has:
-- `DATABASE_URL=postgresql://postgres:u8cByDlAeGNsZlQQ@db.lpofrfyozqjkjebpwmma.supabase.co:5432/postgres`
+- `DATABASE_URL=postgresql://postgres:<DB_PASSWORD>@db.<PROJECT_REF>.supabase.co:5432/postgres`
+  (copy the real value from Supabase → Project Settings → Database → Connection string.
+  Never commit it: this line previously held a live password in plaintext.)
 
 ## Option 1: Run in Supabase SQL Editor (EASIEST - 2 minutes)
 

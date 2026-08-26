@@ -8,26 +8,19 @@ from supabase_client import supabase
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from utils.usage_logger import log_usage
-from utils.pricing import get_pricing
+from utils.pricing import get_pricing, get_non_token_rate
 from utils.encryption import decrypt_api_key
 
 router = APIRouter()
 
-# DALL·E 3 approximate cost per image (USD) for usage logging; actual pricing may vary.
-DALLE3_STANDARD_1024_COST = 0.040
-DALLE3_HD_1024_COST = 0.080
-DALLE3_STANDARD_OTHER_COST = 0.080
-DALLE3_HD_OTHER_COST = 0.120
+# Non-token prices (images, audio, embeddings) live in shared/providers.json
+# under non_token_rates.openai and are read via get_non_token_rate(). The
+# second argument to each call is the historical constant, kept as a fallback
+# so behaviour is unchanged if the config section is missing.
 
-# TTS: ~$0.015/1K chars (tts-1), ~$0.030/1K (tts-1-hd). Approximate.
-TTS_COST_PER_1K_CHARS = 0.015
-# Whisper: ~$0.006/min. Approximate per second.
-WHISPER_COST_PER_SEC = 0.0001
 # Whisper API max file size 25 MB; use 24 MB to stay safe.
 WHISPER_MAX_FILE_BYTES = 24 * 1024 * 1024
 STT_REQUEST_TIMEOUT = 120.0
-# Embedding: text-embedding-3-small ~$0.00002/1K tokens.
-EMBEDDING_COST_PER_1K = 0.00002
 
 class PromptPayload(BaseModel):
     org_id: str
@@ -121,12 +114,15 @@ def handle_image_generation(payload: ImageGenerationPayload) -> dict:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     url = response.data[0].url if response.data else ""
     if model == "dall-e-2":
-        cost_usd = 0.020
+        cost_usd = get_non_token_rate("openai", "image.dall-e-2.per_image", 0.020)
     else:
-        if quality == "hd":
-            cost_usd = DALLE3_HD_1024_COST if size == "1024x1024" else DALLE3_HD_OTHER_COST
-        else:
-            cost_usd = DALLE3_STANDARD_1024_COST if size == "1024x1024" else DALLE3_STANDARD_OTHER_COST
+        tier = "hd" if quality == "hd" else "standard"
+        dim = "1024" if size == "1024x1024" else "other"
+        _fallbacks = {("hd", "1024"): 0.080, ("hd", "other"): 0.120,
+                      ("standard", "1024"): 0.040, ("standard", "other"): 0.080}
+        cost_usd = get_non_token_rate(
+            "openai", f"image.dall-e-3.{tier}.{dim}", _fallbacks[(tier, dim)]
+        )
     log_usage(
         None,
         "OpenAI",
@@ -154,7 +150,7 @@ def handle_tts(payload: TTSPayload) -> dict:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     b64 = base64.b64encode(b).decode("ascii")
     data_url = f"data:audio/mp3;base64,{b64}"
-    cost_usd = (len(text) / 1000.0) * TTS_COST_PER_1K_CHARS
+    cost_usd = (len(text) / 1000.0) * get_non_token_rate("openai", "audio.tts.per_1k_chars", 0.015)
     log_usage(None, "OpenAI", model, text[:200], "[audio]", payload.prompt_id, cost_usd=cost_usd)
     return {"output": data_url, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
@@ -188,7 +184,9 @@ def handle_stt(payload: STTPayload) -> dict:
         raise HTTPException(status_code=500, detail=f"OpenAI Whisper failed: {e}")
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     # Approximate cost by length (Whisper ~$0.006/min)
-    cost_usd = max(0.0001, (len(raw) / (16000 * 2 * 60)) * 0.006)
+    _per_min = get_non_token_rate("openai", "audio.stt.per_min", 0.006)
+    _min_cost = get_non_token_rate("openai", "audio.stt.min_cost", 0.0001)
+    cost_usd = max(_min_cost, (len(raw) / (16000 * 2 * 60)) * _per_min)
     log_usage(None, "OpenAI", model, "[audio]", text[:200], payload.prompt_id, cost_usd=cost_usd)
     return {"output": text, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
@@ -207,7 +205,7 @@ def handle_embedding(payload: EmbeddingPayload) -> dict:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     tokens = getattr(response, "usage", None)
     num_tokens = (getattr(tokens, "total_tokens", 0) or 0) if tokens else len(text) // 4
-    cost_usd = (num_tokens / 1000.0) * EMBEDDING_COST_PER_1K
+    cost_usd = (num_tokens / 1000.0) * get_non_token_rate("openai", "embedding.per_1k_tokens", 0.00002)
     log_usage(None, "OpenAI", model, text[:200], f"[{len(emb)}d]", payload.prompt_id, cost_usd=cost_usd)
     return {"output": json.dumps(emb), "embedding": emb, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
@@ -343,7 +341,7 @@ def handle_prompt(payload: PromptPayload, *, target=None):
             provider_label = "OpenAI"
 
         log_usage(
-            payload.org_id,
+            None,  # user_id — this is an org-scoped call; org_id goes in org_id=
             provider_label,
             payload.model,
             payload.prompt[:200],
@@ -352,7 +350,8 @@ def handle_prompt(payload: PromptPayload, *, target=None):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd
+            cost_usd=cost_usd,
+            org_id=payload.org_id,
         )
 
         return {

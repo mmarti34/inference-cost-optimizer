@@ -1,12 +1,57 @@
+import logging
 import re
 from supabase_client import supabase
 from utils.pricing import get_pricing, suggest_model
 
+logger = logging.getLogger(__name__)
+
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+# Columns added by migration_pricing_provenance_and_eval_grading.sql. If the
+# migration has not been applied yet the insert is retried without them rather
+# than dropping the usage row on the floor.
+_OPTIONAL_USAGE_COLUMNS = ("pricing_source", "pricing_estimated")
+
 
 def _is_prompt_template_id(prompt_id: str) -> bool:
     """True if prompt_id is a valid UUID (prompt_templates.id). Workflow runs use ids like 'workflow-model-1'."""
     return bool(prompt_id and _UUID_RE.match(prompt_id.strip()))
+
+
+def _pricing_provenance(provider, model) -> dict:
+    """
+    How the price behind cost_usd was obtained. 'default' means we had no real
+    price for this model and the cost is a GUESS — downstream savings math must
+    exclude or flag those rows rather than treating them as measured spend.
+    Provider labels here are display strings ("OpenAI", "custom:host"); a label
+    with no entry in providers.json correctly resolves to estimated.
+    """
+    try:
+        p = get_pricing(str(provider or ""), str(model or ""))
+        return {
+            "pricing_source": p.get("source") or "default",
+            "pricing_estimated": bool(p.get("estimated")),
+        }
+    except Exception:
+        return {"pricing_source": "default", "pricing_estimated": True}
+
+
+def _insert_usage_row(data: dict):
+    """Insert into usage_logs, retrying without the optional provenance columns if absent."""
+    try:
+        return supabase.table("usage_logs").insert(data).execute()
+    except Exception as e:
+        msg = str(e)
+        if not any(col in msg for col in _OPTIONAL_USAGE_COLUMNS):
+            raise
+        logger.warning(
+            "usage_logs is missing pricing provenance columns (%s); inserting without them. "
+            "Apply migration_pricing_provenance_and_eval_grading.sql. Detail: %s",
+            ", ".join(_OPTIONAL_USAGE_COLUMNS), msg[:200],
+        )
+        stripped = {k: v for k, v in data.items() if k not in _OPTIONAL_USAGE_COLUMNS}
+        return supabase.table("usage_logs").insert(stripped).execute()
+
 
 def log_usage(user_id, provider, model, prompt, response, prompt_id,
               input_tokens=None, output_tokens=None, total_tokens=None, cost_usd=None, project_id=None, org_id=None):
@@ -41,10 +86,12 @@ def log_usage(user_id, provider, model, prompt, response, prompt_id,
         "org_id": org_id,
         "prompt_id": prompt_id,
     }
-    
+    # Record whether cost_usd came from a known list price or an estimated default.
+    data.update(_pricing_provenance(provider, model))
+
     # Insert usage log
-    result = supabase.table("usage_logs").insert(data).execute()
-    
+    result = _insert_usage_row(data)
+
     # Always update optimizer recommendations
     update_optimizer_recommendations(user_id, org_id, project_id, prompt_id, prompt, input_tokens, output_tokens, cost_usd)
 

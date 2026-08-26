@@ -10,10 +10,11 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from supabase_client import supabase
+from auth_dependency import require_org_member, AuthenticatedUser, verified_org_id
 from utils.encryption import encrypt_api_key, decrypt_api_key
 from model_target import ModelTarget
 
@@ -93,7 +94,11 @@ ENDPOINT_COLS = "id, org_id, name, base_url, auth_type, auth_header_name, defaul
 
 
 @router.post("/custom-endpoints", response_model=CustomEndpointResponse)
-def create_custom_endpoint(payload: CustomEndpointCreate):
+def create_custom_endpoint(
+    payload: CustomEndpointCreate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    org_id = verified_org_id(auth_user)
     if payload.auth_type not in ("bearer", "header"):
         raise HTTPException(status_code=400, detail="auth_type must be 'bearer' or 'header'")
     if payload.auth_type == "header" and not payload.auth_header_name:
@@ -106,7 +111,7 @@ def create_custom_endpoint(payload: CustomEndpointCreate):
     encrypted = encrypt_api_key(payload.auth_secret.strip())
 
     row = {
-        "org_id": payload.org_id,
+        "org_id": org_id,
         "name": payload.name.strip(),
         "base_url": payload.base_url.strip().rstrip("/"),
         "auth_type": payload.auth_type,
@@ -128,7 +133,10 @@ def create_custom_endpoint(payload: CustomEndpointCreate):
 
 
 @router.get("/custom-endpoints/{org_id}", response_model=List[CustomEndpointResponse])
-def list_custom_endpoints(org_id: str):
+def list_custom_endpoints(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     try:
         result = (
             supabase.table("custom_endpoints")
@@ -144,14 +152,32 @@ def list_custom_endpoints(org_id: str):
     return result.data or []
 
 
-@router.delete("/custom-endpoints/{endpoint_id}")
-def delete_custom_endpoint(endpoint_id: str):
-    """Soft-delete: sets is_active=False."""
+@router.delete("/custom-endpoints/{org_id}/{endpoint_id}")
+def delete_custom_endpoint(
+    org_id: str,
+    endpoint_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Soft-delete: sets is_active=False.
+
+    org_id is in the PATH so the guard and the query agree on the same tenant.
+    Previously `/custom-endpoints/{endpoint_id}` with no guard and no org
+    filter — any caller could disable any org's inference endpoint.
+    """
     try:
-        supabase.table("custom_endpoints").update({"is_active": False}).eq("id", endpoint_id).execute()
+        result = (
+            supabase.table("custom_endpoints")
+            .update({"is_active": False})
+            .eq("id", endpoint_id)
+            .eq("org_id", org_id)
+            .execute()
+        )
     except Exception as e:
         logger.error("Failed to delete custom endpoint: %s", e)
         raise HTTPException(status_code=500, detail="Failed to delete endpoint") from e
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Custom endpoint not found")
     return {"ok": True}
 
 
@@ -161,7 +187,11 @@ REGISTRY_COLS = "id, org_id, name, target_type, provider, model_name, endpoint_i
 
 
 @router.post("/models", response_model=ModelRegistryResponse)
-def create_model(payload: ModelRegistryCreate):
+def create_model(
+    payload: ModelRegistryCreate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    org_id = verified_org_id(auth_user)
     if payload.target_type not in ("provider_model", "openai_compatible_endpoint"):
         raise HTTPException(status_code=400, detail="target_type must be 'provider_model' or 'openai_compatible_endpoint'")
 
@@ -171,13 +201,22 @@ def create_model(payload: ModelRegistryCreate):
     else:
         if not payload.endpoint_id or not payload.endpoint_model_name:
             raise HTTPException(status_code=400, detail="endpoint_id and endpoint_model_name are required for openai_compatible_endpoint")
-        # Verify endpoint exists
-        ep = supabase.table("custom_endpoints").select("id").eq("id", payload.endpoint_id).eq("is_active", True).execute()
+        # Verify endpoint exists AND belongs to the caller's org — otherwise a
+        # registry entry could point at another tenant's endpoint (and its
+        # credentials) at execution time.
+        ep = (
+            supabase.table("custom_endpoints")
+            .select("id")
+            .eq("id", payload.endpoint_id)
+            .eq("org_id", org_id)
+            .eq("is_active", True)
+            .execute()
+        )
         if not ep.data:
             raise HTTPException(status_code=404, detail="Custom endpoint not found or inactive")
 
     row = {
-        "org_id": payload.org_id,
+        "org_id": org_id,
         "name": payload.name.strip(),
         "target_type": payload.target_type,
         "provider": payload.provider.lower().strip() if payload.provider else None,
@@ -199,7 +238,10 @@ def create_model(payload: ModelRegistryCreate):
 
 
 @router.get("/models/{org_id}", response_model=List[ModelRegistryResponse])
-def list_models(org_id: str):
+def list_models(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     try:
         result = (
             supabase.table("model_registry")
@@ -224,6 +266,7 @@ def list_models(org_id: str):
                 supabase.table("custom_endpoints")
                 .select("id, name, base_url")
                 .in_("id", list(endpoint_ids))
+                .eq("org_id", org_id)
                 .execute()
             )
             endpoints_map = {e["id"]: e for e in (ep_result.data or [])}
@@ -238,14 +281,26 @@ def list_models(org_id: str):
     return models
 
 
-@router.delete("/models/{model_id}")
-def delete_model(model_id: str):
-    """Soft-delete: sets is_active=False."""
+@router.delete("/models/{org_id}/{model_id}")
+def delete_model(
+    org_id: str,
+    model_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Soft-delete: sets is_active=False. Scoped to the org in the path."""
     try:
-        supabase.table("model_registry").update({"is_active": False}).eq("id", model_id).execute()
+        result = (
+            supabase.table("model_registry")
+            .update({"is_active": False})
+            .eq("id", model_id)
+            .eq("org_id", org_id)
+            .execute()
+        )
     except Exception as e:
         logger.error("Failed to delete model: %s", e)
         raise HTTPException(status_code=500, detail="Failed to delete model") from e
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Model not found")
     return {"ok": True}
 
 
@@ -291,6 +346,7 @@ def resolve_model_target(model_registry_id: str, org_id: str) -> ModelTarget:
             supabase.table("custom_endpoints")
             .select("id, base_url, auth_type, auth_header_name, auth_secret_encrypted, default_headers_json")
             .eq("id", ep_id)
+            .eq("org_id", org_id)
             .eq("is_active", True)
             .single()
             .execute()

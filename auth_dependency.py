@@ -33,8 +33,17 @@ CURSOR_TOKEN_PREFIX = "optml_"
 class AuthenticatedUser:
     user_id: str
     email: Optional[str] = None
+    #: True only when the identity provider confirmed the address (Supabase
+    #: ``email_confirmed_at``). Never trust ``email`` for authorization unless
+    #: this is True.
+    email_verified: bool = False
     _org_role: Optional[str] = None
     _cursor_org_id: Optional[str] = None
+    #: The org_id that ``require_org_member``/``require_org_admin`` actually
+    #: verified membership against. Handlers whose path has no ``{org_id}``
+    #: MUST re-filter their queries by this value — never by an org id taken
+    #: straight from the request.
+    _verified_org_id: Optional[str] = None
 
 
 def _verify_cursor_token(token: str) -> Optional[AuthenticatedUser]:
@@ -45,7 +54,7 @@ def _verify_cursor_token(token: str) -> Optional[AuthenticatedUser]:
         token_hash = hash_service_api_key(token)
         result = (
             supabase.table("cursor_tokens")
-            .select("user_id, org_id")
+            .select("user_id, org_id, status")
             .eq("token_hash", token_hash)
             .limit(1)
             .execute()
@@ -53,6 +62,11 @@ def _verify_cursor_token(token: str) -> Optional[AuthenticatedUser]:
         if not result.data or len(result.data) == 0:
             return None
         row = result.data[0]
+        # Revoked tokens must never authenticate. Rows written before the
+        # status column existed come back as None -> treated as active.
+        status = row.get("status")
+        if status is not None and str(status) != "active":
+            return None
         return AuthenticatedUser(
             user_id=str(row["user_id"]),
             _cursor_org_id=str(row["org_id"]),
@@ -91,6 +105,10 @@ async def require_auth(
         return AuthenticatedUser(
             user_id=str(user.id),
             email=user.email,
+            email_verified=bool(
+                getattr(user, "email_confirmed_at", None)
+                or getattr(user, "confirmed_at", None)
+            ),
         )
     except HTTPException:
         raise
@@ -143,6 +161,7 @@ async def require_org_member(
                 detail="Cursor token is scoped to a different organization.",
             )
         auth_user._org_role = "member"
+        auth_user._verified_org_id = org_id
         return auth_user
 
     # Check membership (Supabase-authenticated user)
@@ -169,6 +188,7 @@ async def require_org_member(
 
     # Stash the role so require_org_admin can use it without re-querying
     auth_user._org_role = result.data[0].get("role", "member") if result.data else "member"
+    auth_user._verified_org_id = org_id
     return auth_user
 
 
@@ -187,3 +207,19 @@ async def require_org_admin(
             detail="Admin access required for this operation.",
         )
     return auth_user
+
+
+def verified_org_id(auth_user: AuthenticatedUser) -> str:
+    """
+    Return the org_id that require_org_member/require_org_admin actually verified.
+
+    Use this in handlers whose path does not contain {org_id}: the guard resolved
+    the org from the path/query/body/X-Org-Id header and proved membership, so
+    this is the only org the caller may touch on this request. Re-filter every
+    query by it.
+    """
+    org_id = getattr(auth_user, "_verified_org_id", None)
+    if not org_id:
+        # Should be unreachable: the guard always sets it. Fail closed.
+        raise HTTPException(status_code=403, detail="Organization access could not be verified.")
+    return org_id

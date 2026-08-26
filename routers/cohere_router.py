@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import cohere
 from supabase_client import supabase
 from utils.usage_logger import log_usage
-from utils.pricing import get_pricing
+from utils.pricing import get_pricing, get_non_token_rate
 from utils.encryption import decrypt_api_key
 
 router = APIRouter()
@@ -46,7 +46,7 @@ def handle_vision(payload: VisionPayload) -> dict:
         total_tokens = input_tokens + output_tokens
         pricing = get_pricing("cohere", model)
         cost_usd = (input_tokens / 1000 * pricing["input"]) + (output_tokens / 1000 * pricing["output"])
-        log_usage(payload.org_id, "Cohere", model, prompt[:200], reply[:200], payload.prompt_id, input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens, cost_usd=cost_usd)
+        log_usage(None, "Cohere", model, prompt[:200], reply[:200], payload.prompt_id, input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens, cost_usd=cost_usd, org_id=payload.org_id)
         return {"response": reply, "output": reply, "input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens, "cost_usd": cost_usd, "latency_ms": 0}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cohere vision failed: {e}")
@@ -78,8 +78,9 @@ def handle_embedding(payload: EmbeddingPayload) -> dict:
     tokens = getattr(response, "meta", None) and getattr(response.meta, "billed_units", None)
     num_tokens = tokens if isinstance(tokens, (int, float)) else len(text) // 4
     pricing = get_pricing("cohere", model)
-    cost_usd = (num_tokens / 1000.0) * (pricing.get("input") or 0.0001)
-    log_usage(payload.org_id, "Cohere", model, payload.text[:200], f"[{len(emb)}d]", payload.prompt_id, cost_usd=cost_usd)
+    _rate = pricing.get("input") if not pricing.get("estimated") else None
+    cost_usd = (num_tokens / 1000.0) * (_rate or get_non_token_rate("cohere", "embedding.per_1k_tokens", 0.0001))
+    log_usage(None, "Cohere", model, payload.text[:200], f"[{len(emb)}d]", payload.prompt_id, cost_usd=cost_usd, org_id=payload.org_id)
     return {"output": json.dumps(emb), "embedding": list(emb) if hasattr(emb, "__iter__") and not isinstance(emb, str) else emb, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
 
@@ -111,7 +112,7 @@ def handle_prompt(payload: PromptPayload):
 
         # 5. Log usage
         log_usage(
-            payload.org_id,
+            None,  # user_id — org-scoped call; org_id goes in org_id=
             "Cohere",
             payload.model,
             payload.prompt,
@@ -120,7 +121,8 @@ def handle_prompt(payload: PromptPayload):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd
+            cost_usd=cost_usd,
+            org_id=payload.org_id,
         )
 
         return {

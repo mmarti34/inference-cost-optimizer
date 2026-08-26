@@ -85,156 +85,26 @@ class Router(ABC):
         pass
 
 
-class BaselineRouter(Router):
-    """
-    Baseline heuristic router using:
-    - Capabilities filters
-    - Cost estimates
-    - Latency priors
-    """
-    
-    def __init__(self):
-        self._name = "baseline"
-        self._version = "1.0.0"
-    
-    @property
-    def name(self) -> str:
-        return self._name
-    
-    @property
-    def version(self) -> str:
-        return self._version
-    
-    def select_model(self, route_input: RouteInput) -> RouteDecision:
-        """
-        Heuristic routing based on prompt characteristics and requirements.
-        """
-        from utils.pricing import get_pricing, suggest_model
-        
-        # If provider/model are explicitly specified, use them
-        if route_input.provider and route_input.model:
-            return RouteDecision(
-                provider=route_input.provider.lower(),
-                model=route_input.model,
-                fallback_chain=[],
-                parameters={},
-                reason_code="explicit_provider_model_specified",
-                route_policy_name=self.name,
-                route_policy_version=self.version
-            )
-        
-        # If only provider is specified, select cheapest model from that provider
-        if route_input.provider:
-            provider = route_input.provider.lower()
-            # Select cheapest model for the provider
-            if provider == "openai":
-                model = "gpt-3.5-turbo"
-            elif provider == "anthropic":
-                model = "claude-3-haiku"
-            elif provider == "mistral":
-                model = "mistral-small"
-            elif provider == "cohere":
-                model = "command-r"
-            elif provider == "gemini":
-                model = "gemini-1.5-flash"
-            else:
-                model = "gpt-3.5-turbo"  # Default fallback
-            
-            return RouteDecision(
-                provider=provider,
-                model=model,
-                fallback_chain=[],
-                parameters={},
-                reason_code=f"provider_specified_cheapest_model_selected",
-                route_policy_name=self.name,
-                route_policy_version=self.version
-            )
-        
-        # Use existing suggest_model heuristic
-        suggestion = suggest_model(route_input.prompt)
-        provider = suggestion.get("provider", "openai")
-        model = suggestion.get("model", "gpt-3.5-turbo")
-        
-        # Build fallback chain (cheaper alternatives)
-        fallback_chain = []
-        if provider == "openai" and model != "gpt-3.5-turbo":
-            fallback_chain.append({"provider": "openai", "model": "gpt-3.5-turbo"})
-        elif provider == "anthropic" and model != "claude-3-haiku":
-            fallback_chain.append({"provider": "anthropic", "model": "claude-3-haiku"})
-        
-        # Add cross-provider fallback (cheapest option)
-        if provider != "openai":
-            fallback_chain.append({"provider": "openai", "model": "gpt-3.5-turbo"})
-        
-        # Check capabilities requirements
-        reason_code = "heuristic_cost_optimized"
-        if route_input.capabilities_required:
-            if "json" in route_input.capabilities_required:
-                # Prefer models with better JSON mode
-                if provider == "openai" and model == "gpt-3.5-turbo":
-                    model = "gpt-4-turbo"  # Better JSON support
-                    reason_code = "json_capability_required"
-        
-        # Apply cost budget constraint if specified
-        if route_input.cost_budget:
-            pricing = get_pricing(provider, model)
-            estimated_input_tokens = len(route_input.prompt.split()) * 1.3  # Rough estimate
-            estimated_output_tokens = route_input.max_tokens or 500
-            estimated_cost = (estimated_input_tokens * pricing["input"] + estimated_output_tokens * pricing["output"]) / 1000
-            
-            if estimated_cost > route_input.cost_budget:
-                # Switch to cheaper model
-                if provider == "openai" and model != "gpt-3.5-turbo":
-                    model = "gpt-3.5-turbo"
-                    reason_code = "cost_budget_constraint"
-                elif provider == "anthropic" and model != "claude-3-haiku":
-                    model = "claude-3-haiku"
-                    reason_code = "cost_budget_constraint"
-        
-        return RouteDecision(
-            provider=provider,
-            model=model,
-            fallback_chain=fallback_chain,
-            parameters={
-                "temperature": route_input.temperature or 0.7,
-                "max_tokens": route_input.max_tokens or 1024
-            },
-            reason_code=reason_code,
-            route_policy_name=self.name,
-            route_policy_version=self.version
-        )
-
-
-class ExperimentalRouter(Router):
-    """
-    Experimental router stub for future research integrations.
-    Can load JSON/DB config and call learned predictors or bandit policies.
-    """
-    
-    def __init__(self, config_path: Optional[str] = None):
-        self._name = "experimental"
-        self._version = "1.0.0"
-        self.config_path = config_path
-        # TODO: Load config from JSON/DB
-    
-    @property
-    def name(self) -> str:
-        return self._name
-    
-    @property
-    def version(self) -> str:
-        return self._version
-    
-    def select_model(self, route_input: RouteInput) -> RouteDecision:
-        """
-        Experimental routing - currently falls back to baseline.
-        TODO: Implement learned predictor or bandit policy.
-        """
-        # For now, delegate to baseline
-        baseline = BaselineRouter()
-        decision = baseline.select_model(route_input)
-        decision.route_policy_name = self.name
-        decision.route_policy_version = self.version
-        decision.reason_code = "experimental_fallback_to_baseline"
-        return decision
-
+# ---------------------------------------------------------------------------
+# REMOVED: BaselineRouter and ExperimentalRouter.
+#
+# BaselineRouter was a heuristic that ran on the live /v1/prompt path and whose
+# decision was then discarded — main.py built the provider call from the prompt
+# template, not from the decision. Its only lasting effect was stamping a
+# reason_code such as "heuristic_cost_optimized" onto request_logs rows for
+# calls where no routing decision was ever made, which made that column
+# unanalysable. Its model table was also stale (gpt-3.5-turbo, claude-3-haiku,
+# gemini-1.5-flash) and one reason_code was an f-string with no placeholders.
+#
+# ExperimentalRouter was a stub that delegated straight back to BaselineRouter
+# with reason_code="experimental_fallback_to_baseline", reachable only via
+# OPTIML_ROUTER=experimental.
+#
+# routers/router_manager.py (get_router()) went with them; it existed only to
+# choose between the two.
+#
+# The Router / RouteInput / RouteDecision interfaces above are kept: they are
+# the extension point a real, evidence-based optimizer should implement. When
+# one exists, wire its decision into the actual provider call — do not
+# reintroduce a decision that is computed and thrown away.
+# ---------------------------------------------------------------------------

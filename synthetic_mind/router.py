@@ -23,8 +23,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/synthetic-mind", tags=["synthetic-mind"])
 
 # Secret for cron-triggered consolidation (no user auth needed)
+import hmac
 import os
-CRON_SECRET = os.getenv("SM_CRON_SECRET", "sm-cron-default-secret")
+# No default. A hardcoded fallback that ships in the repo is not a secret: it
+# let anyone trigger a consolidation pass across EVERY org (an expensive LLM
+# operation per tenant). When SM_CRON_SECRET is unset the endpoint is disabled.
+CRON_SECRET = os.getenv("SM_CRON_SECRET", "")
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +77,11 @@ async def cron_consolidation(request: Request):
     Secured by SM_CRON_SECRET header, no user auth needed.
     Called by Railway cron or external scheduler.
     """
+    if not CRON_SECRET:
+        logger.error("consolidate-cron called but SM_CRON_SECRET is not configured — refusing")
+        raise HTTPException(status_code=503, detail="Cron endpoint is not configured.")
     secret = request.headers.get("x-sm-cron-secret", "")
-    if secret != CRON_SECRET:
+    if not hmac.compare_digest(secret, CRON_SECRET):
         raise HTTPException(status_code=403, detail="Invalid cron secret")
 
     try:
@@ -224,53 +231,11 @@ async def trigger_forgetting(body: ConsolidateRequest, user=Depends(require_auth
         raise HTTPException(status_code=500, detail=f"Forgetting failed: {str(e)}")
 
 
-# ---------------------------------------------------------------------------
-# Debug endpoint (TEMPORARY — remove after Phase 4 is verified)
-# ---------------------------------------------------------------------------
-
-@router.get("/debug-phase4")
-async def debug_phase4(org_id: str, endpoint_slug: str = "concert-reviews"):
-    """
-    Temporary debug endpoint to check Phase 4 variable consolidation status.
-    No auth required — read-only diagnostic info only.
-    """
-    try:
-        # Count unconsolidated observations
-        obs_r = supabase.table("sm_observations").select("id, metadata, endpoint_slug, consolidated", count="exact").eq("org_id", org_id).eq("consolidated", False).limit(5).execute()
-        obs_count = obs_r.count or 0
-
-        # Check if any observations have metadata with variable_text
-        obs_with_metadata = 0
-        sample_metadata = None
-        for o in (obs_r.data or []):
-            m = o.get("metadata")
-            if m and isinstance(m, dict) and m.get("variable_text"):
-                obs_with_metadata += 1
-                if not sample_metadata:
-                    sample_metadata = {k: (str(v)[:50] if v else None) for k, v in m.items()}
-
-        # Check variable consolidation records
-        vc_r = supabase.table("sm_variable_consolidations").select("*").eq("org_id", org_id).eq("endpoint_slug", endpoint_slug).limit(10).execute()
-
-        # Check consolidation runs
-        runs_r = supabase.table("sm_consolidation_runs").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(3).execute()
-
-        return {
-            "unconsolidated_observations": obs_count,
-            "sample_obs_with_variable_text": obs_with_metadata,
-            "sample_metadata": sample_metadata,
-            "variable_consolidations": len(vc_r.data or []),
-            "variable_consolidation_records": [
-                {k: (str(v)[:100] if v else None) for k, v in r.items()}
-                for r in (vc_r.data or [])
-            ],
-            "recent_consolidation_runs": [
-                {k: v for k, v in r.items() if k != "id"}
-                for r in (runs_r.data or [])
-            ],
-        }
-    except Exception as e:
-        return {"error": str(e)}
+# REMOVED: `GET /debug-phase4`.
+# It was unauthenticated, took org_id from a query parameter, and returned that
+# org's observation samples, variable consolidations and consolidation runs to
+# anyone who asked. Its own docstring said "TEMPORARY — remove after Phase 4 is
+# verified". Phase 4 diagnostics belong in logs, not in an open endpoint.
 
 
 # ---------------------------------------------------------------------------

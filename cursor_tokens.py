@@ -33,18 +33,24 @@ async def create_cursor_token(
     org_id = body.org_id.strip()
     name = (body.name or "Cursor").strip() or "Cursor"
 
-    # Count existing tokens for this user
+    # Count existing ACTIVE tokens for this user — revoked ones don't count.
     existing = (
         supabase.table("cursor_tokens")
-        .select("id")
+        .select("id, status")
         .eq("user_id", _user.user_id)
         .execute()
     )
-    total = len(existing.data or [])
+    total = len([
+        r for r in (existing.data or [])
+        if (r.get("status") or "active") == "active"
+    ])
     if total >= MAX_CURSOR_TOKENS_PER_USER:
         raise HTTPException(
             status_code=400,
-            detail=f"Maximum {MAX_CURSOR_TOKENS_PER_USER} Cursor tokens per user. Revoke one in Settings first.",
+            detail=(
+                f"Maximum {MAX_CURSOR_TOKENS_PER_USER} active Cursor tokens per user. "
+                f"Revoke one first (DELETE /api/cursor-tokens/{{org_id}}/{{token_id}})."
+            ),
         )
 
     plaintext = f"{CURSOR_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
@@ -55,6 +61,7 @@ async def create_cursor_token(
         "org_id": org_id,
         "token_hash": token_hash,
         "name": name,
+        "status": "active",
     }).execute()
 
     # Get org slug for response
@@ -67,6 +74,64 @@ async def create_cursor_token(
         "org_slug": org_slug,
         "name": name,
     }
+
+
+@router.get("/api/cursor-tokens/{org_id}")
+async def list_cursor_tokens(
+    org_id: str,
+    _user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    List the caller's own Cursor tokens for this org. Never returns token_hash
+    or any part of the plaintext token — those are shown once, at creation.
+    """
+    result = (
+        supabase.table("cursor_tokens")
+        .select("id, org_id, name, status, created_at, revoked_at")
+        .eq("org_id", org_id)
+        .eq("user_id", _user.user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    rows = []
+    for row in (result.data or []):
+        rows.append({
+            "id": row.get("id"),
+            "org_id": row.get("org_id"),
+            "name": row.get("name"),
+            "status": row.get("status") or "active",
+            "created_at": row.get("created_at"),
+            "revoked_at": row.get("revoked_at"),
+        })
+    return rows
+
+
+@router.delete("/api/cursor-tokens/{org_id}/{token_id}")
+async def revoke_cursor_token(
+    org_id: str,
+    token_id: str,
+    _user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Revoke one of the caller's own Cursor tokens.
+
+    Marks it `revoked`; auth_dependency._verify_cursor_token refuses any token
+    whose status is not 'active', so the bearer stops working immediately.
+    Re-filtered by both org_id (the org the guard verified) and user_id, so a
+    member cannot revoke another member's token.
+    """
+    result = (
+        supabase.table("cursor_tokens")
+        .update({"status": "revoked", "revoked_at": "now()"})
+        .eq("id", token_id)
+        .eq("org_id", org_id)
+        .eq("user_id", _user.user_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Cursor token not found")
+    logger.info("Cursor token revoked: token_id=%s org=%s", token_id, org_id)
+    return {"status": "revoked", "id": token_id}
 
 
 @router.get("/api/cursor/me")

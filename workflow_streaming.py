@@ -92,6 +92,7 @@ async def _stream_ai_step_openai(
     model: str,
     messages: list[dict],
     node_id: str,
+    provider: str = "openai",
 ) -> AsyncGenerator[dict, None]:
     """Stream OpenAI chat completion; yield token deltas then usage."""
     from openai import AsyncOpenAI
@@ -121,7 +122,8 @@ async def _stream_ai_step_openai(
         if chunk.usage:
             input_tokens = chunk.usage.prompt_tokens or 0
             output_tokens = chunk.usage.completion_tokens or 0
-    pricing = get_pricing("openai", model)
+    # Price with the node's actual provider, not a hardcoded "openai".
+    pricing = get_pricing(provider or "openai", model)
     cost_usd = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1000
     log_usage(
         org_id,
@@ -276,7 +278,7 @@ async def stream_workflow_async(
                     full_output = ""
                     cost_usd = 0.0
                     in_tok = out_tok = 0
-                    async for ev in _stream_ai_step_openai(org_id, model, messages, node_id):
+                    async for ev in _stream_ai_step_openai(org_id, model, messages, node_id, provider=provider):
                         if ev.get("type") == "token":
                             yield _sse_event("token", {"delta": ev.get("delta", "")})
                             full_output += ev.get("delta", "")

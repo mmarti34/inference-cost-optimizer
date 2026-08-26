@@ -33,7 +33,13 @@ def get_org_plan_tier(org_id: str) -> str:
         if result.data:
             return result.data.get("plan") or "free"
     except Exception as e:
-        logger.warning("Failed to get org plan for %s: %s", org_id, type(e).__name__)
+        # Falling back to "free" is the conservative direction (most restrictive
+        # tier), so this one does not need to raise — but it must not be quiet:
+        # a paying org silently enforced at free limits is a billing incident.
+        logger.error(
+            "Failed to read plan for org %s (%s) — falling back to 'free' limits",
+            org_id, type(e).__name__,
+        )
     return "free"
 
 
@@ -41,6 +47,29 @@ def _get_plan_limit(plan: str, resource: str) -> int:
     """Get the limit for a resource on a given plan. Returns -1 for unlimited."""
     limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
     return limits.get(resource, 0)
+
+
+def _fail_closed(resource: str, org_id: str, exc: Exception) -> "HTTPException":
+    """
+    Build the 503 raised when a limit check cannot be evaluated.
+
+    These checks used to `return` on any database error, which silently GRANTED
+    the resource: one failing count query was an unlimited plan. A limit that
+    cannot be evaluated is not a limit that has been satisfied, so refuse the
+    write instead and make the failure loud.
+    """
+    logger.error(
+        "PLAN ENFORCEMENT FAILED CLOSED: could not evaluate the %s limit for org %s; "
+        "denying the request. %s: %s",
+        resource, org_id, type(exc).__name__, exc,
+    )
+    return HTTPException(
+        status_code=503,
+        detail=(
+            f"Could not verify your plan's {resource} limit right now. "
+            "Please try again in a moment."
+        ),
+    )
 
 
 # ── Resource limit checks ──────────────────────────────────────────
@@ -62,8 +91,7 @@ def check_project_limit(org_id: str) -> None:
         )
         current = result.count if result.count is not None else len(result.data or [])
     except Exception as e:
-        logger.warning("Failed to count projects for org %s: %s", org_id, e)
-        return  # fail open — don't block on count errors
+        raise _fail_closed("project", org_id, e) from e
 
     if current >= limit:
         upgrade = get_upgrade_suggestion(plan)
@@ -89,8 +117,7 @@ def check_workflow_limit(org_id: str) -> None:
         )
         current = result.count if result.count is not None else len(result.data or [])
     except Exception as e:
-        logger.warning("Failed to count workflows for org %s: %s", org_id, e)
-        return  # fail open
+        raise _fail_closed("workflow", org_id, e) from e
 
     if current >= limit:
         upgrade = get_upgrade_suggestion(plan)
@@ -117,8 +144,7 @@ def check_server_key_limit(org_id: str) -> None:
         )
         current = result.count if result.count is not None else len(result.data or [])
     except Exception as e:
-        logger.warning("Failed to count server keys for org %s: %s", org_id, e)
-        return
+        raise _fail_closed("server key", org_id, e) from e
 
     if current >= limit:
         upgrade = get_upgrade_suggestion(plan)
@@ -145,12 +171,14 @@ def check_monthly_request_limit(org_id: str) -> None:
             .select("request_count")
             .eq("org_id", org_id)
             .eq("month", month)
-            .single()
+            .limit(1)
             .execute()
         )
-        current = int(result.data.get("request_count", 0)) if result.data else 0
-    except Exception:
-        current = 0  # no row yet or query error — treat as 0
+        rows = result.data or []
+        # Empty list = no usage row for this month yet = genuinely zero.
+        current = int(rows[0].get("request_count", 0)) if rows else 0
+    except Exception as e:
+        raise _fail_closed("monthly request", org_id, e) from e
 
     if current >= limit:
         upgrade = get_upgrade_suggestion(plan)
@@ -203,9 +231,14 @@ def get_monthly_usage(org_id: str) -> int:
             .select("request_count")
             .eq("org_id", org_id)
             .eq("month", month)
-            .single()
+            .limit(1)
             .execute()
         )
-        return int(result.data.get("request_count", 0)) if result.data else 0
-    except Exception:
+        rows = result.data or []
+        return int(rows[0].get("request_count", 0)) if rows else 0
+    except Exception as e:
+        # Display-only helper (billing page / usage bar) — never gates a write,
+        # so reporting 0 here is safe. The enforcing path is
+        # check_monthly_request_limit(), which fails closed.
+        logger.warning("Failed to read monthly usage for org %s: %s", org_id, e)
         return 0
