@@ -33,17 +33,22 @@ class Router(ABC):
 
 #### Available Routers
 
-1. **BaselineRouter** (default)
-   - Heuristic routing based on:
-     - Capabilities filters
-     - Cost estimates
-     - Latency priors
-   - Falls back to cheaper models on budget constraints
+**None ship today.** `routers/base.py` defines the interface only.
 
-2. **ExperimentalRouter** (stub)
-   - Placeholder for future research integrations
-   - Currently delegates to BaselineRouter
-   - Can be extended to load JSON/DB config and call learned predictors or bandit policies
+`BaselineRouter` and `ExperimentalRouter` were removed, along with
+`routers/router_manager.py` and the `OPTIML_ROUTER` environment variable.
+BaselineRouter ran on the live `/v1/prompt` path but its decision was
+discarded — the provider call was built from the prompt template, not from the
+decision — so the only thing it did was write a fictional `reason_code`
+(e.g. `heuristic_cost_optimized`) onto `request_logs` rows for calls where no
+routing decision was ever made. `ExperimentalRouter` was a stub that delegated
+straight back to it.
+
+`request_logs` now records what actually happens at the gateway:
+`route_policy_name="passthrough"`, `reason_code="caller_specified_provider_model"`.
+
+Implement `Router` when there is a routing engine whose decision is actually
+executed, and log its real inputs.
 
 ### Observability System
 
@@ -95,11 +100,12 @@ Add these to your `.env` file:
 ```bash
 # Observability settings
 OPTIML_STORE_PROMPTS=false              # Set to true to store prompts (default: false)
-OPTIML_ROUTER=baseline                   # Router to use: baseline or experimental
-OPTIML_ENABLE_REPLAY=false               # Enable replay endpoint (default: false)
 
-# Optional: Experimental router config
-OPTIML_ROUTER_CONFIG_PATH=/path/to/config.json
+# Control loop (rollback monitor + experiment auto-conclude)
+OPTIML_CONTROL_LOOP_ENABLED=true               # Set to false to opt out of the in-process scheduler
+OPTIML_CONTROL_LOOP_INTERVAL_SECONDS=60        # Seconds between cycles (default: 60)
+OPTIML_CONTROL_LOOP_START_DELAY_SECONDS=15     # Delay before the first cycle (default: 15)
+OPTIML_CRON_SECRET=                            # Shared secret for POST /api/control-loop/run (org-wide)
 ```
 
 ### 3. Running Locally
@@ -112,7 +118,6 @@ pip install -r requirements.txt
 export SUPABASE_URL=your_supabase_url
 export SUPABASE_KEY=your_supabase_key
 export OPTIML_STORE_PROMPTS=false
-export OPTIML_ROUTER=baseline
 
 # Run the server
 uvicorn main:app --reload
@@ -355,37 +360,30 @@ class MyCustomRouter(Router):
         )
 ```
 
-2. Update `routers/router_manager.py`:
+2. Call it from the request path and **use its decision** to build the provider
+   call. A decision that is computed and then ignored is worse than no router:
+   it writes a `reason_code` that describes something that never happened.
 
-```python
-def get_router() -> Router:
-    router_type = os.getenv("OPTIML_ROUTER", "baseline").lower()
-    
-    if router_type == "my_custom":
-        return MyCustomRouter()
-    # ... existing routers
-```
-
-3. Set environment variable:
-
-```bash
-export OPTIML_ROUTER=my_custom
-```
+3. Log the decision's real inputs alongside the outcome so the choice can be
+   evaluated after the fact.
 
 ## Files Created/Modified
 
 ### Backend Files
 
 **Created:**
-- `routers/base.py` - Router interface and implementations
-- `routers/router_manager.py` - Router selection logic
+- `routers/base.py` - Router interface (`Router`, `RouteInput`, `RouteDecision`, `Outcome`, `FailureReason`). Interface only; no implementations ship.
 - `utils/observability.py` - Observability logging utilities
-- `utils/provider_wrapper.py` - Provider call wrapper with spans
 - `middleware/observability_middleware.py` - Request ID/Trace ID middleware
+- `background_jobs.py` - Control-loop scheduler + machine-callable `POST /api/control-loop/run`
 - `migration_add_observability_tables.sql` - Database migration
 
 **Modified:**
 - `main.py` - Added observability middleware and endpoints
+
+**Removed:**
+- `routers/router_manager.py`, `BaselineRouter`, `ExperimentalRouter` - the decision was discarded; see "Available Routers".
+- `utils/provider_wrapper.py` - never imported by anything, and its `execute_with_fallbacks()` retry loop had a body of literally `pass`. It was listed here as a shipped component; it never was one.
 
 ### Frontend Files
 

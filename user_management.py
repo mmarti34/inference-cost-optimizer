@@ -1,9 +1,20 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from supabase_client import supabase
+from auth_dependency import require_auth, AuthenticatedUser
 
 router = APIRouter()
+
+
+def _require_self(auth_user: AuthenticatedUser, user_id: str) -> None:
+    """
+    These routes are user-scoped, not org-scoped, so there is no org_id to guard
+    on. The only correct boundary is: you may act on your own profile and no
+    one else's.
+    """
+    if not user_id or auth_user.user_id != user_id:
+        raise HTTPException(status_code=403, detail="You can only access your own user profile.")
 
 # Pydantic models
 class UserProfileUpdate(BaseModel):
@@ -34,8 +45,12 @@ class UserProfileResponse(BaseModel):
 
 # User Profile Endpoints
 @router.get("/user-profiles/{user_id}", response_model=UserProfileResponse)
-async def get_user_profile(user_id: str):
-    """Get user profile by user ID"""
+async def get_user_profile(
+    user_id: str,
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """Get your own user profile."""
+    _require_self(auth_user, user_id)
     try:
         result = supabase.table("user_profiles").select(
             "user_id, first_name, last_name, display_name, bio, phone, timezone, locale, "
@@ -46,12 +61,19 @@ async def get_user_profile(user_id: str):
             raise HTTPException(status_code=404, detail="User profile not found")
         
         return result.data
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching user profile: {str(e)}")
 
 @router.put("/user-profiles/{user_id}", response_model=UserProfileResponse)
-async def update_user_profile(user_id: str, profile_data: UserProfileUpdate):
-    """Update user profile"""
+async def update_user_profile(
+    user_id: str,
+    profile_data: UserProfileUpdate,
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """Update your own user profile."""
+    _require_self(auth_user, user_id)
     try:
         # First check if the profile exists
         existing = supabase.table("user_profiles").select(
@@ -80,8 +102,12 @@ async def update_user_profile(user_id: str, profile_data: UserProfileUpdate):
         raise HTTPException(status_code=500, detail=f"Error updating user profile: {str(e)}")
 
 @router.post("/user-profiles/{user_id}/password-reset")
-async def request_password_reset(user_id: str):
-    """Request password reset for user"""
+async def request_password_reset(
+    user_id: str,
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """Request a password reset email for your own account."""
+    _require_self(auth_user, user_id)
     try:
         # Get user email from auth.users table
         result = supabase.auth.admin.get_user_by_id(user_id)

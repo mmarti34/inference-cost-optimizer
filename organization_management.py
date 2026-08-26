@@ -9,24 +9,36 @@ from plan_enforcement import get_monthly_usage, get_org_plan_tier, _get_plan_lim
 logger = logging.getLogger(__name__)
 
 
-class OrganizationPlanUpdate(BaseModel):
-    plan: str
-
-
 class OrganizationUpdate(BaseModel):
-    """Allowed fields for org update. Slug is never accepted — it is permanent after creation."""
+    """
+    Allowed fields for a client org update.
+
+    `slug` is permanent after creation. `plan` is BILLING STATE and is not
+    client-writable at all: every user is admin of their own Personal
+    workspace, so accepting a plan string here let anyone set
+    plan='enterprise' and turn every limit in PLAN_LIMITS into -1 (unlimited).
+    The only writer of organizations.plan is the Stripe webhook
+    (stripe_webhook._propagate_tier_to_orgs).
+    """
     name: Optional[str] = None
-    plan: Optional[str] = None
     logo: Optional[str] = None
 
     class Config:
-        extra = "forbid"  # Reject any extra fields (e.g. slug) at parse time
+        extra = "forbid"  # Reject any extra fields (e.g. slug, plan) at parse time
+
+
+#: Columns a client may never write on `organizations`, whatever the payload says.
+_ORG_CLIENT_WRITABLE_FIELDS = frozenset({"name", "logo"})
 
 
 def _org_update_payload_safe(data: dict) -> dict:
-    """Strip slug from any org update payload. Never allow slug to be updated."""
-    out = {k: v for k, v in data.items() if k != "slug"}
-    return out
+    """
+    Reduce an org update payload to the client-writable allow-list.
+
+    Deny-by-default: anything not explicitly listed (slug, plan, type,
+    created_by, ...) is dropped rather than passed through to Supabase.
+    """
+    return {k: v for k, v in data.items() if k in _ORG_CLIENT_WRITABLE_FIELDS}
 
 
 router = APIRouter()
@@ -195,25 +207,11 @@ async def get_org_monthly_usage(
         raise HTTPException(status_code=500, detail=f"Error fetching monthly usage: {str(e)}")
 
 
-@router.put("/organizations/{org_id}/plan")
-async def update_organization_plan(
-    org_id: str,
-    plan_data: OrganizationPlanUpdate,
-    auth_user: AuthenticatedUser = Depends(require_org_admin),
-):
-    """Update organization plan. Admin only. Slug is never updated."""
-    try:
-        update_data = _org_update_payload_safe({"plan": plan_data.plan})
-        result = supabase.table("organizations").update(update_data).eq("id", org_id).execute()
-
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Organization not found")
-
-        return {"message": "Organization plan updated successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating organization plan: {str(e)}")
+# NOTE: `PUT /organizations/{org_id}/plan` was removed deliberately.
+# It accepted an arbitrary plan string with no Stripe validation, and every user
+# is admin of their own Personal workspace — so it was a one-request upgrade to
+# `enterprise` (unlimited everything). Plan changes now come exclusively from
+# the Stripe webhook. It had no frontend caller.
 
 
 @router.patch("/organizations/{org_id}")
@@ -222,18 +220,24 @@ async def update_organization(
     payload: OrganizationUpdate,
     auth_user: AuthenticatedUser = Depends(require_org_admin),
 ):
-    """Update organization (name, plan, logo). Admin only. Slug is immutable and must never be sent or updated."""
+    """
+    Update organization (name, logo). Admin only.
+
+    Slug is immutable. Plan is billing state and is rejected outright — it is
+    settable only by the Stripe webhook.
+    """
     try:
         update_data = {}
         if payload.name is not None:
             update_data["name"] = payload.name
-        if payload.plan is not None:
-            update_data["plan"] = payload.plan
         if payload.logo is not None:
             update_data["logo"] = payload.logo
-        if not update_data:
-            raise HTTPException(status_code=400, detail="No allowed fields provided (name, plan, logo). Slug cannot be updated.")
         update_data = _org_update_payload_safe(update_data)
+        if not update_data:
+            raise HTTPException(
+                status_code=400,
+                detail="No allowed fields provided (name, logo). Slug and plan cannot be updated.",
+            )
         result = supabase.table("organizations").update(update_data).eq("id", org_id).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Organization not found")

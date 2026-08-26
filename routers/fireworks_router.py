@@ -7,13 +7,16 @@ from pydantic import BaseModel
 from supabase_client import supabase
 from utils.encryption import decrypt_api_key
 from utils.usage_logger import log_usage
+from utils.pricing import get_non_token_rate
 import json
 from utils.openai_compatible import call_openai_compatible, call_openai_compatible_embeddings, call_openai_compatible_with_tools
 
 router = APIRouter()
 
-FLUX_COST_PER_IMAGE = 0.0014
-FIREWORKS_STT_COST_PER_MIN = 0.002
+# Non-token prices (images, audio, embeddings) live in shared/providers.json
+# under non_token_rates.fireworks, read via get_non_token_rate(). The second
+# argument is the historical constant, kept as a fallback so behaviour is
+# unchanged if the config section is missing.
 # Whisper-style limit; reject oversized audio before calling API.
 WHISPER_MAX_FILE_BYTES = 24 * 1024 * 1024
 
@@ -115,8 +118,9 @@ def handle_image_generation(payload: ImageGenerationPayload) -> dict:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:image/png;base64,{b64}"
-    log_usage(None, "Fireworks", model, payload.prompt[:200], "[image]", payload.prompt_id, cost_usd=FLUX_COST_PER_IMAGE)
-    return {"url": data_url, "cost_usd": FLUX_COST_PER_IMAGE, "latency_ms": elapsed_ms}
+    cost_usd = get_non_token_rate("fireworks", "image.flux.per_image", 0.0014)
+    log_usage(None, "Fireworks", model, payload.prompt[:200], "[image]", payload.prompt_id, cost_usd=cost_usd)
+    return {"url": data_url, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
 
 def handle_stt(payload: STTPayload) -> dict:
@@ -150,7 +154,7 @@ def handle_stt(payload: STTPayload) -> dict:
     except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Fireworks transcription failed: {e}")
     elapsed_ms = int((time.perf_counter() - start) * 1000)
-    cost_usd = max(0.0001, (len(raw) / (16000 * 2 * 60)) * FIREWORKS_STT_COST_PER_MIN)
+    cost_usd = max(0.0001, (len(raw) / (16000 * 2 * 60)) * get_non_token_rate("fireworks", "audio.stt.per_min", 0.002))
     log_usage(None, "Fireworks", model, "[audio]", text[:200], payload.prompt_id, cost_usd=cost_usd)
     return {"output": text, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 

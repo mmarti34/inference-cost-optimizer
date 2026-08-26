@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 from supabase_client import supabase
+from auth_dependency import require_org_member, AuthenticatedUser, verified_org_id
 import uuid
 
 router = APIRouter()
@@ -38,8 +39,13 @@ class PromptTemplateResponse(BaseModel):
 
 # Prompt Template Endpoints
 @router.post("/prompt-templates", response_model=PromptTemplateResponse)
-async def create_prompt_template(prompt_data: PromptTemplateCreate):
-    """Create a new prompt template"""
+async def create_prompt_template(
+    prompt_data: PromptTemplateCreate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Create a new prompt template in the caller's verified org."""
+    # Use the org the guard actually verified, not the raw body field.
+    org_id = verified_org_id(auth_user)
     try:
         # Generate UUID for the prompt template
         prompt_id = str(uuid.uuid4())
@@ -53,7 +59,7 @@ async def create_prompt_template(prompt_data: PromptTemplateCreate):
             "model": prompt_data.model,
             "prompt": prompt_data.prompt,
             "project_id": prompt_data.project_id,
-            "org_id": prompt_data.org_id
+            "org_id": org_id
         }).execute()
         
         if not result.data:
@@ -71,7 +77,10 @@ async def create_prompt_template(prompt_data: PromptTemplateCreate):
         raise HTTPException(status_code=500, detail=f"Error creating prompt template: {error_msg}")
 
 @router.get("/prompt-templates/{org_id}", response_model=List[PromptTemplateResponse])
-async def get_prompt_templates(org_id: str):
+async def get_prompt_templates(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Get all prompt templates for an organization"""
     try:
         result = supabase.table("prompt_templates").select("id, org_id, name, description, provider, model, prompt, project_id, created_at, updated_at").eq("org_id", org_id).execute()
@@ -95,7 +104,11 @@ async def get_prompt_templates(org_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching prompt templates: {error_msg}")
 
 @router.get("/prompt-templates/{org_id}/{prompt_id}", response_model=PromptTemplateResponse)
-async def get_prompt_template(org_id: str, prompt_id: str):
+async def get_prompt_template(
+    org_id: str,
+    prompt_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Get a specific prompt template"""
     try:
         result = supabase.table("prompt_templates").select("id, org_id, name, description, provider, model, prompt, project_id, created_at, updated_at").eq("id", prompt_id).eq("org_id", org_id).single().execute()
@@ -108,7 +121,12 @@ async def get_prompt_template(org_id: str, prompt_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching prompt template: {str(e)}")
 
 @router.put("/prompt-templates/{org_id}/{prompt_id}", response_model=PromptTemplateResponse)
-async def update_prompt_template(org_id: str, prompt_id: str, prompt_data: PromptTemplateUpdate):
+async def update_prompt_template(
+    org_id: str,
+    prompt_id: str,
+    prompt_data: PromptTemplateUpdate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Update a prompt template"""
     try:
         # First check if the prompt template exists and belongs to the org
@@ -135,7 +153,11 @@ async def update_prompt_template(org_id: str, prompt_id: str, prompt_data: Promp
         raise HTTPException(status_code=500, detail=f"Error updating prompt template: {str(e)}")
 
 @router.delete("/prompt-templates/{org_id}/{prompt_id}")
-async def delete_prompt_template(org_id: str, prompt_id: str):
+async def delete_prompt_template(
+    org_id: str,
+    prompt_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Delete a prompt template"""
     try:
         # First check if the prompt template exists and belongs to the org

@@ -6,11 +6,15 @@ from pydantic import BaseModel
 from supabase_client import supabase
 from utils.encryption import decrypt_api_key
 from utils.usage_logger import log_usage
+from utils.pricing import get_non_token_rate
 from utils.openai_compatible import call_openai_compatible, call_openai_compatible_with_tools
 
 router = APIRouter()
 
-GROQ_TTS_COST_PER_1K_CHARS = 0.022  # ~$22/1M chars
+# Non-token prices (images, audio, embeddings) live in shared/providers.json
+# under non_token_rates.groq, read via get_non_token_rate(). The second
+# argument is the historical constant, kept as a fallback so behaviour is
+# unchanged if the config section is missing.
 
 class PromptPayload(BaseModel):
     org_id: str
@@ -77,7 +81,7 @@ def handle_tts(payload: TTSPayload) -> dict:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     b64 = base64.b64encode(audio_bytes).decode("ascii")
     data_url = f"data:audio/wav;base64,{b64}"
-    cost_usd = (len(text) / 1000.0) * GROQ_TTS_COST_PER_1K_CHARS
+    cost_usd = (len(text) / 1000.0) * get_non_token_rate("groq", "audio.tts.per_1k_chars", 0.022)
     log_usage(None, "Groq", model, text[:200], "[audio]", payload.prompt_id, cost_usd=cost_usd)
     return {"output": data_url, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 

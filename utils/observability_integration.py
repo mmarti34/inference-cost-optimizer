@@ -5,9 +5,18 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from fastapi import Request
-from routers.base import RouteInput, Outcome, FailureReason
-from routers.router_manager import get_router
+from routers.base import Outcome, FailureReason
 from utils.observability import log_request, log_span, update_daily_stats
+
+# The gateway executes the provider/model the caller (or their prompt template)
+# named. It does not choose one. These constants say exactly that on every
+# request_logs row. Previously a heuristic BaselineRouter was run here purely to
+# produce a reason_code, so request_logs recorded values like
+# "heuristic_cost_optimized" for calls where no routing decision existed, and any
+# analysis of that column measured nothing.
+ROUTE_POLICY_NAME = "passthrough"
+ROUTE_POLICY_VERSION = "1.0.0"
+REASON_CODE_NO_DECISION = "caller_specified_provider_model"
 
 
 def log_request_with_observability(
@@ -42,19 +51,6 @@ def log_request_with_observability(
     # Calculate latency
     latency_ms = int((time.time() - start_time) * 1000)
     
-    # Get router decision (use baseline for now)
-    router = get_router()
-    route_input = RouteInput(
-        prompt=prompt_text,
-        provider=provider,
-        model=model,
-        org_id=org_id,
-        project_id=project_id,
-        user_id=user_id,
-        prompt_id=prompt_id,
-    )
-    route_decision = router.select_model(route_input)
-    
     # Extract metrics from result
     prompt_tokens = result.get("input_tokens") or result.get("prompt_tokens")
     completion_tokens = result.get("output_tokens") or result.get("completion_tokens")
@@ -70,11 +66,11 @@ def log_request_with_observability(
         project_id=project_id,
         user_id=user_id,
         prompt_id=prompt_id,
-        route_policy_name=route_decision.route_policy_name,
-        route_policy_version=route_decision.route_policy_version,
+        route_policy_name=ROUTE_POLICY_NAME,
+        route_policy_version=ROUTE_POLICY_VERSION,
         chosen_provider=provider,
         chosen_model=model,
-        reason_code=route_decision.reason_code,
+        reason_code=REASON_CODE_NO_DECISION,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
@@ -126,20 +122,10 @@ def log_gateway_span(request: Request, start_time: datetime) -> None:
         )
 
 
-def log_route_decision_span(request: Request, route_decision, start_time: datetime, duration_ms: int) -> None:
-    """Log route decision span."""
-    request_id = getattr(request.state, 'request_id', None)
-    trace_id = getattr(request.state, 'trace_id', None)
-    
-    if request_id and trace_id:
-        log_span(
-            request_id=request_id,
-            trace_id=trace_id,
-            span_type="route_decision",
-            start_time=start_time,
-            duration_ms=duration_ms,
-            status="success",
-        )
+# log_route_decision_span() was removed along with the BaselineRouter call that
+# fed it: the gateway makes no routing decision, so a "route_decision" span was
+# recording a step that never ran. When the evidence-based optimizer starts
+# actually choosing models, it should log its own span with its real inputs.
 
 
 def log_provider_call_span(

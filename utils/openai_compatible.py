@@ -6,7 +6,7 @@ import json
 import time
 import httpx
 from fastapi import HTTPException
-from utils.pricing import get_pricing
+from utils.pricing import get_pricing, get_non_token_rate
 from utils.usage_logger import log_usage
 
 
@@ -278,7 +278,10 @@ def call_openai_compatible_embeddings(
     prompt_tokens = usage.get("total_tokens", usage.get("prompt_tokens", len(input_text) // 4))
     try:
         pricing = get_pricing(provider, model)
-        cost_usd = (prompt_tokens / 1000.0) * (pricing.get("input") or 0.0001)
+        rate = pricing.get("input") if not pricing.get("estimated") else None
+        if rate is None:
+            rate = get_non_token_rate(provider, "embedding.per_1k_tokens", 0.0001)
+        cost_usd = (prompt_tokens / 1000.0) * rate
     except Exception:
         cost_usd = (prompt_tokens / 1000.0) * 0.0001
     return {"embedding": embedding, "input_tokens": prompt_tokens, "cost_usd": cost_usd, "latency_ms": elapsed_ms}

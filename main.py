@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from supabase_client import supabase
-from auth_dependency import require_auth, require_org_member, AuthenticatedUser
+from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
 from utils.encryption import (
     encrypt_api_key,
     decrypt_api_key,
@@ -29,8 +29,7 @@ from routers import (
     deepseek_router,
     fireworks_router,
 )
-from routers.router_manager import get_router
-from routers.base import RouteInput, Outcome, FailureReason
+from routers.base import Outcome, FailureReason
 from org_access_control import router as org_access_router
 from stripe_webhook import router as stripe_webhook_router
 from prompt_management import router as prompt_management_router
@@ -55,6 +54,8 @@ from cursor_deploy import router as cursor_deploy_router
 from workflow_draft_generator import router as workflow_draft_generator_router
 from github_migration import router as github_migration_router
 from synthetic_mind.router import router as synthetic_mind_router
+from routers.optimization_router import router as optimization_router
+from routers.optimization_router import public_router as optimization_public_router
 from middleware.observability_middleware import ObservabilityMiddleware
 from utils.observability import log_request, log_span, generate_request_id, generate_trace_id
 
@@ -157,6 +158,15 @@ app.include_router(context_asset_management_router, prefix="/api")
 app.include_router(workflow_draft_generator_router, prefix="/api")
 app.include_router(github_migration_router, prefix="/api")
 app.include_router(synthetic_mind_router, prefix="/api")
+app.include_router(optimization_router, prefix="/api")
+# Customer-facing outcome ingestion alias: POST /v1/outcomes
+app.include_router(optimization_public_router)
+
+# Control loop: runs the rollback monitor and experiment auto-conclude on a timer,
+# and exposes machine-callable POST /api/control-loop/run for external cron.
+# Without this, automatic rollback never fires. See background_jobs.py.
+from background_jobs import register_background_jobs  # noqa: E402
+register_background_jobs(app)
 
 # Health check endpoint for Railway
 @app.get("/health")
@@ -320,25 +330,12 @@ Return your recommendation as a JSON object with the following structure:
         print(f"Error in optimize endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
 
-@app.get("/get-keys/{org_id}")
-def get_keys(org_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
-    try:
-        result = supabase.table("api_keys").select("id, org_id, provider, api_key, name, user_id, created_at").eq("org_id", org_id).execute()
-        
-        # Decrypt API keys before returning
-        decrypted_keys = []
-        for key in result.data:
-            decrypted_key = key.copy()
-            try:
-                decrypted_key["api_key"] = decrypt_api_key(key["api_key"])
-            except Exception:
-                # If decryption fails, mask the key
-                decrypted_key["api_key"] = "***DECRYPTION_FAILED***"
-            decrypted_keys.append(decrypted_key)
-        
-        return {"status": "success", "keys": decrypted_keys}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching keys: {str(e)}")
+# REMOVED: `GET /get-keys/{org_id}`.
+# It returned every provider API key for an org fully DECRYPTED to any org
+# member — a single request exfiltrated the org's OpenAI/Anthropic/etc.
+# credentials in plaintext over HTTP. Provider keys are decrypted server-side
+# at call time only. The frontend never used this route; it reads the masked
+# list from `GET /api/api-keys/{org_id}` (api_key_management.get_api_keys).
 
 @app.post("/store-key")
 def store_api_key(payload: APIKeyPayload, _user: AuthenticatedUser = Depends(require_org_member)):
@@ -512,12 +509,9 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
     from utils.observability_integration import (
         log_request_with_observability,
         log_gateway_span,
-        log_route_decision_span,
         log_provider_call_span,
     )
     from routers.base import Outcome, FailureReason
-    from routers.router_manager import get_router
-    from routers.base import RouteInput
     
     request_start_time = time.time()
     gateway_start = datetime.now(timezone.utc)
@@ -619,19 +613,12 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
             
             print(f"Direct API call - provider: {provider}, model: {model}")
             
-            # Observability: Log route decision
-            router = get_router()
-            route_input = RouteInput(
-                prompt=prompt_text,
-                provider=provider,
-                model=model,
-                org_id=org_id,
-                prompt_id="direct_call",
-            )
-            route_decision = router.select_model(route_input)
-            route_start = datetime.now(timezone.utc)
-            route_duration = int((time.time() - request_start_time) * 1000)
-            log_route_decision_span(request, route_decision, route_start, route_duration)
+            # No routing decision is made here: the caller named the provider and
+            # model and we execute exactly that. The heuristic BaselineRouter that
+            # used to run at this point had its result thrown away one line later
+            # (the payload below is built from `provider`/`model`, not from the
+            # decision), so all it did was stamp a fictional reason_code onto
+            # request_logs. Removed rather than left half-wired.
             
             # Call the correct LLM router directly
             payload_obj = PromptPayload(
@@ -752,22 +739,16 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
         provider = prompt_template["provider"].lower()
         model = prompt_template["model"]
         project_id = prompt_template.get("project_id")
-        print(f"Using provider: {provider}, model: {model}, prompt_text: {prompt_text}")
+        # Never log prompt content: these logs are shipped off-box and prompts
+        # routinely carry customer data. Length only, plus the full text behind
+        # an explicit debug opt-in.
+        print(f"Using provider: {provider}, model: {model}, prompt_chars: {len(prompt_text or '')}")
+        if _debug_logging_enabled():
+            print(f"[OPTIML_DEBUG] prompt_text: {prompt_text}")
 
-        # Observability: Log route decision
-        router = get_router()
-        route_input = RouteInput(
-            prompt=prompt_text,
-            provider=provider,
-            model=model,
-            org_id=org_id,
-            project_id=project_id,
-            prompt_id=prompt_id,
-        )
-        route_decision = router.select_model(route_input)
-        route_start = datetime.now(timezone.utc)
-        route_duration = int((time.time() - request_start_time) * 1000)
-        log_route_decision_span(request, route_decision, route_start, route_duration)
+        # No routing decision is made here either: provider/model come from the
+        # prompt template and the payload below is built from them directly.
+        # See the note on the direct-call path above.
 
         # 5. Call the correct LLM router
         payload_obj = PromptPayload(
@@ -850,7 +831,11 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
             )
             raise HTTPException(status_code=500, detail=f"LLM service error: {str(e)}")
 
-        print("LLM router result:", result)
+        # Model responses can echo the prompt and its data — same rule as above.
+        if _debug_logging_enabled():
+            print("[OPTIML_DEBUG] LLM router result:", result)
+        else:
+            print(f"LLM router result: status={result.get('status', 'success')} response_chars={len(str(result.get('response') or ''))}")
         # 6. Return response in standard format
         return {
             "status": result.get("status", "success"),
@@ -972,6 +957,11 @@ def suggest_model_endpoint(data: dict = Body(...), _user: AuthenticatedUser = De
     suggestion = suggest_model(prompt)
     return {"suggestion": suggestion}
 
+def _debug_logging_enabled() -> bool:
+    """True only when OPTIML_DEBUG=true. Gates logging of prompt/response bodies."""
+    return os.environ.get("OPTIML_DEBUG", "false").lower() == "true"
+
+
 @app.get("/debug/api-keys")
 def debug_api_keys():
     """Debug endpoint to check API keys and database connectivity.
@@ -1027,8 +1017,8 @@ def debug_api_keys():
 
 @app.get("/observability/summary")
 def get_observability_summary(
-    org_id: str = None,
-    _user: AuthenticatedUser = Depends(require_auth),
+    org_id: str,
+    _user: AuthenticatedUser = Depends(require_org_member),
     project_id: str = None,
     start_date: str = None,
     end_date: str = None,
@@ -1037,20 +1027,26 @@ def get_observability_summary(
 ):
     """
     Get observability summary (daily aggregates) for dashboards.
-    
+
+    org_id is REQUIRED and membership-checked. It used to be an optional filter
+    behind require_auth only: any signed-in user could pass someone else's
+    org_id, and omitting it entirely returned every organization's daily cost
+    and latency aggregates in one response.
+
     Query parameters:
-    - org_id: Filter by organization
+    - org_id: Organization to report on (required; must be one you belong to)
     - project_id: Filter by project
     - start_date: Start date (YYYY-MM-DD)
     - end_date: End date (YYYY-MM-DD)
     - provider: Filter by provider
     - model: Filter by model
     """
+    # Filter by the org the guard actually verified, never the raw query value.
+    caller_org_id = verified_org_id(_user)
     try:
         query = supabase.table("model_stats_daily").select("date, org_id, project_id, provider, model, request_count, success_count, failure_count, fallback_count, total_prompt_tokens, total_completion_tokens, total_tokens, total_cost_usd, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms, timeout_count, rate_limit_count, provider_5xx_count, created_at")
-        
-        if org_id:
-            query = query.eq("org_id", org_id)
+
+        query = query.eq("org_id", caller_org_id)
         if project_id:
             query = query.eq("project_id", project_id)
         if start_date:
@@ -1075,8 +1071,8 @@ def get_observability_summary(
 
 @app.get("/observability/requests")
 def get_observability_requests(
-    org_id: str = None,
-    _user: AuthenticatedUser = Depends(require_auth),
+    org_id: str,
+    _user: AuthenticatedUser = Depends(require_org_member),
     project_id: str = None,
     start_date: str = None,
     end_date: str = None,
@@ -1086,10 +1082,15 @@ def get_observability_requests(
     limit: int = 100,
 ):
     """
-    Get recent request logs with optional filters.
-    
+    Get recent request logs for one organization.
+
+    org_id is REQUIRED and membership-checked. It used to be an optional filter
+    behind require_auth only, so any signed-in user could list another org's
+    request logs — and harvest the request_ids that make the trace endpoint
+    below exploitable.
+
     Query parameters:
-    - org_id: Filter by organization
+    - org_id: Organization to list (required; must be one you belong to)
     - project_id: Filter by project
     - start_date: Start date (ISO format)
     - end_date: End date (ISO format)
@@ -1098,14 +1099,15 @@ def get_observability_requests(
     - outcome: Filter by outcome (success, fallback_success, failure, refused)
     - limit: Maximum number of results (default 100, max 1000)
     """
+    # Filter by the org the guard actually verified, never the raw query value.
+    caller_org_id = verified_org_id(_user)
     try:
         limit = min(limit, 1000)  # Cap at 1000
-        
+
         cols = "id, request_id, trace_id, org_id, project_id, user_id, prompt_id, route_policy_name, route_policy_version, chosen_provider, chosen_model, reason_code, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, outcome, failure_reason, created_at"
         query = supabase.table("request_logs").select(cols)
-        
-        if org_id:
-            query = query.eq("org_id", org_id)
+
+        query = query.eq("org_id", caller_org_id)
         if project_id:
             query = query.eq("project_id", project_id)
         if start_date:
@@ -1131,33 +1133,58 @@ def get_observability_requests(
 
 
 @app.get("/observability/requests/{request_id}/trace")
-def get_request_trace(request_id: str):
+def get_request_trace(
+    request_id: str,
+    _user: AuthenticatedUser = Depends(require_org_member),
+):
     """
     Get full trace for a specific request (request + all spans).
+
+    Was completely unauthenticated: any anonymous caller who had a request_id
+    got that request's org_id, user_id, provider, model, token counts, cost and
+    outcome. A UUID is obscurity, not an access control — and the requests list
+    endpoint above was handing those UUIDs out to any signed-in user.
+
+    There is no {org_id} in this path, so the guard resolves the caller's org
+    from the X-Org-Id header (which is what the frontend already sends) and the
+    request row is re-filtered by that same verified org. A request belonging to
+    another tenant reads as 404, not 403, so this cannot be used to probe which
+    request_ids exist.
     """
+    caller_org_id = verified_org_id(_user)
     try:
-        # Get request log
+        # Get request log — scoped to the caller's verified org.
         req_cols = "id, request_id, trace_id, org_id, project_id, user_id, prompt_id, route_policy_name, route_policy_version, chosen_provider, chosen_model, reason_code, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, outcome, failure_reason, created_at"
         request_result = supabase.table("request_logs") \
             .select(req_cols) \
             .eq("request_id", request_id) \
-            .single() \
+            .eq("org_id", caller_org_id) \
+            .limit(1) \
             .execute()
-        
-        if not request_result.data:
+
+        rows = request_result.data or []
+        if not rows:
             raise HTTPException(status_code=404, detail="Request not found")
-        
-        # Get all spans for this request
+        request_row = rows[0]
+
+        # Defence in depth: never serve a row whose org_id is missing or does
+        # not match, even if the filter above were ever loosened.
+        if str(request_row.get("org_id") or "") != str(caller_org_id):
+            raise HTTPException(status_code=404, detail="Request not found")
+
+        # Spans are keyed only by request_id and carry no org_id of their own,
+        # so they are fetched only after the parent request has been confirmed
+        # to belong to the caller's org.
         span_cols = "id, request_id, trace_id, span_type, provider, model, attempt_number, start_time, end_time, duration_ms, status, error_message, prompt_tokens, completion_tokens, total_tokens, cost_usd, created_at"
         spans_result = supabase.table("request_spans") \
             .select(span_cols) \
             .eq("request_id", request_id) \
             .order("start_time", desc=False) \
             .execute()
-        
+
         return {
             "status": "success",
-            "request": request_result.data,
+            "request": request_row,
             "spans": spans_result.data or []
         }
     except HTTPException:
@@ -1175,102 +1202,16 @@ def replay_request(
     authorization: str = Header(None),
 ):
     """
-    Replay a stored request against a specified model/provider (admin-only).
-    Not implemented — this endpoint is a stub that does not call real providers.
+    Not implemented here. Replay/benchmarking lives in the `optimization` package.
+
+    This used to carry ~95 lines of unreachable body below an unconditional
+    `raise HTTPException(501)` — including an OPTIML_ENABLE_REPLAY gate that
+    could never be evaluated and a log_request() call that wrote a
+    reason_code="offline_replay" row with every metric set to None, i.e. a
+    fabricated replay record for a provider call that never happened. Deleted
+    rather than left to look like a shipped feature.
     """
-    raise HTTPException(status_code=501, detail="Replay endpoint is not yet implemented.")
-    import os
-    if not os.getenv("OPTIML_ENABLE_REPLAY", "false").lower() == "true":
-        raise HTTPException(status_code=403, detail="Replay is disabled. Set OPTIML_ENABLE_REPLAY=true to enable.")
-    
-    try:
-        # Authenticate (admin check - simplified for now)
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-        
-        # Get original request
-        orig_cols = "id, request_id, trace_id, org_id, project_id, user_id, prompt_id, route_policy_name, route_policy_version, chosen_provider, chosen_model, reason_code, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, outcome, failure_reason, prompt_text, response_text, created_at"
-        original_result = supabase.table("request_logs") \
-            .select(orig_cols) \
-            .eq("request_id", request_id) \
-            .single() \
-            .execute()
-        
-        if not original_result.data:
-            raise HTTPException(status_code=404, detail="Original request not found")
-        
-        original = original_result.data
-        
-        # Use provided prompt or original (if stored)
-        if not prompt_text:
-            if original.get("prompt_text"):
-                prompt_text = original["prompt_text"]
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="prompt_text is required because original prompt was not stored"
-                )
-        
-        # Use provided provider/model or original
-        replay_provider = provider or original["chosen_provider"]
-        replay_model = model or original["chosen_model"]
-        
-        # Create replay request_id and trace_id
-        replay_request_id = generate_request_id()
-        replay_trace_id = generate_trace_id()
-        
-        # Call the provider (simplified - would need to integrate with router system)
-        # For now, this is a placeholder that shows the structure
-        # TODO: Actually call the provider with the new provider/model
-        
-        # Log replay result
-        from utils.observability import log_request
-        
-        # This would be populated by actual provider call
-        log_request(
-            request_id=replay_request_id,
-            trace_id=replay_trace_id,
-            org_id=original["org_id"],
-            project_id=original.get("project_id"),
-            user_id=original.get("user_id"),
-            prompt_id=original.get("prompt_id"),
-            route_policy_name="replay",
-            route_policy_version="1.0.0",
-            chosen_provider=replay_provider,
-            chosen_model=replay_model,
-            reason_code="offline_replay",
-            prompt_tokens=None,  # Would be populated by actual call
-            completion_tokens=None,
-            total_tokens=None,
-            cost_usd=None,
-            latency_ms=0,
-            outcome=Outcome.SUCCESS,  # Would be determined by actual call
-            prompt_text=prompt_text,
-        )
-        
-        # Store replay link
-        supabase.table("replay_logs").insert({
-            "original_request_id": request_id,
-            "replay_request_id": replay_request_id,
-            "trace_id": replay_trace_id,
-            "replayed_provider": replay_provider,
-            "replayed_model": replay_model,
-            "replay_prompt_text": prompt_text,
-            "org_id": original["org_id"],
-            "project_id": original.get("project_id"),
-            "user_id": original.get("user_id"),
-        }).execute()
-        
-        return {
-            "status": "success",
-            "message": "Replay initiated",
-            "replay_request_id": replay_request_id,
-            "original_request_id": request_id,
-            "replay_provider": replay_provider,
-            "replay_model": replay_model,
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Replay failed: {str(e)}")
+    raise HTTPException(
+        status_code=501,
+        detail="Replay is not available on this endpoint; use the optimization replay/benchmark API.",
+    )

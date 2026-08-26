@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import google.generativeai as genai
 from supabase_client import supabase
 from utils.usage_logger import log_usage
-from utils.pricing import get_pricing
+from utils.pricing import get_pricing, get_non_token_rate
 from utils.encryption import decrypt_api_key
 
 router = APIRouter()
@@ -20,8 +20,10 @@ except ImportError:
     genai_new = None
     _HAS_GENAI_NEW = False
 
-IMAGEN_COST_PER_IMAGE = 0.03
-EMBEDDING_COST_PER_1K = 0.000025
+# Non-token prices (images, audio, embeddings) live in shared/providers.json
+# under non_token_rates.gemini, read via get_non_token_rate(). The second
+# argument is the historical constant, kept as a fallback so behaviour is
+# unchanged if the config section is missing.
 
 class PromptPayload(BaseModel):
     org_id: str
@@ -134,8 +136,9 @@ def handle_image_generation(payload: ImageGenerationPayload) -> dict:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:image/png;base64,{b64}"
-    log_usage(None, "Gemini", model, payload.prompt[:200], "[image]", payload.prompt_id, cost_usd=IMAGEN_COST_PER_IMAGE)
-    return {"url": data_url, "cost_usd": IMAGEN_COST_PER_IMAGE, "latency_ms": elapsed_ms}
+    cost_usd = get_non_token_rate("gemini", "image.imagen.per_image", 0.03)
+    log_usage(None, "Gemini", model, payload.prompt[:200], "[image]", payload.prompt_id, cost_usd=cost_usd)
+    return {"url": data_url, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 
 
 def handle_embedding(payload: EmbeddingPayload) -> dict:
@@ -157,7 +160,7 @@ def handle_embedding(payload: EmbeddingPayload) -> dict:
         pass
     else:
         emb = list(emb) if hasattr(emb, "__iter__") else []
-    cost_usd = (len(text) / 1000.0) * EMBEDDING_COST_PER_1K
+    cost_usd = (len(text) / 1000.0) * get_non_token_rate("gemini", "embedding.per_1k_tokens", 0.000025)
     log_usage(None, "Gemini", model, text[:200], f"[{len(emb)}d]", payload.prompt_id, cost_usd=cost_usd)
     return {"output": json.dumps(emb), "embedding": emb, "cost_usd": cost_usd, "latency_ms": elapsed_ms}
 

@@ -8,7 +8,7 @@ import logging
 import math
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from auth_dependency import require_auth, require_org_member, AuthenticatedUser
+from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from datetime import datetime, timezone, timedelta
@@ -31,17 +31,15 @@ def _nr_has_error(nr: Any) -> bool:
       - explicit errors:  status == "error"  or  error == True
       - output quality:   status == "warning"  (empty output, refusal, provider_error)
       - output_warning:   output_warning field is non-empty
+
+    Delegates to optimization.attempts.node_result_has_error, which is the ONE
+    place in the backend that parses `node_results`. Keeping a single definition
+    means the error rates shown here, in experiments, in rollback checks and in
+    optimization benchmarks are literally the same number.
     """
-    if not isinstance(nr, dict):
-        return False
-    _st = nr.get("status")
-    if _st == "error" or _st == "warning":
-        return True
-    if nr.get("error"):
-        return True
-    if nr.get("output_warning"):
-        return True
-    return False
+    from optimization.attempts import node_result_has_error
+
+    return node_result_has_error(nr)
 
 
 def _sse_line(data: Any) -> str:
@@ -344,17 +342,27 @@ async def update_workflow(workflow_id: str, payload: WorkflowUpdate, _user: Auth
 @router.delete("/workflows/{workflow_id}")
 async def delete_workflow(workflow_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a workflow and all associated data: runs, deployments, golden_inputs, eval_suites, then the workflow."""
+    # The guard proves the caller belongs to the org they named (X-Org-Id here,
+    # since org_id is not in the path). It does NOT prove this workflow is in
+    # that org — so compare before deleting anything.
+    caller_org_id = verified_org_id(_user)
     try:
-        # Verify workflow exists and get org_id for RLS (optional; delete may still work with service role)
         wf = supabase.table("workflows").select("id, org_id").eq("id", workflow_id).execute()
         if not wf.data or len(wf.data) == 0:
             raise HTTPException(status_code=404, detail="Workflow not found")
+        workflow_org_id = wf.data[0].get("org_id")
+        if not workflow_org_id or str(workflow_org_id) != str(caller_org_id):
+            logger.warning(
+                "Cross-tenant workflow delete blocked: workflow=%s belongs to org=%s, caller verified for org=%s",
+                workflow_id, workflow_org_id, caller_org_id,
+            )
+            raise HTTPException(status_code=403, detail="You do not have access to this workflow.")
         # Delete in order to respect FKs: runs -> deployments (eval_runs CASCADE from deployment) -> golden_inputs, eval_suites -> workflow
         supabase.table("workflow_runs").delete().eq("workflow_id", workflow_id).execute()
         supabase.table("workflow_deployments").delete().eq("workflow_id", workflow_id).execute()
         supabase.table("golden_inputs").delete().eq("workflow_id", workflow_id).execute()
         supabase.table("eval_suites").delete().eq("workflow_id", workflow_id).execute()
-        supabase.table("workflows").delete().eq("id", workflow_id).execute()
+        supabase.table("workflows").delete().eq("id", workflow_id).eq("org_id", caller_org_id).execute()
         return {"message": "Workflow deleted"}
     except HTTPException:
         raise
@@ -1566,6 +1574,144 @@ def _normalize_output(s: Optional[str]) -> str:
     return " ".join(str(s).split())
 
 
+# Optional columns on eval_run_results, added by
+# migration_pricing_provenance_and_eval_grading.sql. If that migration has not
+# been applied the insert is retried without them so an eval still records a
+# pass/fail instead of erroring the whole run.
+_EVAL_RESULT_OPTIONAL_COLS = (
+    "score", "grade_reasoning", "grader_provider", "grader_model",
+    "grading_cost_usd", "grading_latency_ms", "quality_provenance",
+)
+
+_MODEL_GRADED_DEFAULT_RUBRIC = (
+    "Judge whether the AI system's output is a correct, complete and helpful response "
+    "to the input. Score 1 (unusable) through 5 (excellent)."
+)
+_MODEL_GRADED_DEFAULT_THRESHOLD = 3.0
+_MODEL_GRADED_DEFAULT_MODEL = "gpt-4o-mini"
+
+
+def _insert_eval_result(row: dict) -> None:
+    """Insert one eval_run_results row, degrading gracefully if grading columns are absent."""
+    try:
+        supabase.table("eval_run_results").insert(row).execute()
+        return
+    except Exception as e:
+        msg = str(e)
+        if not any(col in msg for col in _EVAL_RESULT_OPTIONAL_COLS):
+            raise
+        logger.warning(
+            "eval_run_results is missing LLM-judge columns; inserting without them. "
+            "Apply migration_pricing_provenance_and_eval_grading.sql. Detail: %s", msg[:200]
+        )
+        supabase.table("eval_run_results").insert(
+            {k: v for k, v in row.items() if k not in _EVAL_RESULT_OPTIONAL_COLS}
+        ).execute()
+
+
+def _run_model_graded_check_sync(
+    org_id: str,
+    check_name: str,
+    config: dict,
+    input_text: str,
+    candidate_output: Optional[str],
+    expected_output: Optional[str],
+    eval_run_id: str,
+) -> dict:
+    """
+    Run one model_graded (LLM-judge) eval check via the shared judge in
+    auto_grading.grade_output_sync. There is exactly one judge in this backend;
+    this does not implement a second one.
+
+    Returns the fields to merge into the eval_run_results row. The resulting
+    quality signal is always recorded with quality_provenance='llm_judge' — an
+    LLM's opinion, never a business outcome and never a deterministic check.
+    """
+    from auto_grading import GradingError, grade_output_sync
+
+    config = config or {}
+    grading_type = str(config.get("grading_type") or config.get("metric_type") or "score").lower()
+    rubric = str(config.get("rubric") or config.get("criteria") or "").strip() or _MODEL_GRADED_DEFAULT_RUBRIC
+    grading_model = str(config.get("grading_model") or config.get("model") or _MODEL_GRADED_DEFAULT_MODEL).strip()
+    try:
+        threshold = float(config.get("threshold", config.get("min_score", _MODEL_GRADED_DEFAULT_THRESHOLD)))
+    except (TypeError, ValueError):
+        threshold = _MODEL_GRADED_DEFAULT_THRESHOLD
+    categories = config.get("categories") or []
+    passing_categories = [str(c) for c in (config.get("passing_categories") or [])]
+    reference = expected_output if config.get("use_expected_output", True) else None
+
+    base = {
+        "passed": False,
+        "failure_reason": None,
+        "score": None,
+        "grade_reasoning": None,
+        "grader_provider": None,
+        "grader_model": grading_model,
+        "grading_cost_usd": None,
+        "grading_latency_ms": None,
+        "quality_provenance": "llm_judge",
+    }
+
+    if candidate_output is None or not str(candidate_output).strip():
+        base["failure_reason"] = "Candidate produced no output to grade"
+        return base
+
+    if grading_type == "category" and not passing_categories:
+        base["failure_reason"] = (
+            f"Check '{check_name}' uses grading_type=category but config.passing_categories is not set"
+        )
+        return base
+
+    try:
+        graded = grade_output_sync(
+            org_id,
+            metric_type=grading_type,
+            rubric=rubric,
+            output=str(candidate_output),
+            input_text=input_text or "",
+            model=grading_model,
+            categories=categories,
+            expected_output=reference,
+            prompt_id=f"eval-{eval_run_id}",
+        )
+    except GradingError as e:
+        base["failure_reason"] = f"AI grader unavailable: {str(e)[:400]}"
+        return base
+    except Exception as e:  # never let a judge failure kill the whole eval run
+        base["failure_reason"] = f"AI grader error: {str(e)[:400]}"
+        return base
+
+    base["grader_provider"] = graded.get("grader_provider")
+    base["grader_model"] = graded.get("grader_model") or grading_model
+    base["grading_cost_usd"] = graded.get("grading_cost")
+    base["grading_latency_ms"] = graded.get("grading_latency_ms")
+    base["grade_reasoning"] = graded.get("reasoning")
+
+    if grading_type == "binary":
+        base["passed"] = bool(graded.get("binary_result"))
+        base["score"] = 1.0 if base["passed"] else 0.0
+        if not base["passed"]:
+            base["failure_reason"] = f"AI judge answered no: {graded.get('reasoning') or ''}".strip()
+    elif grading_type == "category":
+        cat = graded.get("category_result") or ""
+        base["passed"] = cat in passing_categories
+        if not base["passed"]:
+            base["failure_reason"] = (
+                f"AI judge categorised output as '{cat}', not in {passing_categories}"
+            )
+    else:
+        score = graded.get("score")
+        base["score"] = score
+        base["passed"] = score is not None and float(score) >= threshold
+        if not base["passed"]:
+            base["failure_reason"] = (
+                f"AI-graded score {score} is below the passing threshold {threshold}. "
+                f"{graded.get('reasoning') or ''}".strip()
+            )
+    return base
+
+
 def _run_eval_sync(deployment_id: str, eval_run_id: str) -> None:
     """Run eval for a deployment: execute each golden input on candidate (and production for regression), run checks, write results."""
     try:
@@ -1630,6 +1776,8 @@ def _run_eval_sync(deployment_id: str, eval_run_id: str) -> None:
 
         total_checks = 0
         passed_checks = 0
+        model_graded_ran = False
+        grading_cost_total = 0.0
         start_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         for gi in golden_inputs:
@@ -1816,9 +1964,21 @@ def _run_eval_sync(deployment_id: str, eval_run_id: str) -> None:
                     }).execute()
 
                 elif check_type == "model_graded":
-                    passed = False
-                    failure_reason = "AI-graded check not yet implemented"
-                    supabase.table("eval_run_results").insert({
+                    graded = _run_model_graded_check_sync(
+                        org_id,
+                        check_name,
+                        config,
+                        input_text,
+                        candidate_output,
+                        expected_output,
+                        eval_run_id,
+                    )
+                    passed = bool(graded["passed"])
+                    failure_reason = graded["failure_reason"]
+                    model_graded_ran = True
+                    if graded.get("grading_cost_usd"):
+                        grading_cost_total += float(graded["grading_cost_usd"])
+                    _insert_eval_result({
                         "eval_run_id": eval_run_id,
                         "golden_input_id": gi_id,
                         "check_name": check_name,
@@ -1828,7 +1988,16 @@ def _run_eval_sync(deployment_id: str, eval_run_id: str) -> None:
                         "candidate_latency_ms": candidate_latency_ms,
                         "candidate_cost": candidate_cost,
                         "failure_reason": failure_reason,
-                    }).execute()
+                        "score": graded["score"],
+                        "grade_reasoning": graded["grade_reasoning"],
+                        "grader_provider": graded["grader_provider"],
+                        "grader_model": graded["grader_model"],
+                        "grading_cost_usd": graded["grading_cost_usd"],
+                        "grading_latency_ms": graded["grading_latency_ms"],
+                        # An LLM's opinion. Never a business outcome, never a
+                        # deterministic check.
+                        "quality_provenance": "llm_judge",
+                    })
                 else:
                     passed = True
                     supabase.table("eval_run_results").insert({
@@ -1850,14 +2019,20 @@ def _run_eval_sync(deployment_id: str, eval_run_id: str) -> None:
         end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         duration_ms = end_ms - start_ms
         status = "passed" if (total_checks == 0 or passed_checks == total_checks) else "failed"
+        summary = {
+            "total_checks": total_checks,
+            "passed": passed_checks,
+            "failed": total_checks - passed_checks,
+            "duration_ms": duration_ms,
+        }
+        if model_graded_ran:
+            # Say plainly where the quality signal came from. An LLM-judge score
+            # is NOT equivalent to a measured business outcome.
+            summary["quality_provenance"] = "llm_judge"
+            summary["grading_cost_usd"] = round(grading_cost_total, 6)
         supabase.table("eval_runs").update({
             "status": status,
-            "summary": {
-                "total_checks": total_checks,
-                "passed": passed_checks,
-                "failed": total_checks - passed_checks,
-                "duration_ms": duration_ms,
-            },
+            "summary": summary,
             "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }).eq("id", eval_run_id).execute()
         dep_status = "promoted" if status == "passed" else "failed"
@@ -1997,52 +2172,14 @@ async def get_eval_run(eval_run_id: str, _user: AuthenticatedUser = Depends(requ
 
 # ---------------------------------------------------------------------------
 # Promote override (admin) — Phase 5
+#
+# REMOVED: a second, byte-for-byte duplicate declaration of
+# POST /workflow-deployments/{deployment_id}/promote (plus a duplicate
+# PromoteOverridePayload). FastAPI dispatches to the FIRST matching route, so
+# this copy never ran — every request was already served by the handler defined
+# earlier in this file. Edits made here would have had no effect at runtime.
+# The live handler is promote_deployment_override() above.
 # ---------------------------------------------------------------------------
-
-class PromoteOverridePayload(BaseModel):
-    override_reason: Optional[str] = None
-
-    class Config:
-        extra = "ignore"
-
-
-@router.post("/workflow-deployments/{deployment_id}/promote")
-async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload = None, _user: AuthenticatedUser = Depends(require_org_member)):
-    """Admin override: promote a deployment despite failed eval. Sets status=promoted, promoted_at, override_reason."""
-    try:
-        payload = payload or PromoteOverridePayload()
-        dep = (
-            supabase.table("workflow_deployments")
-            .select("id, status")
-            .eq("id", deployment_id)
-            .single()
-            .execute()
-        )
-        if not dep.data:
-            raise HTTPException(status_code=404, detail="Deployment not found")
-        update = {
-            "status": "promoted",
-            "promoted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "override_reason": (payload.override_reason or "").strip() or None,
-        }
-        result = (
-            supabase.table("workflow_deployments")
-            .update(update)
-            .eq("id", deployment_id)
-            .execute()
-        )
-        if not result.data or len(result.data) == 0:
-            raise HTTPException(status_code=500, detail="Update failed")
-        row = result.data[0]
-        oid = row.get("org_id")
-        slug = (row.get("endpoint_slug") or "").strip()
-        if oid and slug:
-            await asyncio.to_thread(_end_experiments_on_endpoint_sync, str(oid), slug, "new_deployment")
-        return _deployment_row_to_response(row)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -3830,16 +3967,28 @@ def _execute_automatic_rollback_sync(rule: dict) -> None:
     }).eq("id", rule_id).execute()
 
 
-async def run_rollback_monitor_cycle() -> dict:
-    """Run one cycle: evaluate all enabled rollback rules and execute rollback when action=rollback. Returns summary."""
+async def run_rollback_monitor_cycle(org_id: Optional[str] = None) -> dict:
+    """
+    Run one cycle: evaluate all enabled rollback rules and execute rollback when
+    action=rollback. Returns summary.
+
+    org_id scopes the cycle to a single organization (used by the service-key
+    cron path, which is org-scoped). None evaluates every org and is only
+    reachable from the in-process scheduler or the shared cron secret.
+
+    A failure on one rule is recorded and the loop continues; one org's bad rule
+    must never stop rollbacks for everyone else.
+    """
     result = {"checked": 0, "triggered": 0, "errors": []}
     try:
-        rules_result = (
+        rules_query = (
             supabase.table("rollback_rules")
             .select(_ROLLBACK_RULE_COLS)
             .eq("enabled", True)
-            .execute()
         )
+        if org_id:
+            rules_query = rules_query.eq("org_id", org_id)
+        rules_result = rules_query.execute()
         rules = rules_result.data or []
         result["checked"] = len(rules)
         for rule in rules:
@@ -3875,10 +4024,57 @@ async def run_rollback_monitor_cycle() -> dict:
 
 
 @router.post("/rollback-monitor/run")
-async def trigger_rollback_monitor(_user: AuthenticatedUser = Depends(require_org_member)):
-    """Trigger one rollback monitor cycle (e.g. from cron every 60s). Returns summary."""
-    summary = await run_rollback_monitor_cycle()
+async def trigger_rollback_monitor(org_id: Optional[str] = None, _user: AuthenticatedUser = Depends(require_org_member)):
+    """
+    Trigger one rollback monitor cycle from the UI. Requires a user JWT, so it is
+    NOT machine-callable; the scheduler in background_jobs.py runs this loop on a
+    timer, and POST /control-loop/run is the service-key path for external cron.
+    """
+    summary = await run_rollback_monitor_cycle(org_id=org_id)
     return summary
+
+
+async def run_experiment_auto_conclude_cycle(org_id: Optional[str] = None) -> dict:
+    """
+    Evaluate every running experiment that has auto_conclude set.
+
+    Before this existed, _maybe_auto_conclude only ran from GET /experiments/{id},
+    i.e. only when a human happened to open the page — an experiment that reached
+    significance overnight stayed running until someone looked at it.
+    """
+    result = {"checked": 0, "concluded": 0, "errors": []}
+    try:
+        query = (
+            supabase.table("experiments")
+            .select("id, status, auto_conclude")
+            .eq("status", "running")
+            .eq("auto_conclude", True)
+        )
+        if org_id:
+            query = query.eq("org_id", org_id)
+        rows = query.execute().data or []
+        result["checked"] = len(rows)
+        for row in rows:
+            exp_id = str(row.get("id"))
+            try:
+                # Every row here is status='running' by the query filter, so a
+                # status change after the call means it concluded.
+                await _maybe_auto_conclude(exp_id)
+                after = (
+                    supabase.table("experiments")
+                    .select("status")
+                    .eq("id", exp_id)
+                    .single()
+                    .execute()
+                )
+                if (after.data or {}).get("status") != "running":
+                    result["concluded"] += 1
+            except Exception as e:
+                # One bad experiment must not stop the sweep.
+                result["errors"].append({"experiment_id": exp_id, "error": str(e)[:300]})
+    except Exception as e:
+        result["errors"].append({"cycle": str(e)[:300]})
+    return result
 
 
 # ---------------------------------------------------------------------------

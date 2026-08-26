@@ -1,4 +1,13 @@
-"""OptiML Python SDK — call your deployed AI workflows from Python."""
+"""OptiML Python SDK.
+
+Two ways in:
+
+* **Direct inference** — point an OpenAI-compatible client at
+  ``https://api.optiml.one/v1`` (or use :meth:`OptiMLClient.chat`) and keep your
+  existing application exactly as it is. No workflow, no migration.
+* **Deployed workflows** — call a Studio deployment by endpoint slug with
+  :meth:`OptiMLClient.run`.
+"""
 
 from .client import OptiMLClient
 from .exceptions import (

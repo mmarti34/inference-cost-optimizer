@@ -1,9 +1,10 @@
 import os
 import uuid
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from supabase_client import supabase
+from auth_dependency import require_org_member, AuthenticatedUser, verified_org_id
 from plan_enforcement import check_project_limit
 
 router = APIRouter()
@@ -31,11 +32,17 @@ class ProjectResponse(BaseModel):
 
 # Project Endpoints
 @router.post("/projects", response_model=ProjectResponse)
-async def create_project(project_data: ProjectCreate):
-    """Create a new project"""
+async def create_project(
+    project_data: ProjectCreate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Create a new project in the caller's verified org."""
+    # The guard resolved org_id from the body and proved membership; use that
+    # exact value rather than re-reading the (attacker-controlled) body field.
+    org_id = verified_org_id(auth_user)
     try:
         # Plan enforcement: check project limit before creating
-        check_project_limit(project_data.org_id)
+        check_project_limit(org_id)
 
         # Generate UUID for the project
         project_id = str(uuid.uuid4())
@@ -46,7 +53,7 @@ async def create_project(project_data: ProjectCreate):
             "name": project_data.name,
             "description": project_data.description,
             "monthly_budget": project_data.monthly_budget,
-            "org_id": project_data.org_id
+            "org_id": org_id
         }).execute()
         
         if not result.data:
@@ -64,7 +71,10 @@ async def create_project(project_data: ProjectCreate):
         raise HTTPException(status_code=500, detail=f"Error creating project: {error_msg}")
 
 @router.get("/projects/{org_id}", response_model=List[ProjectResponse])
-async def get_projects(org_id: str):
+async def get_projects(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Get all projects for an organization"""
     try:
         result = supabase.table("projects").select("id, name, description, monthly_budget, org_id, user_id, created_at").eq("org_id", org_id).execute()
@@ -86,7 +96,11 @@ async def get_projects(org_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching projects: {error_msg}")
 
 @router.get("/projects/{org_id}/{project_id}", response_model=ProjectResponse)
-async def get_project(org_id: str, project_id: str):
+async def get_project(
+    org_id: str,
+    project_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Get a specific project"""
     try:
         result = supabase.table("projects").select("id, name, description, monthly_budget, org_id, user_id, created_at").eq("id", project_id).eq("org_id", org_id).single().execute()
@@ -99,7 +113,12 @@ async def get_project(org_id: str, project_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching project: {str(e)}")
 
 @router.put("/projects/{org_id}/{project_id}", response_model=ProjectResponse)
-async def update_project(org_id: str, project_id: str, project_data: ProjectUpdate):
+async def update_project(
+    org_id: str,
+    project_id: str,
+    project_data: ProjectUpdate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Update a project"""
     try:
         # First check if the project exists and belongs to the org
@@ -126,7 +145,11 @@ async def update_project(org_id: str, project_id: str, project_data: ProjectUpda
         raise HTTPException(status_code=500, detail=f"Error updating project: {str(e)}")
 
 @router.delete("/projects/{org_id}/{project_id}")
-async def delete_project(org_id: str, project_id: str):
+async def delete_project(
+    org_id: str,
+    project_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Delete a project"""
     try:
         # First check if the project exists and belongs to the org
@@ -136,7 +159,7 @@ async def delete_project(org_id: str, project_id: str):
             raise HTTPException(status_code=404, detail="Project not found")
         
         # Check if there are any prompt templates using this project
-        prompts_result = supabase.table("prompt_templates").select("id").eq("project_id", project_id).limit(1).execute()
+        prompts_result = supabase.table("prompt_templates").select("id").eq("project_id", project_id).eq("org_id", org_id).limit(1).execute()
         
         if prompts_result.data:
             raise HTTPException(status_code=400, detail="Cannot delete project that has prompt templates. Please reassign or delete the prompt templates first.")
@@ -154,29 +177,14 @@ async def delete_project(org_id: str, project_id: str):
 def _debug_enabled() -> bool:
     return os.environ.get("OPTIML_DEBUG", "false").lower() == "true"
 
-@router.get("/debug/projects")
-async def debug_projects():
-    """Debug endpoint to test projects table access. Disabled unless OPTIML_DEBUG=true."""
-    if not _debug_enabled():
-        raise HTTPException(status_code=404, detail="Not Found")
-    try:
-        # Test basic table access
-        result = supabase.table("projects").select("id, name, description, monthly_budget, org_id, user_id, created_at").limit(1).execute()
-        return {
-            "status": "success",
-            "message": "Projects table accessible",
-            "count": len(result.data) if result.data else 0,
-            "sample_data": result.data[0] if result.data else None
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Projects table error: {str(e)}",
-            "error_type": type(e).__name__
-        }
+# `GET /debug/projects` was removed: it returned a sample row from the projects
+# table with no org filter at all, i.e. an arbitrary other tenant's project.
 
 @router.get("/debug/projects/{org_id}")
-async def debug_get_projects(org_id: str):
+async def debug_get_projects(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """Debug endpoint to test GET projects with org_id. Disabled unless OPTIML_DEBUG=true."""
     if not _debug_enabled():
         raise HTTPException(status_code=404, detail="Not Found")

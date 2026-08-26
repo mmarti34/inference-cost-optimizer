@@ -2,11 +2,12 @@
 Custom model configs: named LLM presets per org.
 Explicit columns only; no select("*"); no updated_at.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
 from supabase_client import supabase
+from auth_dependency import require_org_member, AuthenticatedUser, verified_org_id
 
 router = APIRouter()
 
@@ -54,7 +55,10 @@ class CustomModelResponse(BaseModel):
 
 
 @router.get("/custom-models", response_model=List[CustomModelResponse])
-async def get_custom_models(org_id: str):
+async def get_custom_models(
+    org_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
     """List custom models for an organization."""
     try:
         result = (
@@ -70,11 +74,15 @@ async def get_custom_models(org_id: str):
 
 
 @router.post("/custom-models", response_model=CustomModelResponse)
-async def create_custom_model(payload: CustomModelCreate):
-    """Create a custom model config."""
+async def create_custom_model(
+    payload: CustomModelCreate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Create a custom model config in the caller's verified org."""
+    org_id = verified_org_id(auth_user)
     try:
         data = {
-            "org_id": payload.org_id,
+            "org_id": org_id,
             "name": payload.name,
             "provider": payload.provider,
             "base_model": payload.base_model,
@@ -101,14 +109,26 @@ async def create_custom_model(payload: CustomModelCreate):
     }
 
 
-@router.put("/custom-models/{model_id}", response_model=CustomModelResponse)
-async def update_custom_model(model_id: str, payload: CustomModelUpdate):
-    """Update a custom model config."""
+@router.put("/custom-models/{org_id}/{model_id}", response_model=CustomModelResponse)
+async def update_custom_model(
+    org_id: str,
+    model_id: str,
+    payload: CustomModelUpdate,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Update a custom model config.
+
+    org_id is in the PATH so the guard verifies membership of the same org the
+    query re-filters by. Previously this route was `/custom-models/{model_id}`
+    with no guard and no org filter — any id, any tenant.
+    """
     try:
         existing = (
             supabase.table("custom_models")
             .select(COLS)
             .eq("id", model_id)
+            .eq("org_id", org_id)
             .single()
             .execute()
         )
@@ -124,6 +144,7 @@ async def update_custom_model(model_id: str, payload: CustomModelUpdate):
             supabase.table("custom_models")
             .update(update_data)
             .eq("id", model_id)
+            .eq("org_id", org_id)
             .execute()
         )
     except Exception as e:
@@ -144,13 +165,25 @@ async def update_custom_model(model_id: str, payload: CustomModelUpdate):
     }
 
 
-@router.delete("/custom-models/{model_id}")
-async def delete_custom_model(model_id: str):
-    """Delete a custom model config."""
+@router.delete("/custom-models/{org_id}/{model_id}")
+async def delete_custom_model(
+    org_id: str,
+    model_id: str,
+    auth_user: AuthenticatedUser = Depends(require_org_member),
+):
+    """Delete a custom model config owned by the org in the path."""
     try:
-        result = supabase.table("custom_models").delete().eq("id", model_id).execute()
+        result = (
+            supabase.table("custom_models")
+            .delete()
+            .eq("id", model_id)
+            .eq("org_id", org_id)
+            .execute()
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Custom model not found")
     return {"message": "Custom model deleted"}
 
 

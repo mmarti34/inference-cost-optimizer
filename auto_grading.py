@@ -32,7 +32,7 @@ def get_enabled_auto_graded_metrics_sync(org_id: str, endpoint_slug: str) -> lis
     try:
         r = (
             supabase.table("auto_graded_metrics")
-            .select("id, name, key, metric_type, rubric, categories, direction, grading_model, sample_rate")
+            .select("id, name, key, metric_type, rubric, categories, direction, grading_model, sample_rate, endpoint_slugs")
             .eq("org_id", org_id)
             .eq("enabled", True)
             .execute()
@@ -115,6 +115,138 @@ def insert_auto_grade_result_sync(
         logger.warning("auto_grade_results insert failed: %s", e)
 
 
+class GradingError(RuntimeError):
+    """The LLM judge could not produce a usable grade (call failed or reply was unparseable)."""
+
+
+def build_grading_prompt(
+    metric_type: str,
+    rubric: str,
+    input_text: str,
+    output: str,
+    categories: Optional[list] = None,
+    expected_output: Optional[str] = None,
+) -> str:
+    """Build the judge prompt for one metric type. Single source of the rubric wording."""
+    metric_type = (metric_type or "score").lower()
+    rubric = (rubric or "").strip() or "Evaluate the response."
+    inp_preview = (input_text or "")[:500]
+    out_preview = (output or "")[:1000]
+    expected_block = ""
+    if expected_output:
+        expected_block = f"\nReference answer (for comparison, not a required verbatim match): {str(expected_output)[:1000]}\n"
+
+    header = (
+        "You are evaluating an AI system's output.\n\n"
+        f"Input from user: {inp_preview}\n"
+        f"AI system output: {out_preview}\n"
+        f"{expected_block}\n"
+        f"{rubric}\n\n"
+    )
+    if metric_type == "binary":
+        return header + 'Respond with ONLY a JSON object: {"result": true or false, "reasoning": "<one sentence>"}'
+    if metric_type == "category":
+        cats = categories or []
+        cats_str = ", ".join(f'"{c}"' for c in cats) if cats else '"positive", "neutral", "negative"'
+        return header + (
+            f"Choose one category from: [{cats_str}]\n"
+            'Respond with ONLY a JSON object: {"category": "<chosen category>", "reasoning": "<one sentence>"}'
+        )
+    # "score" and any unknown type both grade on the 1-5 scale.
+    return header + 'Respond with ONLY a JSON object: {"score": <number 1-5>, "reasoning": "<one sentence>"}'
+
+
+def _parse_grade_reply(reply: str) -> dict:
+    reply_clean = (reply or "").strip().strip("`").strip()
+    if reply_clean.startswith("json"):
+        reply_clean = reply_clean[4:].strip()
+    try:
+        parsed = json.loads(reply_clean)
+    except (ValueError, TypeError) as e:
+        raise GradingError(f"judge reply was not valid JSON: {reply_clean[:200]}") from e
+    if not isinstance(parsed, dict):
+        raise GradingError(f"judge reply was not a JSON object: {reply_clean[:200]}")
+    return parsed
+
+
+def grade_output_sync(
+    org_id: str,
+    *,
+    metric_type: str,
+    rubric: str,
+    output: str,
+    input_text: str,
+    model: Optional[str] = None,
+    categories: Optional[list] = None,
+    expected_output: Optional[str] = None,
+    prompt_id: str = "grade",
+) -> dict:
+    """
+    Run the LLM judge once and return a structured grade.
+
+    This is the ONLY LLM judge in the backend. Both production auto-grading
+    (auto_grade_results) and eval-gate model_graded checks (eval_run_results)
+    go through it, so the rubric wording, provider routing and cost accounting
+    stay identical between them.
+
+    Returns {metric_type, score, binary_result, category_result, reasoning,
+             grading_latency_ms, grading_cost, grader_provider, grader_model}.
+    Raises GradingError when the judge could not be called or its reply could
+    not be parsed — callers decide whether that is a failure or a skip.
+
+    NOTE: the result is an LLM's opinion. It is a quality signal of provenance
+    'llm_judge' and must never be recorded or presented as a business outcome
+    or as a deterministic check.
+    """
+    metric_type = (metric_type or "score").lower()
+    grading_model = (model or "gpt-4o-mini").strip() or "gpt-4o-mini"
+    grader_provider = _model_to_provider(grading_model)
+    grade_prompt = build_grading_prompt(
+        metric_type, rubric, input_text, output,
+        categories=categories, expected_output=expected_output,
+    )
+
+    start = time.perf_counter()
+    try:
+        result = _call_grading_llm_sync(org_id, grading_model, grade_prompt, prompt_id=prompt_id)
+    except Exception as e:
+        raise GradingError(f"judge call failed ({grader_provider}/{grading_model}): {e}") from e
+    latency_ms = int((time.perf_counter() - start) * 1000)
+
+    reply = (result.get("response") or result.get("output") or "").strip()
+    parsed = _parse_grade_reply(reply)
+    cost = _estimate_grading_cost_sync(
+        result.get("input_tokens") or 0,
+        result.get("output_tokens") or 0,
+        grading_model,
+    )
+
+    score = None
+    binary_result = None
+    category_result = None
+    if metric_type == "binary":
+        binary_result = bool(parsed.get("result", False))
+    elif metric_type == "category":
+        category_result = str(parsed.get("category", ""))[:200]
+    else:
+        try:
+            score = float(parsed.get("score", 0))
+        except (TypeError, ValueError) as e:
+            raise GradingError(f"judge returned a non-numeric score: {parsed.get('score')!r}") from e
+
+    return {
+        "metric_type": metric_type,
+        "score": score,
+        "binary_result": binary_result,
+        "category_result": category_result,
+        "reasoning": str(parsed.get("reasoning", ""))[:500],
+        "grading_latency_ms": latency_ms,
+        "grading_cost": cost,
+        "grader_provider": grader_provider,
+        "grader_model": grading_model,
+    }
+
+
 def _grade_one_sync(
     request_log_id: str,
     org_id: str,
@@ -122,90 +254,31 @@ def _grade_one_sync(
     output: str,
     input_text: str,
 ) -> None:
-    """Grade one metric (sync)."""
-    metric_type = (metric.get("metric_type") or "score").lower()
-    rubric = (metric.get("rubric") or "").strip() or "Evaluate the response."
+    """Grade one metric (sync) and store it in auto_grade_results."""
     key = metric.get("key") or ""
     metric_id = metric.get("id")
-    model = (metric.get("grading_model") or "gpt-4o-mini").strip()
-    inp_preview = (input_text or "")[:500]
-    out_preview = (output or "")[:1000]
-
-    if metric_type == "score":
-        grade_prompt = f"""You are evaluating an AI system's output.
-
-Input from user: {inp_preview}
-AI system output: {out_preview}
-
-{rubric}
-
-Respond with ONLY a JSON object: {{"score": <number 1-5>, "reasoning": "<one sentence>"}}"""
-    elif metric_type == "binary":
-        grade_prompt = f"""You are evaluating an AI system's output.
-
-Input from user: {inp_preview}
-AI system output: {out_preview}
-
-{rubric}
-
-Respond with ONLY a JSON object: {{"result": true or false, "reasoning": "<one sentence>"}}"""
-    elif metric_type == "category":
-        categories = metric.get("categories") or []
-        cats_str = ", ".join(f'"{c}"' for c in categories) if categories else '"positive", "neutral", "negative"'
-        grade_prompt = f"""You are evaluating an AI system's output.
-
-Input from user: {inp_preview}
-AI system output: {out_preview}
-
-{rubric}
-
-Choose one category from: [{cats_str}]
-Respond with ONLY a JSON object: {{"category": "<chosen category>", "reasoning": "<one sentence>"}}"""
-    else:
-        grade_prompt = f"""You are evaluating an AI system's output.
-
-Input from user: {inp_preview}
-AI system output: {out_preview}
-
-{rubric}
-
-Respond with ONLY a JSON object: {{"score": <number 1-5>, "reasoning": "<one sentence>"}}"""
-
-    start = time.perf_counter()
     try:
-        result = _call_grading_llm_sync(org_id, model, grade_prompt, prompt_id=f"grade-{key}-{request_log_id}")
-        latency_ms = int((time.perf_counter() - start) * 1000)
-        reply = (result.get("response") or result.get("output") or "").strip()
-        reply_clean = reply.strip().strip("`").strip()
-        if reply_clean.startswith("json"):
-            reply_clean = reply_clean[4:].strip()
-        parsed = json.loads(reply_clean)
-        cost = _estimate_grading_cost_sync(
-            result.get("input_tokens") or 0,
-            result.get("output_tokens") or 0,
-            model,
+        graded = grade_output_sync(
+            org_id,
+            metric_type=(metric.get("metric_type") or "score"),
+            rubric=(metric.get("rubric") or ""),
+            output=output or "",
+            input_text=input_text or "",
+            model=metric.get("grading_model"),
+            categories=metric.get("categories") or [],
+            prompt_id=f"grade-{key}-{request_log_id}",
         )
-        score = None
-        binary_result = None
-        category_result = None
-        if metric_type == "score":
-            score = float(parsed.get("score", 0))
-        elif metric_type == "binary":
-            binary_result = bool(parsed.get("result", False))
-        elif metric_type == "category":
-            category_result = str(parsed.get("category", ""))[:200]
-        reasoning = str(parsed.get("reasoning", ""))[:500]
         insert_auto_grade_result_sync(
             org_id=org_id,
             request_log_id=request_log_id,
             metric_id=str(metric_id),
             metric_key=key,
-            score=score,
-            binary_result=binary_result,
-            category_result=category_result,
-            reasoning=reasoning,
-            grading_latency_ms=latency_ms,
-            grading_cost=cost,
+            score=graded["score"],
+            binary_result=graded["binary_result"],
+            category_result=graded["category_result"],
+            reasoning=graded["reasoning"],
+            grading_latency_ms=graded["grading_latency_ms"],
+            grading_cost=graded["grading_cost"],
         )
     except Exception as e:
         logger.error("Auto-grading failed for metric %s: %s", key, e, exc_info=False)

@@ -1,10 +1,11 @@
 import re
 import uuid
 import logging
+from typing import Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from supabase_client import supabase
-from auth_dependency import require_auth, require_org_member, AuthenticatedUser
+from auth_dependency import require_auth, require_org_member, require_org_admin, AuthenticatedUser
 from email_service import send_invite_email
 
 logger = logging.getLogger(__name__)
@@ -45,19 +46,33 @@ def get_upgrade_suggestion(plan):
 
 @router.get("/api/organizations/test")
 def test_connection():
-    """Test endpoint to check if the router and database connection work"""
-    try:
-        if not supabase:
-            return {"status": "error", "message": "Supabase client not initialized"}
-        
-        # Test basic query
-        result = supabase.table("organizations").select("count").limit(1).execute()
-        return {"status": "success", "message": "Database connection working", "data": result.data}
-    except Exception as e:
-        return {"status": "error", "message": f"Database connection failed: {str(e)}"}
+    """
+    Liveness probe for this router. Intentionally unauthenticated, but it no
+    longer runs a query or echoes database state / driver errors back to an
+    anonymous caller — it used to return an organizations row count and the raw
+    exception text on failure.
+    """
+    return {
+        "status": "success" if supabase else "error",
+        "message": "Router reachable" if supabase else "Supabase client not initialized",
+    }
 
 @router.post("/api/organizations/create")
-def create_organization(user_id: str = Body(...), org_name: str = Body(...), plan: str = Body("free")):
+def create_organization(
+    org_name: str = Body(...),
+    user_id: Optional[str] = Body(None),
+    plan: str = Body("free"),
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """
+    Create an organization owned by the authenticated caller.
+
+    ``user_id`` and ``plan`` in the body are ignored: the org is always created
+    for the caller, and its plan always comes from the caller's Stripe-backed
+    ``user_profiles.subscription_tier``. A client-supplied plan used to be able
+    to mint an ``enterprise`` org with every limit set to unlimited.
+    """
+    user_id = auth_user.user_id
     try:
         logger.info(f"Creating organization: user_id={user_id}, org_name={org_name}, plan={plan}")
         
@@ -82,9 +97,10 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
             user_actual_plan = user_profile_result.data["subscription_tier"]
         logger.info(f"User's actual plan: {user_actual_plan}")
         
-        # Use the provided plan or user's actual plan, whichever is higher
-        plan_priority = {"free": 0, "startup": 1, "team": 2, "enterprise": 3}
-        effective_plan = max([plan, user_actual_plan], key=lambda p: plan_priority.get(p, 0))
+        # The org plan is the caller's own subscription tier. The client-supplied
+        # `plan` value is deliberately NOT considered — plan is billing state and
+        # only Stripe (via stripe_webhook.py) may raise it.
+        effective_plan = user_actual_plan if user_actual_plan in PLAN_LIMITS else "free"
         logger.info(f"Effective plan for organization: {effective_plan}")
         
         # 2. Check if user can create organizations (Free users cannot create orgs)
@@ -161,8 +177,21 @@ def create_organization(user_id: str = Body(...), org_name: str = Body(...), pla
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/invite")
-def invite_member(org_id: str = Body(...), email: str = Body(...), user_id: str = Body(...), inviter_email: str = Body("a team admin")):
-    """Invite a member to an organization. Generates a token and sends an email."""
+def invite_member(
+    org_id: str = Body(...),
+    email: str = Body(...),
+    user_id: Optional[str] = Body(None),
+    inviter_email: str = Body("a team admin"),
+    auth_user: AuthenticatedUser = Depends(require_org_admin),
+):
+    """
+    Invite a member to an organization. Admin of org_id only.
+
+    Was previously unauthenticated: anyone could invite their own address into
+    any organization and then accept the emailed token, a full takeover.
+    """
+    user_id = auth_user.user_id
+    inviter_email = auth_user.email or inviter_email
     try:
         logger.info("Inviting %s to org %s by user %s", email, org_id, user_id)
 
@@ -257,8 +286,22 @@ def invite_member(org_id: str = Body(...), email: str = Body(...), user_id: str 
 
 
 @router.post("/api/organizations/accept-invite")
-def accept_invite(token: str = Body(...), user_id: str = Body(...)):
-    """Accept an organization invite by token. Links the user to the org."""
+def accept_invite(
+    token: str = Body(...),
+    user_id: Optional[str] = Body(None),
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """
+    Accept an organization invite by token.
+
+    The membership is always created for the *authenticated* caller — the
+    ``user_id`` body field is ignored (it used to let anyone holding a token
+    grant membership to an arbitrary account). The invite must also have been
+    addressed to the caller's own verified email address.
+    """
+    # Never trust a body-supplied user id.
+    user_id = auth_user.user_id
+    caller_email = (auth_user.email or "").lower().strip()
     try:
         # 1. Look up the token
         token_result = supabase.table("invite_tokens") \
@@ -270,6 +313,18 @@ def accept_invite(token: str = Body(...), user_id: str = Body(...)):
             raise HTTPException(status_code=404, detail="Invitation not found or has already been used.")
 
         invite = token_result.data
+
+        # 1b. The invite must be addressed to this caller's own verified email.
+        invited_email = (invite.get("invited_email") or "").lower().strip()
+        if not caller_email or not auth_user.email_verified or invited_email != caller_email:
+            logger.warning(
+                "accept_invite rejected: invite email does not match authenticated caller (user=%s)",
+                user_id,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="This invitation was sent to a different email address. Sign in with the invited address to accept it.",
+            )
 
         # 2. Check token status
         if invite["status"] == "accepted":
@@ -353,31 +408,31 @@ def accept_invite(token: str = Body(...), user_id: str = Body(...)):
 
 
 @router.post("/api/organizations/revoke-invite")
-def revoke_invite(org_id: str = Body(...), member_id: str = Body(...), user_id: str = Body(...)):
-    """Revoke a pending invite. Admin only."""
+def revoke_invite(
+    org_id: str = Body(...),
+    member_id: str = Body(...),
+    user_id: Optional[str] = Body(None),
+    auth_user: AuthenticatedUser = Depends(require_org_admin),
+):
+    """Revoke a pending invite. Admin of org_id only (verified by the guard)."""
+    # The guard proved the caller is an admin of org_id; the body-supplied
+    # user_id is ignored (it used to be the only "authorization" here).
+    user_id = auth_user.user_id
     try:
-        # 1. Verify the requesting user is an admin
-        admin_check = supabase.table("organization_members") \
-            .select("role") \
-            .eq("org_id", org_id) \
-            .eq("user_id", user_id) \
-            .eq("status", "active") \
-            .single().execute()
-
-        if not admin_check.data or admin_check.data.get("role") != "admin":
-            raise HTTPException(status_code=403, detail="Only admins can revoke invitations.")
-
-        # 2. Revoke invite token(s) for this member
+        # 1. Revoke invite token(s) for this member
         supabase.table("invite_tokens") \
             .update({"status": "revoked"}) \
             .eq("member_id", member_id) \
+            .eq("org_id", org_id) \
             .eq("status", "pending") \
             .execute()
 
-        # 3. Delete the organization_members row (only if still invited)
+        # 2. Delete the organization_members row (only if still invited),
+        #    re-filtered by the org the guard verified.
         supabase.table("organization_members") \
             .delete() \
             .eq("id", member_id) \
+            .eq("org_id", org_id) \
             .eq("status", "invited") \
             .execute()
 
@@ -392,12 +447,32 @@ def revoke_invite(org_id: str = Body(...), member_id: str = Body(...), user_id: 
 
 
 @router.get("/api/organizations/pending-invites")
-def get_pending_invites_for_user(email: str = Query(...)):
-    """Get all pending invite tokens for a given email address."""
+def get_pending_invites_for_user(
+    email: str = Query(None),
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """
+    Get pending invite tokens addressed to the *authenticated caller's own*
+    verified email address.
+
+    The ``email`` query parameter is accepted for backwards compatibility but is
+    never used to select rows: previously any anonymous caller could enumerate
+    invite tokens for an arbitrary address and take over the organization.
+    """
+    caller_email = (auth_user.email or "").lower().strip()
+    if not caller_email or not auth_user.email_verified:
+        # Cursor tokens and unverified accounts have no verified address to
+        # scope by — return nothing rather than leaking someone else's invites.
+        return []
+    if email and email.lower().strip() != caller_email:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only view invitations sent to your own email address.",
+        )
     try:
         results = supabase.table("invite_tokens") \
             .select("id, token, org_id, invited_email, expires_at, created_at, organizations(id, name, logo)") \
-            .eq("invited_email", email.lower().strip()) \
+            .eq("invited_email", caller_email) \
             .eq("status", "pending") \
             .execute()
 
@@ -426,10 +501,26 @@ def get_pending_invites_for_user(email: str = Query(...)):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.post("/api/organizations/join")
-def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
-    """Join an organization - check plan limits before allowing"""
+def join_organization(
+    org_id: str = Body(...),
+    user_id: Optional[str] = Body(None),
+    auth_user: AuthenticatedUser = Depends(require_auth),
+):
+    """
+    Request to join an organization.
+
+    This creates a *pending* row in ``join_requests`` — it never grants
+    membership. An admin of the target org approves or rejects the request from
+    the Join Requests screen, which is what actually inserts the
+    organization_members row.
+
+    Previously this endpoint was unauthenticated and inserted an **active**
+    member directly, which let anyone join any organization they knew the id of.
+    """
+    # Never trust a body-supplied user id — always the authenticated caller.
+    user_id = auth_user.user_id
     try:
-        logger.info(f"User {user_id} attempting to join organization {org_id}")
+        logger.info(f"User {user_id} requesting to join organization {org_id}")
         
         # 1. Get user's actual plan
         user_profile_result = supabase.table("user_profiles").select("subscription_tier").eq("user_id", user_id).maybe_single().execute()
@@ -480,15 +571,48 @@ def join_organization(user_id: str = Body(...), org_id: str = Body(...)):
                 detail=f"Organization has reached its member limit ({member_limit}) for the {plan} plan.{upgrade_msg}"
             )
         
-        # 5. Add user as member
-        member_result = supabase.table("organization_members").insert({
+        # 5. Record a PENDING join request. An org admin must approve it before
+        #    any organization_members row is created.
+        existing_request = (
+            supabase.table("join_requests")
+            .select("id, status")
+            .eq("org_id", org_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        for row in (existing_request.data or []):
+            if row.get("status") == "pending":
+                return {
+                    "status": "pending",
+                    "message": "A join request for this organization is already awaiting approval.",
+                    "join_request_id": row.get("id"),
+                }
+
+        request_row = {
             "org_id": org_id,
             "user_id": user_id,
-            "role": "member",
-            "status": "active"
-        }).execute()
-        
-        return member_result.data
+            "user_email": auth_user.email or "",
+            "status": "pending",
+        }
+        if existing_request.data:
+            # Re-open a previously rejected/approved request (table is UNIQUE on
+            # (org_id, user_id), so update rather than insert).
+            jr_result = (
+                supabase.table("join_requests")
+                .update({"status": "pending"})
+                .eq("org_id", org_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+        else:
+            jr_result = supabase.table("join_requests").insert(request_row).execute()
+
+        jr = (jr_result.data or [{}])[0]
+        return {
+            "status": "pending",
+            "message": "Join request submitted. An organization admin must approve it.",
+            "join_request_id": jr.get("id"),
+        }
         
     except HTTPException:
         raise

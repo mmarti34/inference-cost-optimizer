@@ -152,7 +152,11 @@ class ToolResultBody(BaseModel):
 
 
 @router.post("/tool-result/{yield_id}")
-async def submit_tool_result(yield_id: str, body: ToolResultBody):
+async def submit_tool_result(
+    yield_id: str,
+    body: ToolResultBody,
+    authorization: Optional[str] = Header(None),
+):
     """
     Resume a pending client-side tool execution.
 
@@ -160,9 +164,20 @@ async def submit_tool_result(yield_id: str, body: ToolResultBody):
     the SSE stream emits a ``tool_yield`` event containing a ``yield_id``.
     The external client (e.g. an IDE like Cursor) executes the tool locally
     and POSTs the result here.  The agent loop then resumes with this result.
+
+    Requires ``Authorization: Bearer <service_api_key>`` — the same key used to
+    open the stream. This was the only unauthenticated route on the public
+    router: anyone could inject text straight into a running agent's reasoning
+    loop (and, by extension, into whatever that agent's tools go on to do).
+    The key's org must also match the org the yield was created for.
     """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization.split(" ", 1)[1]
+    ctx = validate_api_key(token)
+
     from workflow_runtime import resume_tool_yield
-    success = resume_tool_yield(yield_id, body.result, body.latency_ms or 0)
+    success = resume_tool_yield(yield_id, body.result, body.latency_ms or 0, org_id=ctx.org_id)
     if not success:
         raise HTTPException(status_code=404, detail="No pending tool yield with this ID — it may have timed out or already been resumed.")
     return {"status": "resumed", "yield_id": yield_id}

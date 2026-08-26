@@ -13,11 +13,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from supabase_client import supabase
-from auth_dependency import require_org_member, AuthenticatedUser
+from auth_dependency import require_org_member, AuthenticatedUser, verified_org_id
+from rate_limiting import check_and_increment_usage
+from plan_enforcement import check_monthly_request_limit, increment_monthly_usage
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+#: Requests per minute allowed per (org, webhook). Incoming webhooks execute
+#: workflows against the org's provider keys, so an unbounded firehose burns
+#: the org's money.
+WEBHOOK_RATE_LIMIT_PER_MINUTE = 60
 
 
 # Pydantic models
@@ -47,7 +54,10 @@ async def list_webhooks(
     try:
         result = (
             supabase.table("webhook_triggers")
-            .select("*")
+            .select(
+                "id, org_id, workflow_id, name, endpoint_path, secret, payload_template, "
+                "is_active, last_triggered_at, trigger_count, created_at, updated_at"
+            )
             .eq("org_id", org_id)
             .order("created_at", desc=False)
             .execute()
@@ -74,9 +84,24 @@ async def create_webhook(
     body: WebhookCreate,
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
-    """Create a new webhook trigger."""
+    """Create a new webhook trigger in the caller's verified org."""
     if not body.name or not body.name.strip():
         raise HTTPException(status_code=400, detail="Webhook name is required")
+
+    org_id = verified_org_id(auth_user)
+
+    # The workflow this webhook fires must belong to the same org — otherwise a
+    # webhook in org A could be pointed at org B's workflow.
+    wf = (
+        supabase.table("workflows")
+        .select("id")
+        .eq("id", body.workflow_id)
+        .eq("org_id", org_id)
+        .limit(1)
+        .execute()
+    )
+    if not wf.data:
+        raise HTTPException(status_code=404, detail="Workflow not found in this organization")
 
     # Generate unique endpoint path
     endpoint_path = secrets_module.token_urlsafe(16)
@@ -88,7 +113,7 @@ async def create_webhook(
         result = (
             supabase.table("webhook_triggers")
             .insert({
-                "org_id": body.org_id,
+                "org_id": org_id,
                 "workflow_id": body.workflow_id,
                 "name": body.name.strip(),
                 "endpoint_path": endpoint_path,
@@ -222,20 +247,45 @@ async def trigger_webhook(
     except Exception:
         body_str = ""
 
-    # Verify signature if secret is set
+    # Verify signature if a secret is configured.
+    #
+    # This used to be `if signature:` — omitting the header entirely skipped
+    # verification and executed the workflow unauthenticated. When a secret is
+    # configured the signature is REQUIRED.
     secret = trigger.get("secret")
+    if not secret:
+        # A trigger with no secret has no authentication at all. create_webhook
+        # always generates one, so this only happens for rows written outside
+        # the API. Refuse rather than execute a workflow for an anonymous caller.
+        logger.error(
+            "Webhook %s has no secret configured — refusing to execute unauthenticated",
+            trigger.get("id"),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="This webhook has no signing secret configured. Set one before using it.",
+        )
     if secret:
         signature = request.headers.get("x-webhook-signature") or request.headers.get("x-hub-signature-256") or ""
-        if signature:
-            expected = hmac.new(
-                secret.encode("utf-8"),
-                raw_body,
-                hashlib.sha256,
-            ).hexdigest()
-            # Support "sha256=..." prefix
-            sig_value = signature.replace("sha256=", "")
-            if not hmac.compare_digest(expected, sig_value):
-                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        if not signature:
+            logger.warning(
+                "Webhook %s rejected: signature header missing but a secret is configured",
+                trigger.get("id"),
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Missing webhook signature. Send X-Webhook-Signature (HMAC-SHA256 hex of the raw body).",
+            )
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        # Support "sha256=..." prefix
+        sig_value = signature.replace("sha256=", "").strip()
+        if not hmac.compare_digest(expected, sig_value):
+            logger.warning("Webhook %s rejected: invalid signature", trigger.get("id"))
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     # Parse JSON body
     try:
@@ -262,12 +312,23 @@ async def trigger_webhook(
     org_id = trigger.get("org_id")
     workflow_id = trigger.get("workflow_id")
 
+    # Rate limit + monthly quota. This path spends the org's provider tokens,
+    # so it gets the same accounting as the public execution endpoint.
+    check_and_increment_usage(
+        org_id=org_id,
+        endpoint_slug=f"webhook:{endpoint_path}",
+        rate_limit_per_minute=WEBHOOK_RATE_LIMIT_PER_MINUTE,
+    )
+    check_monthly_request_limit(org_id)
+
     try:
-        # Fetch workflow graph
+        # Fetch workflow graph — re-filtered by the trigger's own org so a
+        # webhook can never execute another tenant's workflow.
         wf_result = (
             supabase.table("workflows")
             .select("graph_json, variables")
             .eq("id", workflow_id)
+            .eq("org_id", org_id)
             .execute()
         )
         if not wf_result.data:
@@ -287,6 +348,8 @@ async def trigger_webhook(
             workflow_id=workflow_id,
             execution_mode="production",
         )
+
+        increment_monthly_usage(org_id)
 
         # Update trigger stats
         try:
