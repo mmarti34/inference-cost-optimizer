@@ -491,6 +491,49 @@ CANDIDATE_GENERATORS: dict[str, CandidateGenerator] = {
 }
 
 
+def _configured_providers(org_id: str) -> set[str]:
+    """
+    Providers this org holds a credential for, lowercased.
+
+    An empty set means "unknown" (the lookup failed), and callers must then
+    filter nothing — refusing every candidate because a read errored would be
+    worse than letting the arms report their own failures.
+    """
+    try:
+        from supabase_client import supabase
+        res = (
+            supabase.table("api_keys")
+            .select("provider")
+            .eq("org_id", org_id)
+            .execute()
+        )
+        return {
+            str(r.get("provider") or "").strip().lower()
+            for r in (res.data or [])
+            if r.get("provider")
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "provider credential lookup failed for org %s: %s",
+            org_id, type(exc).__name__,
+        )
+        return set()
+
+
+def _unconfigured_providers(cand_strategy, configured: set[str]) -> set[str]:
+    """Providers named by this strategy's steps that the org cannot execute."""
+    if not configured:
+        return set()  # unknown -> do not filter
+    needed: set[str] = set()
+    for step in (getattr(cand_strategy, "steps", None) or []):
+        ref = getattr(step, "executor_ref", None) or {}
+        vendor = str(ref.get("vendor") or "").strip().lower()
+        # 'optiml' is an internal step target, not an external provider.
+        if vendor and vendor != "optiml":
+            needed.add(vendor)
+    return needed - configured
+
+
 def generate_candidates(
     org_id: str,
     workload: dict,
@@ -514,6 +557,7 @@ def generate_candidates(
     seen: set[str] = {baseline.fingerprint()}
     out: list[Candidate] = []
     dropped: list[dict] = []
+    configured = _configured_providers(org_id)
 
     for name in names:
         gen = CANDIDATE_GENERATORS.get(name)
@@ -541,6 +585,25 @@ def generate_candidates(
                     "surface": cand.strategy.surface,
                     "dimensions": sorted(unapplicable),
                     "detail": unapplicable,
+                })
+                continue
+            # A provider the org holds no credential for cannot execute. Running
+            # it anyway yields a 100%-error arm with every metric NULL, which is
+            # a coverage gap wearing the costume of a policy failure: it reads as
+            # "the alternative was tested and lost" when nothing was tested at
+            # all. Same principle as strategy_not_applicable above — refuse
+            # before producing a measurement of nothing.
+            missing = _unconfigured_providers(cand.strategy, configured)
+            if missing:
+                dropped.append({
+                    "generator": name,
+                    "title": cand.title,
+                    "code": "provider_not_configured",
+                    "providers": sorted(missing),
+                    "detail": (
+                        "No provider credential is configured for this "
+                        "organization, so the arm could not run."
+                    ),
                 })
                 continue
             fp = cand.fingerprint
