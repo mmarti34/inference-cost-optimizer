@@ -266,6 +266,12 @@ class AlternateModelGenerator:
             return []
 
         io_ratio = self._measured_io_ratio(history) or self.DEFAULT_IO_RATIO
+        # Rank only within providers this org can actually execute. Filtering
+        # after ranking is not equivalent: the globally-cheapest models crowd
+        # out an executable substitution, and the org is left with no candidate
+        # at all rather than the cheaper model it could actually have run.
+        # Empty set means "unknown" -> do not constrain.
+        allowed = history.get("configured_providers") or set()
         out: list[Candidate] = []
 
         for step in steps:
@@ -285,6 +291,8 @@ class AlternateModelGenerator:
                 if entry["external_id"].lower() in already_tried:
                     continue
                 if entry["external_id"] == base_model:
+                    continue
+                if allowed and str(entry["vendor"]).strip().lower() not in allowed:
                     continue
                 price = executors.blended_vendor_price(
                     entry["vendor"], entry["external_id"], input_output_ratio=io_ratio
@@ -558,6 +566,9 @@ def generate_candidates(
     out: list[Candidate] = []
     dropped: list[dict] = []
     configured = _configured_providers(org_id)
+    # Generators rank within executable providers; the post-filter below is
+    # defence in depth for generators that ignore this.
+    history["configured_providers"] = configured
 
     for name in names:
         gen = CANDIDATE_GENERATORS.get(name)
