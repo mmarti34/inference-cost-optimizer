@@ -322,8 +322,21 @@ class FakeRuntime:
     """
 
     def __init__(self, *, quality_for=None, latency_for=None, tokens=(1000, 300),
-                 n_cases=20):
+                 n_cases=20, fail_first_for=None, fail_cases_for=None):
         self.quality_for = quality_for or {}
+        # WHERE in the case order a model's failures fall, as model -> number of
+        # LEADING cases that fail. `quality_for` fixes only the rate and places
+        # every failure at the END of the case order, which is invisible to a
+        # staged run that stops after the first 30 cases. A test about staging
+        # has to be able to put the failures at the front.
+        self.fail_first_for = fail_first_for or {}
+        # The general form: model -> the exact case indices that miss. Needed
+        # when a test has to make the BASELINE fail cases in the tail of the
+        # order, so its quality over a stopped candidate's prefix differs from
+        # its quality over the whole set.
+        self.fail_cases_for = {
+            k: set(int(i) for i in v) for k, v in (fail_cases_for or {}).items()
+        }
         self.latency_for = latency_for or {}
         self.tokens = tokens
         # How many replay cases the seeded suite holds. The pass/fail split is
@@ -352,9 +365,17 @@ class FakeRuntime:
         ) / 1000.0
 
         index = int(str(input_text).split()[-1])
-        pass_rate = self.quality_for.get(model, 1.0)
-        # Deterministic: the first `pass_rate` share of cases match.
-        matches = index < round(pass_rate * self.n_cases)
+        fail_cases = self.fail_cases_for.get(model)
+        fail_first = self.fail_first_for.get(model)
+        if fail_cases is not None:
+            matches = index not in fail_cases
+        elif fail_first is not None:
+            # Deterministic: the first `fail_first` cases miss, the rest match.
+            matches = index >= int(fail_first)
+        else:
+            pass_rate = self.quality_for.get(model, 1.0)
+            # Deterministic: the first `pass_rate` share of cases match.
+            matches = index < round(pass_rate * self.n_cases)
 
         self.calls.append({"model": model, "input_text": input_text})
         return {
@@ -424,7 +445,15 @@ def test_cheaper_and_passing_candidate_yields_safe_improvement_and_a_recommendat
     # projected monthly figure and the verified sample figure coincide
     # numerically and the assertion below that they are different things would
     # pass for the wrong reason.
-    _seed(db, golden_inputs=60, production_runs=90)
+    # The margin is pinned to 0.05 EXPLICITLY rather than inherited from the
+    # default. This test asserts what a 60-case tie establishes at a 5pp margin;
+    # a test that silently tracked the default would stop testing that. The 2pp
+    # default's behaviour on the same evidence is asserted separately, in
+    # test_quality_non_inferiority.py.
+    _seed(
+        db, golden_inputs=60, production_runs=90,
+        constraints={"min_quality": 0.95, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(n_cases=60)  # every model returns correct output
 
     result = _run_loop(
@@ -600,7 +629,7 @@ def test_relaxing_only_the_absolute_floor_does_not_make_a_regression_safe(db):
     assert regression["baseline_quality"] == pytest.approx(1.0)
     assert regression["candidate_quality"] == pytest.approx(0.90)
     assert regression["observed"] == pytest.approx(0.10)
-    assert regression["required"] == pytest.approx(0.05)
+    assert regression["required"] == pytest.approx(0.02)
     assert regression["threshold_source"] == "default"   # nobody configured it
 
     assert db.rows("optimization_recommendations") == []
@@ -901,7 +930,15 @@ def test_generated_candidates_carry_honest_evidence_labels(db):
 
 def test_the_loop_runs_end_to_end_from_generated_candidates(db):
     """No caller-supplied candidates: discovery, generation, replay, verdict."""
-    _seed(db, golden_inputs=60, production_runs=120)
+    # The margin is pinned to 0.05 EXPLICITLY rather than inherited from the
+    # default. This test asserts what a 60-case tie establishes at a 5pp margin;
+    # a test that silently tracked the default would stop testing that. The 2pp
+    # default's behaviour on the same evidence is asserted separately, in
+    # test_quality_non_inferiority.py.
+    _seed(
+        db, golden_inputs=60, production_runs=120,
+        constraints={"min_quality": 0.95, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(n_cases=60)
 
     result = _run_loop(db, runtime, create_recommendation=True, actor="user-1")
@@ -1051,7 +1088,15 @@ def test_a_recommendation_cannot_be_created_without_a_measured_strategy(db):
     The reevaluate path holds stored rows, not executable strategies. It must
     decline to create a recommendation rather than reconstruct one from a hash.
     """
-    _seed(db, golden_inputs=60, production_runs=60)
+    # The margin is pinned to 0.05 EXPLICITLY rather than inherited from the
+    # default. This test asserts what a 60-case tie establishes at a 5pp margin;
+    # a test that silently tracked the default would stop testing that. The 2pp
+    # default's behaviour on the same evidence is asserted separately, in
+    # test_quality_non_inferiority.py.
+    _seed(
+        db, golden_inputs=60, production_runs=60,
+        constraints={"min_quality": 0.95, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(n_cases=60)
 
     first = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
@@ -1127,7 +1172,15 @@ def _client(db, runtime):
 
 
 def test_optimize_endpoint_returns_the_verdict_and_the_recommendation(db):
-    _seed(db, golden_inputs=60, production_runs=120)
+    # The margin is pinned to 0.05 EXPLICITLY rather than inherited from the
+    # default. This test asserts what a 60-case tie establishes at a 5pp margin;
+    # a test that silently tracked the default would stop testing that. The 2pp
+    # default's behaviour on the same evidence is asserted separately, in
+    # test_quality_non_inferiority.py.
+    _seed(
+        db, golden_inputs=60, production_runs=120,
+        constraints={"min_quality": 0.95, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(n_cases=60)
     patches = _patched(db, runtime)
     for p in patches:

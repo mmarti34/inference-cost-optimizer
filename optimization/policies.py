@@ -27,6 +27,7 @@ from typing import Any, Optional
 from supabase_client import supabase
 
 from optimization import domain
+from optimization import staging
 
 logger = logging.getLogger(__name__)
 
@@ -55,25 +56,44 @@ POLICY_COLS = (
 #: points below baseline cleared a `min_quality: 0.90` floor by a margin of
 #: exactly zero, won on cost, and shipped as VERIFIED.
 #:
-#: 0.05 is a judgement, and here is the reasoning rather than a vibe. The cost
-#: objective's default materiality is a 5% relative improvement; accepting a
-#: quality loss looser than the gain we demand would be incoherent, so 5pp is a
-#: ceiling, not a target. It is also NOT the effective bar: establishing
-#: non-inferiority at a 5pp margin with 95% one-sided confidence requires the
-#: OBSERVED regression to sit very close to zero — a 3pp observed regression on
-#: 100 paired cases does not clear it. A tighter nominal margin (0.02) is
-#: available to any customer who wants it and is a supported policy value; it is
-#: not the default only because at 95% confidence it needs roughly 133 perfectly
-#: tied cases before anything can be concluded, and a default that can never
-#: conclude is not conservatism, it is silence.
+#: The default margin is 0.02 at 95% one-sided confidence. The margin
+#: represents acceptable quality degradation, not an evaluation-budget knob.
+#: Sample size should adapt to the safety requirement, not the other way
+#: around. A 2pp margin needs roughly 133 perfectly tied cases before it can
+#: conclude; that is a statement about how much evidence a 2pp safety claim
+#: costs, and the answer to it is `optimization/staging.py` — evaluate in
+#: stages and stop candidates whose verdict is already settled — not a looser
+#: margin.
 #:
 #: require_non_inferiority defaults TRUE. With it FALSE a customer is choosing
 #: to act on point estimates alone; that is their right, and it is recorded as
 #: their choice rather than assumed.
 DEFAULT_QUALITY_SAFETY = {
-    "max_quality_regression": 0.05,
+    "max_quality_regression": 0.02,
     "quality_confidence_level": 0.95,
     "require_quality_non_inferiority": True,
+}
+
+#: Documented `max_quality_regression` values. Any value in (0, 1) is accepted
+#: as a per-workload policy override; these are the two the product documents.
+#:
+#:   0.02  the default, above.
+#:   0.05  a supported override, appropriate where the eval suite is a coarse
+#:         proxy rather than a decisive correctness test and a 2pp difference
+#:         sits below the suite's own resolution.
+#:
+#: Nothing in this codebase prefers 0.05, suggests it, or falls back to it. It
+#: converges on fewer cases, which is a property of the evidence bar and never a
+#: reason to choose it.
+DOCUMENTED_MAX_QUALITY_REGRESSION = (0.02, 0.05)
+
+#: STAGED CANDIDATE EVALUATION. Stage sizes are CUMULATIVE case counts, clamped
+#: to the cases the workload actually holds, with the full set always the final
+#: stage. See `optimization/staging.py` for the derivation of each number and of
+#: the bound that permits an early stop.
+DEFAULT_STAGED_EVALUATION = {
+    "staged_evaluation_enabled": True,
+    "evaluation_stage_sizes": list(staging.DEFAULT_STAGE_SIZES),
 }
 
 #: Conservative by default: OptiML does nothing on its own and a human approves
@@ -230,6 +250,59 @@ def quality_safety_of(policy: Optional[dict]) -> dict:
 
     out["min_quality"] = c.get("min_quality")
     out["min_quality_source"] = "policy" if c.get("min_quality") is not None else "unset"
+    out["policy_id"] = str(policy["id"]) if policy and policy.get("id") else None
+    out["policy_version"] = (policy or {}).get("version")
+    return out
+
+
+def staged_evaluation_of(policy: Optional[dict]) -> dict:
+    """
+    The staged-evaluation schedule in force, with its SOURCE stamped per field.
+
+    Stage sizes are cumulative case counts. A policy may shorten, lengthen or
+    replace the schedule, or switch staging off entirely and run every candidate
+    over every case. Whichever it does is recorded, because "OptiML staged this
+    run" and "the customer asked for these stages" are different facts.
+
+    Staging changes only WHICH cases a candidate is spared, never how a verdict
+    is reached: `optimization/staging.py` stops a candidate only when the cases
+    it would still run could not change its verdict.
+    """
+    c = constraints_of(policy)
+    out: dict = {}
+
+    raw_enabled = c.get("staged_evaluation_enabled")
+    if raw_enabled is not None:
+        out["staged_evaluation_enabled"] = bool(raw_enabled)
+        out["staged_evaluation_enabled_source"] = "policy"
+    else:
+        out["staged_evaluation_enabled"] = DEFAULT_STAGED_EVALUATION[
+            "staged_evaluation_enabled"
+        ]
+        out["staged_evaluation_enabled_source"] = "default"
+
+    raw_sizes = c.get("evaluation_stage_sizes")
+    sizes: Optional[list[int]] = None
+    if isinstance(raw_sizes, (list, tuple)) and raw_sizes:
+        cleaned = []
+        for s in raw_sizes:
+            try:
+                v = int(s)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                cleaned.append(v)
+        if cleaned:
+            sizes = sorted(set(cleaned))
+    if sizes is not None:
+        out["evaluation_stage_sizes"] = sizes
+        out["evaluation_stage_sizes_source"] = "policy"
+    else:
+        out["evaluation_stage_sizes"] = list(
+            DEFAULT_STAGED_EVALUATION["evaluation_stage_sizes"]
+        )
+        out["evaluation_stage_sizes_source"] = "default"
+
     out["policy_id"] = str(policy["id"]) if policy and policy.get("id") else None
     out["policy_version"] = (policy or {}).get("version")
     return out
@@ -634,6 +707,8 @@ def policy_row_to_response(row: dict) -> dict:
         # conservative default is protecting them even though they configured
         # nothing.
         "quality_safety": quality_safety_of(row),
+        # The evaluation schedule in force, likewise source-stamped.
+        "staged_evaluation": staged_evaluation_of(row),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         # Which declared constraints OptiML can actually verify. Surfaced so a

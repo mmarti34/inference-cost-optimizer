@@ -27,6 +27,10 @@ EMPIRICAL EVIDENCE:
                     a material quality regression against the customer's
                     measured baseline", which an absolute quality floor and a
                     point estimate both fail to answer. Pure, no I/O.
+    staging.py      Staged candidate evaluation, and the BOUND that makes an
+                    early stop sound: a candidate is dropped only when no
+                    outcome on the cases it has not run could bring it back
+                    inside the policy's quality margin. Pure, no I/O.
     outcomes.py     Outcome recording: delayed arrival, idempotent, ranked.
     attempts.py     Thin domain adapter over the EXISTING tracing tables.
     policies.py     Constraints that make a strategy invalid, not merely worse.
@@ -47,6 +51,7 @@ __all__ = [
     "candidates",
     "benchmark",
     "noninferiority",
+    "staging",
     "outcomes",
     "attempts",
     "policies",

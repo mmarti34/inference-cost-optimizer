@@ -54,6 +54,7 @@ from optimization import (
     noninferiority,
     outcomes as outcomes_mod,
     policies,
+    staging as staging_mod,
     strategy as strategy_mod,
     workloads as workloads_mod,
 )
@@ -314,6 +315,10 @@ def _execute_arm(
                 "case_passed": (
                     (q["passed"] >= q["ran"]) if q["ran"] > 0 else None
                 ),
+                # Carried per case so an arm restricted to a PREFIX of the case
+                # set can be re-summarised exactly, provenance included, rather
+                # than inheriting the full run's provenance by assumption.
+                "quality_provenance": q["provenance"],
             })
 
         except Exception as exc:
@@ -328,9 +333,51 @@ def _execute_arm(
                 "error": True,
                 "error_detail": str(exc)[:300],
                 "case_passed": None,
+                "quality_provenance": None,
             })
 
-    n = len(cases)
+    return _summarize_arm(label, per_case, pricing)
+
+
+def _summarize_arm(label: str, per_case: list[dict], pricing: dict) -> dict:
+    """
+    Roll per-case rows up into the arm metrics the rest of the loop ranks on.
+
+    Split out of `_execute_arm` because staged evaluation needs to summarise the
+    BASELINE over exactly the prefix of cases a stopped candidate actually ran.
+    Comparing a candidate that ran 30 cases against a baseline summarised over
+    133 would be a comparison across two different case sets, which is precisely
+    what the paired design exists to prevent. This function is the only place an
+    arm figure is derived, so a prefix summary and a full summary are the same
+    computation over different rows rather than two code paths that could drift.
+    """
+    cost_is_measured = pricing["basis"] == executors_mod.COST_BASIS_MEASURED
+
+    costs: list[float] = []
+    latencies: list[float] = []
+    errors = quality_ran = quality_passed = 0
+    quality_provenance: Optional[str] = None
+
+    for row in per_case:
+        if row.get("error"):
+            errors += 1
+        cost = row.get("cost_usd") if cost_is_measured else row.get("cost_estimated_usd")
+        if cost is not None:
+            costs.append(float(cost))
+        if row.get("latency_ms") is not None:
+            latencies.append(float(row["latency_ms"]))
+        ran = int(row.get("quality_checks_ran") or 0)
+        if ran > 0:
+            quality_ran += ran
+            quality_passed += int(row.get("quality_checks_passed") or 0)
+        prov = row.get("quality_provenance")
+        if prov and (
+            quality_provenance is None
+            or domain.provenance_rank(prov) > domain.provenance_rank(quality_provenance)
+        ):
+            quality_provenance = prov
+
+    n = len(per_case)
     quality = (quality_passed / quality_ran) if quality_ran > 0 else None
 
     mean_cost = domain.mean(costs)
@@ -358,6 +405,27 @@ def _execute_arm(
         "per_case": per_case,
         "cases_measured": len(costs),
     }
+
+
+def _arm_over_prefix(arm: dict, cases_run: int) -> dict:
+    """
+    The same arm, restricted to the first `cases_run` cases.
+
+    Used to compare a candidate that was stopped early against the baseline over
+    EXACTLY the cases both arms ran. Never a re-execution: it is a re-summary of
+    rows already measured.
+    """
+    rows = arm.get("per_case") or []
+    # 0 means "this arm stored no per-case rows", not "it ran no cases" — a
+    # historical row predating per-case retention. Restricting to nothing would
+    # turn a measured arm into an unmeasured one, so leave it alone.
+    if cases_run <= 0 or cases_run >= len(rows):
+        return arm
+    return _summarize_arm(
+        arm.get("label") or "baseline",
+        list(rows)[:cases_run],
+        arm.get("pricing_provenance") or {"basis": arm.get("cost_basis")},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +675,14 @@ def _run(
         },
     })
 
-    # ── Measure the baseline arm
+    # ── Measure the baseline arm, over the FULL case set, first.
+    #
+    # The baseline is the reference and is never a candidate for elimination, so
+    # it costs the same whether it is staged or not. Running it to completion up
+    # front is what makes staged candidate evaluation possible at all: it means
+    # the baseline's verdicts on the cases a candidate has NOT yet reached are
+    # already MEASURED, so the early-stop bound can use real counts instead of
+    # assuming the worst about every unrun case. See optimization/staging.py.
     baseline_metrics = _execute_arm(
         baseline_graph, cases, org_id=org_id, workflow_id=workflow_id,
         endpoint_slug=endpoint_slug, checks=checks, label="baseline",
@@ -619,8 +694,28 @@ def _run(
         generator=None, dimensions=[],
     )
 
-    # ── Measure each candidate arm over the SAME cases
+    # ── Measure each candidate arm over the SAME cases, IN THE SAME ORDER,
+    # in stages. `cases` is materialised once above and every arm walks the same
+    # list from index 0, so a candidate stopped at stage k has been compared
+    # against the baseline on exactly the prefix it ran, and never against a
+    # baseline summarised over cases it never saw.
+    staging_cfg = policies.staged_evaluation_of(policy)
+    stage_plan = (
+        staging_mod.resolve_stages(n, staging_cfg["evaluation_stage_sizes"])
+        if staging_cfg["staged_evaluation_enabled"]
+        else staging_mod.resolve_stages(n, [])
+    )
+    if not stage_plan:
+        # No cases to slice. Keep the single unstaged pass so the arm is still
+        # executed and its pricing provenance resolved, exactly as before.
+        stage_plan = [
+            {"stage_index": 1, "start": 0, "end": n, "size": n, "cases_cumulative": n}
+        ]
+    quality_safety_cfg = policies.quality_safety_of(policy)
+    stage_margin = quality_safety_cfg["max_quality_regression"]
+
     measured: list[dict] = []
+    staging_records: list[dict] = []
     for cand in cand_list:
         try:
             cand_graph = strategy_mod.apply_to_graph(baseline_graph, cand.strategy)
@@ -632,21 +727,100 @@ def _run(
             )
             continue
 
-        metrics = _execute_arm(
-            cand_graph, cases, org_id=org_id, workflow_id=workflow_id,
-            endpoint_slug=endpoint_slug, checks=checks, label=cand.title,
-            strategy=cand.strategy,
+        per_case: list[dict] = []
+        pricing: Optional[dict] = None
+        stage_log: list[dict] = []
+        stop_decision: Optional[dict] = None
+
+        for stage in stage_plan:
+            part = _execute_arm(
+                cand_graph, cases[stage["start"]:stage["end"]],
+                org_id=org_id, workflow_id=workflow_id, endpoint_slug=endpoint_slug,
+                checks=checks, label=cand.title, strategy=cand.strategy,
+            )
+            per_case.extend(part["per_case"])
+            pricing = part["pricing_provenance"]
+
+            decision = staging_mod.early_stop_assessment(
+                margin=stage_margin,
+                baseline_per_case=baseline_metrics["per_case"],
+                candidate_per_case=per_case,
+            )
+            so_far = _summarize_arm(cand.title, per_case, pricing)
+            base_so_far = _arm_over_prefix(baseline_metrics, len(per_case))
+            # WHAT WAS KNOWN WHEN. Persisted per stage so the decision to stop
+            # (or not to stop) is re-checkable against the evidence that existed
+            # at the moment it was taken, rather than only against the totals.
+            stage_log.append({
+                "stage_index": stage["stage_index"],
+                "cases_this_stage": stage["size"],
+                "cases_cumulative": len(per_case),
+                "quality": so_far.get("quality"),
+                "baseline_quality_same_cases": base_so_far.get("quality"),
+                "observed_regression": decision.get("observed_regression_prefix"),
+                "paired": decision.get("paired"),
+                "best_case_final_paired_delta": decision.get("best_case_final_paired_delta"),
+                "best_case_final_regression": decision.get("best_case_final_regression"),
+                "decision": ("stop" if decision["stop"] else "continue"),
+                "decision_reason_code": decision["reason_code"],
+            })
+            if decision["stop"]:
+                stop_decision = decision
+                break
+
+        metrics = _summarize_arm(cand.title, per_case, pricing or {"basis": None})
+        # The baseline restricted to the cases THIS candidate ran. For a
+        # candidate that ran everything this is the baseline itself.
+        paired_baseline = _arm_over_prefix(baseline_metrics, len(per_case))
+
+        avoided = staging_mod.spend_avoided(
+            cases_not_run=(n - len(per_case)),
+            mean_cost_usd=metrics.get("mean_cost_usd"),
+            cases_priced=metrics.get("cases_measured"),
         )
+        staged_record = {
+            "enabled": staging_cfg["staged_evaluation_enabled"],
+            "stage_sizes": staging_cfg["evaluation_stage_sizes"],
+            "stage_sizes_source": staging_cfg["evaluation_stage_sizes_source"],
+            "stages_planned": len(stage_plan),
+            "stages_run": len(stage_log),
+            "cases_planned": n,
+            "cases_run": len(per_case),
+            "stopped_early": stop_decision is not None,
+            "stopped_at_stage": (
+                stage_log[-1]["stage_index"] if stop_decision is not None else None
+            ),
+            "stop_reason_code": (
+                stop_decision["reason_code"] if stop_decision is not None else None
+            ),
+            "margin": round(float(stage_margin), 6),
+            "margin_source": quality_safety_cfg["max_quality_regression_source"],
+            # The bound that justified the stop, with every input it used.
+            "bound": stop_decision,
+            "stages": stage_log,
+            **avoided,
+        }
+        staging_records.append({**staged_record, "candidate": cand.title})
+
         row = _write_candidate_result(
             org_id, benchmark_id, workload_id, arm="candidate", label=cand.title,
-            strategy=cand.strategy, metrics=metrics, baseline=baseline_metrics,
+            strategy=cand.strategy, metrics=metrics, baseline=paired_baseline,
             generator=cand.generator, dimensions=cand.dimensions,
+            staged_evaluation=staged_record,
         )
         measured.append({
             "candidate": cand,
             "metrics": metrics,
             "result_id": (str(row["id"]) if row else None),
+            # Every gate that compares this candidate to the baseline uses THIS
+            # baseline, not the full-run one. Pairing is the whole basis of the
+            # statistics and a stopped candidate must never be scored against
+            # cases it did not run.
+            "paired_baseline": paired_baseline,
+            "staged_evaluation": staged_record,
         })
+
+    staging_summary = staging_mod.rollup(staging_records)
 
     # ── Success signal: the POLICY decides, not a global constant
     observed_outcomes = outcomes_mod.list_outcomes(org_id, workload_id=workload_id, limit=500)
@@ -684,7 +858,7 @@ def _run(
         verdict["winner"]["baseline_mean_cost_usd"] = baseline_metrics.get("mean_cost_usd")
         verdict["winner"]["baseline_metrics"] = _public_metrics(baseline_metrics)
 
-    return _conclude(
+    concluded = _conclude(
         org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
         policy=policy, materiality=verdict["materiality_applied"],
         conclusion=verdict["conclusion"], reasons=verdict["reasons"],
@@ -705,6 +879,13 @@ def _run(
         frontier=verdict.get("frontier"),
         consideration=verdict.get("consideration"),
     )
+    # The staging rollup is DERIVED from the per-arm rows already persisted in
+    # `benchmark_candidate_results.outcome_metrics`. It is surfaced on the
+    # response rather than stored again, so there is exactly one written source
+    # of truth for what each arm ran.
+    if isinstance(concluded, dict):
+        concluded["staged_evaluation"] = staging_summary
+    return concluded
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +1068,33 @@ def _decide(
     eligible: list[dict] = []
     for m in measured:
         metrics = m["metrics"]
+        # A candidate stopped early ran a PREFIX of the case set. It is judged
+        # against the baseline over that same prefix — `paired_baseline` — never
+        # against the baseline's full-run figures. Comparing arms over different
+        # case sets is not a weaker comparison, it is a different one.
+        arm_baseline = m.get("paired_baseline") or baseline
+
+        staged = m.get("staged_evaluation") or {}
+        if staged.get("stopped_early"):
+            # A settled verdict reached on fewer cases, NOT a shortage of
+            # evidence. The bound that made it settled travels with the reason.
+            bound = staged.get("bound") or {}
+            reasons.append(domain.reason(
+                "candidate_evaluation_stopped_early",
+                candidate=m["candidate"].title,
+                stopped_at_stage=staged.get("stopped_at_stage"),
+                stages_planned=staged.get("stages_planned"),
+                cases_run=staged.get("cases_run"),
+                cases_planned=staged.get("cases_planned"),
+                cases_not_run=staged.get("cases_not_run"),
+                allowed_regression=staged.get("margin"),
+                observed_regression=bound.get("observed_regression_prefix"),
+                best_case_final_regression=bound.get("best_case_final_regression"),
+                best_case_final_paired_delta=bound.get("best_case_final_paired_delta"),
+                bound_method=bound.get("bound_method"),
+                detail_code=staged.get("stop_reason_code"),
+            ))
+
         evaluation = policies.evaluate(
             policy,
             measured={
@@ -900,10 +1108,10 @@ def _decide(
             # Without the baseline arm, `max_quality_regression` is not a
             # weaker check — it is an uncheckable one.
             baseline={
-                "quality": baseline.get("quality"),
-                "error_rate": baseline.get("error_rate"),
-                "latency_p95_ms": baseline.get("latency_p95_ms"),
-                "cost_per_task_usd": baseline.get("mean_cost_usd"),
+                "quality": arm_baseline.get("quality"),
+                "error_rate": arm_baseline.get("error_rate"),
+                "latency_p95_ms": arm_baseline.get("latency_p95_ms"),
+                "cost_per_task_usd": arm_baseline.get("mean_cost_usd"),
             },
         )
         m["policy_evaluation"] = evaluation
@@ -990,12 +1198,13 @@ def _decide(
     safe: list[dict] = []
     promising: list[dict] = []
     for m in eligible:
+        arm_baseline = m.get("paired_baseline") or baseline
         assessment = noninferiority.assess(
-            baseline_per_case=baseline.get("per_case"),
+            baseline_per_case=arm_baseline.get("per_case"),
             candidate_per_case=m["metrics"].get("per_case"),
             margin=quality_safety_cfg["max_quality_regression"],
             confidence_level=quality_safety_cfg["quality_confidence_level"],
-            baseline_quality=baseline.get("quality"),
+            baseline_quality=arm_baseline.get("quality"),
             candidate_quality=m["metrics"].get("quality"),
         )
         assessment["required"] = require_ni
@@ -1269,11 +1478,17 @@ def _frontier_entry(m: dict, baseline: dict, *, eligible_status: str) -> dict:
     metrics = m["metrics"]
     evaluation = m.get("policy_evaluation") or {}
     qs = m.get("quality_safety") or {}
-    b_cost = baseline.get("mean_cost_usd")
+    staged = m.get("staged_evaluation") or {}
+    # Deltas are against the baseline over the cases THIS arm ran, so a
+    # stopped candidate's saving and quality delta are like-for-like.
+    arm_baseline = m.get("paired_baseline") or baseline
+    b_cost = arm_baseline.get("mean_cost_usd")
     c_cost = metrics.get("mean_cost_usd")
-    b_q, c_q = baseline.get("quality"), metrics.get("quality")
+    b_q, c_q = arm_baseline.get("quality"), metrics.get("quality")
 
     codes: list[str] = []
+    if staged.get("stopped_early"):
+        codes.append("candidate_evaluation_stopped_early")
     for v in evaluation.get("violated") or []:
         codes.append(_violation_reason(v, m["candidate"].title)["code"])
     for u in evaluation.get("unmeasured") or []:
@@ -1302,6 +1517,17 @@ def _frontier_entry(m: dict, baseline: dict, *, eligible_status: str) -> dict:
         ),
         "latency_p95_ms": metrics.get("latency_p95_ms"),
         "error_rate": metrics.get("error_rate"),
+        "cases_evaluated": metrics.get("n"),
+        "staged_evaluation": ({
+            "stopped_early": bool(staged.get("stopped_early")),
+            "stopped_at_stage": staged.get("stopped_at_stage"),
+            "stages_planned": staged.get("stages_planned"),
+            "cases_run": staged.get("cases_run"),
+            "cases_planned": staged.get("cases_planned"),
+            "cases_not_run": staged.get("cases_not_run"),
+            "stop_reason_code": staged.get("stop_reason_code"),
+            "bound_method": (staged.get("bound") or {}).get("bound_method"),
+        } if staged else None),
         "quality_safety": {
             k: qs.get(k) for k in (
                 "established", "reason_code", "n_pairs", "discordant_b",
@@ -1580,15 +1806,25 @@ def reevaluate(org_id: str, benchmark_id: str, *, objective: Optional[str] = Non
     materiality = policies.materiality_of(policy, objective)
 
     baseline_metrics = _metrics_from_result_row(baseline_row)
-    measured = [
-        {
+    # A re-read must reproduce the SAME pairing the run used. A candidate whose
+    # evaluation was stopped early stored fewer per-case rows than the baseline,
+    # so it is re-paired against the baseline over that same prefix — otherwise
+    # a reevaluate would silently compare it against cases it never ran and
+    # could reach a verdict the original evidence never supported.
+    measured = []
+    for r in results:
+        if r.get("arm") != "candidate" or r.get("error"):
+            continue
+        metrics = _metrics_from_result_row(r)
+        measured.append({
             "candidate": _StoredCandidate(r),
-            "metrics": _metrics_from_result_row(r),
+            "metrics": metrics,
             "result_id": str(r["id"]),
-        }
-        for r in results
-        if r.get("arm") == "candidate" and not r.get("error")
-    ]
+            "paired_baseline": _arm_over_prefix(
+                baseline_metrics, len(metrics.get("per_case") or [])
+            ),
+            "staged_evaluation": (r.get("outcome_metrics") or {}).get("staged_evaluation"),
+        })
 
     observed_outcomes = outcomes_mod.list_outcomes(
         org_id, workload_id=str(workload["id"]), limit=500
@@ -1729,6 +1965,7 @@ def _public_metrics(metrics: Optional[dict]) -> Optional[dict]:
 def _write_candidate_result(
     org_id, benchmark_id, workload_id, *, arm, label, strategy, metrics, baseline,
     generator, dimensions, error: Optional[str] = None,
+    staged_evaluation: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Persist one measured arm INDEPENDENTLY of any conclusion.
@@ -1736,6 +1973,14 @@ def _write_candidate_result(
     This is what lets a near-miss survive: a candidate that saved 51% but landed
     0.7pp under the quality floor is a row here even though the run concluded
     'candidates_failed_policy'.
+
+    `staged_evaluation` is the arm's per-stage evidence trail: which stages ran,
+    what was known at the end of each, and — for a candidate stopped early — the
+    bound that justified stopping, with every count it was derived from. It goes
+    in `outcome_metrics` alongside the other measured facts rather than in a new
+    table, because it IS a measurement of this arm, not a verdict about it.
+    `baseline` here is the baseline restricted to the cases this arm actually
+    ran, so every delta on the row is a like-for-like comparison.
     """
     row: dict[str, Any] = {
         "org_id": org_id,
@@ -1775,6 +2020,8 @@ def _write_candidate_result(
             },
             "per_case_results": metrics.get("per_case"),
         })
+        if staged_evaluation is not None:
+            row["outcome_metrics"]["staged_evaluation"] = staged_evaluation
 
         if baseline:
             # Paired discordant counts are a MEASUREMENT, not an interpretation:

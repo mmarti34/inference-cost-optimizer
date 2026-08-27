@@ -51,12 +51,14 @@ from optimization import benchmark as benchmark_mod  # noqa: E402
 from optimization import domain  # noqa: E402
 from optimization import noninferiority as ni  # noqa: E402
 from optimization import policies as policies_mod  # noqa: E402
+from optimization import staging as staging_mod  # noqa: E402
 
 # Reuse the in-memory database, the priced fake runtime and the seeding helper
 # from the end-to-end suite. Duplicating them would let the two suites drift and
 # would mean these tests were exercising a different loop from the real one.
 from test_optimization_loop import (  # noqa: E402
     BASELINE_MODEL,
+    _patched,
     CHEAP_MODEL,
     ORG_ID,
     WORKLOAD_ID,
@@ -285,7 +287,7 @@ def test_the_default_policy_is_conservative_without_being_invented():
     would be a fabrication. Both facts are stamped with their source.
     """
     safety = policies_mod.quality_safety_of(None)
-    assert safety["max_quality_regression"] == 0.05
+    assert safety["max_quality_regression"] == 0.02
     assert safety["max_quality_regression_source"] == "default"
     assert safety["require_quality_non_inferiority"] is True
     assert safety["quality_confidence_level"] == 0.95
@@ -380,7 +382,13 @@ def test_a_tie_on_a_small_sample_is_promising_not_verified(db):
     baseline exactly, saves real money, 30 cases. Must NOT be `verified`, must
     NOT be discarded, and must come back with a derived sample-size target.
     """
-    _seed(db, golden_inputs=30, constraints={"min_quality": 0.90}, production_runs=60)
+    # 0.05 pinned EXPLICITLY. The behaviour asserted here belongs to a 5pp
+    # margin, and inheriting the (2pp) default would silently retarget the test.
+    # The default's behaviour on the same evidence is asserted in the 2pp tests.
+    _seed(
+        db, golden_inputs=30, production_runs=60,
+        constraints={"min_quality": 0.90, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(n_cases=30)
 
     result = _run_loop(
@@ -433,7 +441,13 @@ def test_matching_baseline_with_enough_cases_is_evidentially_safe(db):
     it. The same tie as above with 60 cases instead of 30 clears the derived
     threshold of 52.
     """
-    _seed(db, golden_inputs=60, constraints={"min_quality": 0.90}, production_runs=90)
+    # 0.05 pinned EXPLICITLY. The behaviour asserted here belongs to a 5pp
+    # margin, and inheriting the (2pp) default would silently retarget the test.
+    # The default's behaviour on the same evidence is asserted in the 2pp tests.
+    _seed(
+        db, golden_inputs=60, production_runs=90,
+        constraints={"min_quality": 0.90, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(n_cases=60)
 
     result = _run_loop(
@@ -505,7 +519,13 @@ def test_ranking_prefers_the_safe_candidate_over_the_merely_cheaper_one(db):
     saving. Cost-first ranking picked the first. Correct ranking excludes it at
     the policy stage and never sees it again.
     """
-    _seed(db, golden_inputs=60, constraints={"min_quality": 0.90}, production_runs=90)
+    # 0.05 pinned EXPLICITLY: the tying candidate must reach `quality_safe` on
+    # 60 cases for this test to exercise ranking at all, and 60 tied cases clear
+    # a 5pp margin but not the 2pp default (which needs 133).
+    _seed(
+        db, golden_inputs=60, production_runs=90,
+        constraints={"min_quality": 0.90, "max_quality_regression": 0.05},
+    )
     # gpt-4o-mini is the cheapest model in the sheet and is made to regress;
     # the mid-priced candidate ties the baseline.
     runtime = FakeRuntime(quality_for={"gpt-4o-mini": 0.90}, n_cases=60)
@@ -570,7 +590,7 @@ def test_the_stored_verdict_records_the_regime_that_produced_it(db):
 
     row = db.rows("benchmark_conclusions")[0]
     regime = row["quality_safety_policy"]
-    assert regime["max_quality_regression"] == 0.05
+    assert regime["max_quality_regression"] == 0.02
     assert regime["max_quality_regression_source"] == "default"
     assert regime["quality_confidence_level"] == 0.95
     assert row["quality_safety"]["method"] == ni.METHOD
@@ -603,7 +623,12 @@ def test_the_frontier_names_the_alternatives_and_why_each_was_or_was_not_eligibl
 
 
 def test_the_consideration_funnel_accounts_for_every_candidate(db):
-    _seed(db, golden_inputs=60, constraints={"min_quality": 0.90}, production_runs=90)
+    # 0.05 pinned EXPLICITLY so the funnel has one candidate in each of the two
+    # stages it asserts on. 60 tied cases clear a 5pp margin, not the 2pp default.
+    _seed(
+        db, golden_inputs=60, production_runs=90,
+        constraints={"min_quality": 0.90, "max_quality_regression": 0.05},
+    )
     runtime = FakeRuntime(quality_for={"gpt-4o-mini": 0.70}, n_cases=60)
 
     result = _run_loop(
@@ -736,3 +761,540 @@ def test_every_emitted_reason_code_is_a_documented_one(db):
 
 def test_the_new_conclusion_is_in_the_documented_vocabulary():
     assert domain.CONCLUSION_PROMISING_UNVERIFIED in domain.CONCLUSIONS
+
+
+# ===========================================================================
+# 6. The default margin, and the supported override
+# ===========================================================================
+
+def test_the_default_margin_is_two_points_and_the_sample_adapts_to_it():
+    """
+    The margin is the SAFETY REQUIREMENT, not an evaluation-budget knob. 0.02 at
+    95% one-sided is what OptiML applies when nobody configured anything, and
+    the sample size follows from it rather than the other way around: a
+    perfectly tied candidate needs 133 paired cases, and that number is DERIVED
+    from the margin, never chosen for convenience.
+    """
+    safety = policies_mod.quality_safety_of(None)
+    assert safety["max_quality_regression"] == 0.02
+    assert safety["quality_confidence_level"] == 0.95
+
+    assert staging_mod.n_for_perfect_tie(0.02, 0.95) == 133
+    # Confirm the derived figure against the test the verdict actually uses.
+    assert ni.assess(
+        baseline_per_case=_per_case(133, 133), candidate_per_case=_per_case(133, 133),
+        margin=0.02, confidence_level=0.95,
+    )["established"] is True
+    assert ni.assess(
+        baseline_per_case=_per_case(132, 132), candidate_per_case=_per_case(132, 132),
+        margin=0.02, confidence_level=0.95,
+    )["established"] is False
+
+
+def test_a_tie_on_thirty_cases_at_the_default_margin_asks_for_the_derived_rest():
+    """gpt-5-mini's real situation, at the default: 30 tied cases, 103 to go."""
+    out = ni.assess(
+        baseline_per_case=_per_case(30, 30), candidate_per_case=_per_case(30, 30),
+        margin=0.02, confidence_level=0.95,
+    )
+    assert out["established"] is False
+    assert out["n_pairs"] == 30
+    assert out["additional_cases_required"] == 103
+    assert out["required_total_cases"] == 133
+
+
+def test_the_looser_margin_is_still_a_supported_per_workload_override():
+    """
+    0.05 remains available and easy: one policy constraint, source-stamped as
+    the customer's choice rather than OptiML's default.
+    """
+    assert 0.05 in policies_mod.DOCUMENTED_MAX_QUALITY_REGRESSION
+    assert 0.02 in policies_mod.DOCUMENTED_MAX_QUALITY_REGRESSION
+
+    safety = policies_mod.quality_safety_of(
+        {"constraints": {"max_quality_regression": 0.05}}
+    )
+    assert safety["max_quality_regression"] == 0.05
+    assert safety["max_quality_regression_source"] == "policy"
+    # And it behaves as a 5pp margin: 52 tied cases, not 133.
+    assert staging_mod.n_for_perfect_tie(0.05, 0.95) == 52
+    assert ni.assess(
+        baseline_per_case=_per_case(52, 52), candidate_per_case=_per_case(52, 52),
+        margin=0.05, confidence_level=0.95,
+    )["established"] is True
+
+
+def test_the_override_survives_the_whole_loop_and_is_recorded_as_the_customers(db):
+    """A workload on 0.05 concludes on 60 cases, and the regime says whose choice it was."""
+    _seed(
+        db, golden_inputs=60, production_runs=90,
+        constraints={"min_quality": 0.90, "max_quality_regression": 0.05},
+    )
+    result = _run_loop(
+        db, FakeRuntime(n_cases=60), candidates=[_candidate(CHEAP_MODEL)],
+    )
+    assert result["conclusion"] == domain.CONCLUSION_SAFE_IMPROVEMENT
+    regime = result["quality_safety_policy"]
+    assert regime["max_quality_regression"] == 0.05
+    assert regime["max_quality_regression_source"] == "policy"
+
+
+# ===========================================================================
+# 7. Staged evaluation: stop only when the answer is already known
+# ===========================================================================
+
+def _baseline_cases(total: int, *, fails=()):
+    """A baseline arm's per-case rows; `fails` names the indices it failed."""
+    return [
+        {
+            "case_id": f"gi-{i}",
+            "quality_checks_ran": 1,
+            "quality_checks_passed": 0 if i in set(fails) else 1,
+            "case_passed": i not in set(fails),
+            "error": False,
+        }
+        for i in range(total)
+    ]
+
+
+def _candidate_cases(total: int, *, fails=()):
+    return _baseline_cases(total, fails=fails)
+
+
+def test_the_stage_schedule_is_explicit_clamped_and_always_finishes_the_set():
+    """
+    Stage sizes are configuration, not magic numbers inline, and no schedule can
+    make a run cover fewer cases than the workload holds.
+    """
+    assert staging_mod.DEFAULT_STAGE_SIZES == (30, 60, 133)
+    assert policies_mod.DEFAULT_STAGED_EVALUATION["evaluation_stage_sizes"] == [30, 60, 133]
+    # The last default stage is DERIVED from the default margin, not chosen.
+    assert staging_mod.DEFAULT_STAGE_SIZES[-1] == staging_mod.n_for_perfect_tie(
+        policies_mod.DEFAULT_QUALITY_SAFETY["max_quality_regression"],
+        policies_mod.DEFAULT_QUALITY_SAFETY["quality_confidence_level"],
+    )
+
+    assert [(s["start"], s["end"]) for s in staging_mod.resolve_stages(133)] == [
+        (0, 30), (30, 60), (60, 133)
+    ]
+    # Clamped down...
+    assert [(s["start"], s["end"]) for s in staging_mod.resolve_stages(45)] == [
+        (0, 30), (30, 45)
+    ]
+    # ...and extended up: the full set is always the final stage.
+    assert staging_mod.resolve_stages(200)[-1]["end"] == 200
+    # A policy may replace the schedule entirely.
+    assert [(s["start"], s["end"]) for s in staging_mod.resolve_stages(50, [10, 25])] == [
+        (0, 10), (10, 25), (25, 50)
+    ]
+    # Switching staging off is one stage over everything.
+    assert [(s["start"], s["end"]) for s in staging_mod.resolve_stages(133, [])] == [(0, 133)]
+
+
+def test_the_bound_stops_the_live_failure_and_says_exactly_why():
+    """
+    gpt-4o-mini: 0.7667 with b=7, c=0 in the first 30 of 133 cases, against a
+    baseline that passed everything. Best case on the 103 remaining is that it
+    passes them all — and even then it lands at 126/133 = 0.9474, a 5.26pp
+    regression. That is still outside a 2pp margin, so the verdict is settled
+    and the remaining 103 cases are wasted spend.
+    """
+    out = staging_mod.early_stop_assessment(
+        margin=0.02,
+        baseline_per_case=_baseline_cases(133),
+        candidate_per_case=_candidate_cases(30, fails=range(7)),
+    )
+    assert out["stop"] is True
+    assert out["reason_code"] == staging_mod.STOP_REGRESSION_UNRECOVERABLE
+    assert out["cases_run"] == 30 and out["cases_remaining"] == 103
+    assert out["paired"] == {
+        "n_pairs": 30, "discordant_b": 7, "discordant_c": 0,
+        "concordant_pass": 23, "concordant_fail": 0,
+    }
+    # The bound itself, hand-checkable: (c - b + r_fail) / (n + r_pairable).
+    assert out["remaining_baseline_failed"] == 0
+    assert out["best_case_final_paired_delta"] == pytest.approx(-7 / 133, abs=1e-6)
+    assert out["best_case_final_quality"] == pytest.approx(126 / 133, abs=1e-6)
+    assert out["best_case_final_regression"] == pytest.approx(7 / 133, abs=1e-6)
+    assert out["observed_regression_prefix"] == pytest.approx(7 / 30, abs=1e-6)
+
+
+def test_the_bound_refuses_to_stop_a_candidate_that_could_still_recover():
+    """
+    b = 2 on the same 30 of 133. Worst it can finish at is 131/133, a 1.5pp
+    regression — INSIDE a 2pp margin. It looks bad and it is not; the run
+    continues. b = 3 is the first count the margin cannot absorb (2pp of 133 is
+    2.66 cases), and the boundary is asserted from both sides.
+    """
+    base = _baseline_cases(133)
+    keeps_going = staging_mod.early_stop_assessment(
+        margin=0.02, baseline_per_case=base,
+        candidate_per_case=_candidate_cases(30, fails=range(2)),
+    )
+    assert keeps_going["stop"] is False
+    assert keeps_going["reason_code"] == staging_mod.CONTINUE_REMAINING_COULD_RECOVER
+    assert keeps_going["best_case_final_paired_delta"] == pytest.approx(-2 / 133, abs=1e-6)
+
+    stops = staging_mod.early_stop_assessment(
+        margin=0.02, baseline_per_case=base,
+        candidate_per_case=_candidate_cases(30, fails=range(3)),
+    )
+    assert stops["stop"] is True
+
+
+def test_a_baseline_that_also_fails_makes_recovery_possible_and_blocks_the_stop():
+    """
+    The reason the baseline is run to completion FIRST. Here it fails 10 of the
+    103 remaining cases, so the candidate can still win 10 discordant pairs
+    back. Its best finish is above the baseline, and nothing may be concluded
+    yet however bad the first 30 looked.
+    """
+    out = staging_mod.early_stop_assessment(
+        margin=0.02,
+        baseline_per_case=_baseline_cases(133, fails=range(30, 40)),
+        candidate_per_case=_candidate_cases(30, fails=range(7)),
+    )
+    assert out["remaining_baseline_failed"] == 10
+    assert out["stop"] is False
+    assert out["reason_code"] == staging_mod.CONTINUE_REMAINING_COULD_RECOVER
+    # c - b + r_fail = 0 - 7 + 10 = 3, so it could finish ABOVE the baseline.
+    assert out["best_case_final_paired_delta"] > 0
+
+
+def test_a_stop_is_never_derived_from_arms_that_ran_different_cases():
+    """
+    Pairing is the whole basis of the statistics. If the candidate's rows are
+    not a prefix of the baseline's, no bound is computed at all — the counts
+    would be over two different case sets.
+    """
+    mismatched = _candidate_cases(30)
+    mismatched[5]["case_id"] = "gi-999"
+    out = staging_mod.early_stop_assessment(
+        margin=0.02, baseline_per_case=_baseline_cases(133, ),
+        candidate_per_case=mismatched,
+    )
+    assert out["stop"] is False
+    assert out["alignment_verified"] is False
+    assert out["reason_code"] == staging_mod.CONTINUE_CASE_ALIGNMENT_UNVERIFIED
+    assert out["best_case_final_paired_delta"] is None
+
+
+def test_a_completed_candidate_is_never_stopped():
+    out = staging_mod.early_stop_assessment(
+        margin=0.02,
+        baseline_per_case=_baseline_cases(133),
+        candidate_per_case=_candidate_cases(133, fails=range(50)),
+    )
+    assert out["stop"] is False
+    assert out["reason_code"] == staging_mod.CONTINUE_NO_CASES_REMAINING
+
+
+# ---------------------------------------------------------------------------
+# Through the real loop
+# ---------------------------------------------------------------------------
+
+def test_a_stopped_candidate_is_failed_policy_with_its_stage_and_reason_recorded(db):
+    """
+    The live failure, staged. gpt-4o-mini misses the first 7 of 133 cases. It is
+    dropped at stage 1 after 30 cases, and its record says so: stopped early, at
+    which stage, over how many cases, and the bound that justified it.
+
+    It is `failed_policy` — we KNOW the answer — and must never be filed as
+    `insufficient_evidence`.
+    """
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(fail_first_for={CHEAP_MODEL: 7}, n_cases=133)
+
+    result = _run_loop(
+        db, runtime, candidates=[_candidate(CHEAP_MODEL)], create_recommendation=True,
+    )
+
+    assert result["conclusion"] == domain.CONCLUSION_CANDIDATES_FAILED_POLICY
+    assert result["conclusion"] != domain.CONCLUSION_INSUFFICIENT_EVIDENCE
+    assert result["recommendation_created"] is False
+
+    arm = next(a for a in db.rows("benchmark_candidate_results") if a["arm"] == "candidate")
+    staged = arm["outcome_metrics"]["staged_evaluation"]
+    assert staged["stopped_early"] is True
+    assert staged["stopped_at_stage"] == 1
+    assert staged["cases_run"] == 30
+    assert staged["cases_planned"] == 133
+    assert staged["cases_not_run"] == 103
+    assert staged["stop_reason_code"] == staging_mod.STOP_REGRESSION_UNRECOVERABLE
+    assert staged["margin"] == 0.02
+    assert staged["margin_source"] == "default"
+
+    # The bound travels with the decision, so it is re-checkable later.
+    bound = staged["bound"]
+    assert bound["bound_method"] == staging_mod.BOUND_METHOD
+    assert bound["paired"]["discordant_b"] == 7
+    assert bound["best_case_final_paired_delta"] == pytest.approx(-7 / 133, abs=1e-6)
+    assert bound["best_case_final_regression"] == pytest.approx(7 / 133, abs=1e-6)
+
+    # The arm row itself is the evidence for 30 cases, not 133.
+    assert arm["sample_size"] == 30
+    assert len(arm["per_case_results"]) == 30
+
+    # And the verdict names it, with the facts, in the documented vocabulary.
+    stop_reason = next(
+        r for r in result["reasons"] if r["code"] == "candidate_evaluation_stopped_early"
+    )
+    assert stop_reason["stopped_at_stage"] == 1
+    assert stop_reason["cases_run"] == 30
+    assert stop_reason["cases_not_run"] == 103
+    assert stop_reason["detail_code"] == staging_mod.STOP_REGRESSION_UNRECOVERABLE
+    assert stop_reason["allowed_regression"] == 0.02
+    for r in result["reasons"] + result["more_data_reasons"]:
+        assert r["code"] in domain.REASON_CODES
+
+
+def test_per_stage_results_record_what_was_known_when(db):
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(fail_first_for={CHEAP_MODEL: 7}, n_cases=133)
+    _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+
+    arm = next(a for a in db.rows("benchmark_candidate_results") if a["arm"] == "candidate")
+    stages = arm["outcome_metrics"]["staged_evaluation"]["stages"]
+    assert len(stages) == 1                      # it never reached stage 2
+    first = stages[0]
+    assert first["stage_index"] == 1
+    assert first["cases_cumulative"] == 30
+    assert first["quality"] == pytest.approx(23 / 30, abs=1e-4)
+    # The comparison recorded at that moment is against the SAME 30 cases.
+    assert first["baseline_quality_same_cases"] == pytest.approx(1.0)
+    assert first["decision"] == "stop"
+    assert first["decision_reason_code"] == staging_mod.STOP_REGRESSION_UNRECOVERABLE
+
+
+def test_every_arm_walks_the_same_cases_in_the_same_order(db):
+    """
+    A stopped candidate must have been compared against the baseline on exactly
+    the cases it ran — so its calls are a PREFIX of the baseline's call
+    sequence, not a sample from elsewhere in the set.
+    """
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(fail_first_for={CHEAP_MODEL: 7}, n_cases=133)
+    _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+
+    baseline_calls = [c["input_text"] for c in runtime.calls if c["model"] == BASELINE_MODEL]
+    candidate_calls = [c["input_text"] for c in runtime.calls if c["model"] == CHEAP_MODEL]
+    assert len(baseline_calls) == 133
+    assert len(candidate_calls) == 30
+    assert candidate_calls == baseline_calls[:30]
+
+    # And the persisted per-case rows agree, case id for case id.
+    arms = db.rows("benchmark_candidate_results")
+    base_ids = [r["case_id"] for r in next(a for a in arms if a["arm"] == "baseline")["per_case_results"]]
+    cand_ids = [r["case_id"] for r in next(a for a in arms if a["arm"] == "candidate")["per_case_results"]]
+    assert cand_ids == base_ids[:30]
+
+
+def test_a_candidate_that_could_still_recover_runs_every_case(db):
+    """
+    Two misses in the first 30 of 133. It is the worst-looking candidate the
+    bound will NOT stop, and the product must spend the money to find out.
+    """
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(fail_first_for={CHEAP_MODEL: 2}, n_cases=133)
+    _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+
+    candidate_calls = [c for c in runtime.calls if c["model"] == CHEAP_MODEL]
+    assert len(candidate_calls) == 133
+
+    arm = next(a for a in db.rows("benchmark_candidate_results") if a["arm"] == "candidate")
+    staged = arm["outcome_metrics"]["staged_evaluation"]
+    assert staged["stopped_early"] is False
+    assert staged["cases_run"] == 133
+    assert staged["stages_run"] == 3
+    assert [s["decision"] for s in staged["stages"]] == ["continue", "continue", "continue"]
+    assert staged["stages"][0]["decision_reason_code"] == (
+        staging_mod.CONTINUE_REMAINING_COULD_RECOVER
+    )
+
+
+def test_a_candidate_surviving_every_stage_stays_promising_with_a_recomputed_target(db):
+    """
+    gpt-5-mini at the default margin on a 60-case suite: it ties the baseline,
+    survives every stage, is never stopped, and comes back PROMISING with the
+    N-more-cases figure recomputed from the 60 cases it actually ran.
+    """
+    _seed(db, golden_inputs=60, constraints={"min_quality": 0.90}, production_runs=90)
+    runtime = FakeRuntime(n_cases=60)
+
+    result = _run_loop(
+        db, runtime, candidates=[_candidate(CHEAP_MODEL)], create_recommendation=True,
+    )
+    assert result["conclusion"] == domain.CONCLUSION_PROMISING_UNVERIFIED
+    # It really did run every case: nothing was stopped.
+    assert len([c for c in runtime.calls if c["model"] == CHEAP_MODEL]) == 60
+    qs = result["quality_safety"]
+    assert qs["established"] is False
+    assert qs["n_pairs"] == 60                     # every case it ran
+    assert qs["required_total_cases"] == 133       # derived from the 2pp margin
+    assert qs["additional_cases_required"] == 73   # 133 - 60, recomputed
+    assert result["recommendation_created"] is False
+
+
+def test_staging_never_changes_a_verdict_it_only_stops_paying_for_it(db):
+    """
+    The same evidence, staged and unstaged, concludes identically. Staging is a
+    spend decision, never an evidence one — a candidate is only ever dropped
+    when finishing the run could not have changed its verdict.
+    """
+    constraints = {"min_quality": 0.50}
+    staged_db, plain_db = FakeSupabase(), FakeSupabase()
+    _seed(staged_db, golden_inputs=133, constraints=dict(constraints), production_runs=90)
+    _seed(
+        plain_db, golden_inputs=133, production_runs=90,
+        constraints={**constraints, "staged_evaluation_enabled": False},
+    )
+
+    staged = _run_loop(
+        staged_db, FakeRuntime(fail_first_for={CHEAP_MODEL: 7}, n_cases=133),
+        candidates=[_candidate(CHEAP_MODEL)],
+    )
+    plain_runtime = FakeRuntime(fail_first_for={CHEAP_MODEL: 7}, n_cases=133)
+    plain = _run_loop(plain_db, plain_runtime, candidates=[_candidate(CHEAP_MODEL)])
+
+    assert staged["conclusion"] == plain["conclusion"] == (
+        domain.CONCLUSION_CANDIDATES_FAILED_POLICY
+    )
+    # Switching staging off is recorded as the customer's choice and really does
+    # run everything.
+    assert len([c for c in plain_runtime.calls if c["model"] == CHEAP_MODEL]) == 133
+    plain_arm = next(
+        a for a in plain_db.rows("benchmark_candidate_results") if a["arm"] == "candidate"
+    )
+    assert plain_arm["outcome_metrics"]["staged_evaluation"]["enabled"] is False
+    assert plain_arm["outcome_metrics"]["staged_evaluation"]["stopped_early"] is False
+
+
+def test_the_spend_avoided_is_counted_and_the_dollars_are_not_faked(db):
+    """
+    Cases not run is an exact count of something that demonstrably did not
+    happen. The DOLLARS are not measurable — those cases were never executed, so
+    no provider ever priced them — so the measured field stays NULL with a
+    reason code and the projection lives in its own named field with the
+    measured inputs it came from.
+    """
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(fail_first_for={CHEAP_MODEL: 7}, n_cases=133)
+    result = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+
+    summary = result["staged_evaluation"]
+    assert summary["candidates_evaluated"] == 1
+    assert summary["candidates_stopped_early"] == 1
+    assert summary["cases_not_run"] == 103
+    assert summary["workflow_executions_avoided"] == 103
+    assert summary["spend_avoided_usd"] is None
+    assert summary["spend_avoided_reason"] == staging_mod.SPEND_AVOIDED_NOT_MEASURABLE
+
+    arm = next(a for a in db.rows("benchmark_candidate_results") if a["arm"] == "candidate")
+    staged = arm["outcome_metrics"]["staged_evaluation"]
+    assert staged["spend_avoided_usd"] is None
+    assert staged["spend_avoided_reason"] == staging_mod.SPEND_AVOIDED_NOT_MEASURABLE
+    # The projection is derived from measured inputs and says so.
+    assert staged["spend_avoided_projected_usd"] == pytest.approx(
+        arm["mean_cost_usd"] * 103, rel=1e-6
+    )
+    assert staged["spend_avoided_projection_basis"] == (
+        staging_mod.SPEND_AVOIDED_PROJECTION_BASIS
+    )
+    assert staged["projected_from_cases_measured"] == 30
+
+
+def test_a_run_with_nothing_stopped_reports_no_spend_avoided(db):
+    _seed(db, golden_inputs=60, constraints={"min_quality": 0.90}, production_runs=90)
+    result = _run_loop(db, FakeRuntime(n_cases=60), candidates=[_candidate(CHEAP_MODEL)])
+    summary = result["staged_evaluation"]
+    assert summary["candidates_stopped_early"] == 0
+    assert summary["cases_not_run"] == 0
+    assert summary["spend_avoided_usd"] is None
+    assert summary["spend_avoided_projected_usd"] is None
+
+
+def test_a_stopped_candidate_is_scored_against_the_baseline_on_its_own_cases(db):
+    """
+    THE PAIRING RULE, where it can actually be caught. The baseline misses 6
+    cases in the TAIL of the order, so its quality over the whole set (127/133 =
+    0.9549) differs from its quality over the first 30 (1.0000). A candidate
+    stopped after 30 cases must be scored against the SECOND number.
+
+    Using the baseline's full-run figures would quietly compare the candidate
+    against 103 cases it never ran, and every delta on its record would be
+    wrong by the difference.
+    """
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(
+        n_cases=133,
+        fail_cases_for={
+            BASELINE_MODEL: range(127, 133),   # baseline misses 6, all after the prefix
+            CHEAP_MODEL: range(12),            # candidate misses 12 of the first 30
+        },
+    )
+    result = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+    assert result["conclusion"] == domain.CONCLUSION_CANDIDATES_FAILED_POLICY
+
+    arms = db.rows("benchmark_candidate_results")
+    baseline_arm = next(a for a in arms if a["arm"] == "baseline")
+    arm = next(a for a in arms if a["arm"] == "candidate")
+
+    assert baseline_arm["quality"] == pytest.approx(127 / 133, abs=1e-4)
+    assert arm["outcome_metrics"]["staged_evaluation"]["stopped_early"] is True
+    assert arm["quality"] == pytest.approx(18 / 30, abs=1e-4)
+
+    # The delta is against the baseline over the SAME 30 cases (1.0000), not
+    # against its full-run 0.9549.
+    assert arm["quality_delta"] == pytest.approx(18 / 30 - 1.0, abs=1e-4)
+
+    paired = arm["outcome_metrics"]["paired_vs_baseline"]
+    assert paired["n_pairs"] == 30
+    assert paired["discordant_b"] == 12
+    assert paired["discordant_c"] == 0
+    assert paired["baseline_quality_paired"] == pytest.approx(1.0)
+
+    # Same rule inside the bound that stopped it.
+    bound = arm["outcome_metrics"]["staged_evaluation"]["bound"]
+    assert bound["observed_regression_prefix"] == pytest.approx(1.0 - 18 / 30, abs=1e-6)
+    assert bound["remaining_baseline_failed"] == 6
+    # (c - b + r_fail) / (n + r_pairable) = (0 - 12 + 6) / 133
+    assert bound["best_case_final_paired_delta"] == pytest.approx(-6 / 133, abs=1e-6)
+
+    # And the reason the verdict cites carries the like-for-like regression.
+    regression = next(
+        r for r in result["reasons"] if r["code"] == "quality_regression_above_threshold"
+    )
+    assert regression["baseline_quality"] == pytest.approx(1.0)
+    assert regression["candidate_quality"] == pytest.approx(18 / 30, abs=1e-4)
+
+
+def test_a_re_read_reproduces_the_same_pairing_a_stopped_candidate_was_judged_on(db):
+    """
+    `reevaluate` re-derives a verdict from stored rows. A candidate that stopped
+    at 30 cases must be re-paired against the baseline's first 30, or a re-read
+    could reach a conclusion the original evidence never supported.
+    """
+    _seed(db, golden_inputs=133, constraints={"min_quality": 0.50}, production_runs=90)
+    runtime = FakeRuntime(
+        n_cases=133,
+        fail_cases_for={BASELINE_MODEL: range(127, 133), CHEAP_MODEL: range(12)},
+    )
+    first = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+
+    patches = _patched(db, runtime)
+    for p in patches:
+        p.start()
+    try:
+        second = benchmark_mod.reevaluate(ORG_ID, first["benchmark_id"])
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert second["conclusion"] == domain.CONCLUSION_CANDIDATES_FAILED_POLICY
+    regression = next(
+        r for r in second["reasons"] if r["code"] == "quality_regression_above_threshold"
+    )
+    assert regression["baseline_quality"] == pytest.approx(1.0)   # the prefix, not 0.9549
+    assert regression["candidate_quality"] == pytest.approx(18 / 30, abs=1e-4)
+    # Re-reading runs no model calls.
+    assert len(runtime.calls) == 133 + 30

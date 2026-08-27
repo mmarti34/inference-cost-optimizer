@@ -910,6 +910,14 @@ REASON_CODES: dict[str, str] = {
         "the candidate is worse than the baseline by more than the allowed "
         "regression. Not a claim that the candidate IS worse."
     ),
+    "candidate_evaluation_stopped_early": (
+        "Evaluation of this candidate was stopped before the full case set "
+        "because the evidence already gathered determined its verdict: no "
+        "outcome on the remaining cases could bring its quality regression back "
+        "within the policy's max_quality_regression. The record carries the "
+        "stage, the cases run, and the bound. This is a settled verdict, not a "
+        "shortage of evidence."
+    ),
     "quality_non_inferiority_established": (
         "The evidence rules out, at the policy's confidence level, a quality "
         "regression larger than the policy allows."
