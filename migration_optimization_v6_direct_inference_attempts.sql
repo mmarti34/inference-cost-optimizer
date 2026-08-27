@@ -161,7 +161,11 @@ CREATE INDEX IF NOT EXISTS idx_api_request_log_direct
 -- optimization/attempts.py::facts_from_direct_row constructs the AttemptFacts.
 -- All shape knowledge stays in the one module that owns it.
 -- ============================================================================
-CREATE OR REPLACE VIEW public.attempts AS
+-- NOTE: CREATE OR REPLACE VIEW cannot change a view's column names/types or
+-- insert a column mid-list. This definition does both relative to the previous
+-- migration, so the view MUST be dropped first. Verified against production.
+DROP VIEW IF EXISTS public.attempts;
+CREATE VIEW public.attempts AS
 
 -- ── Runtime: Studio workflows and deployed endpoints ────────────────────────
 SELECT

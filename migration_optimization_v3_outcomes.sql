@@ -174,7 +174,11 @@ COMMENT ON COLUMN public.optimization_benchmarks.success_signal IS
 -- 7. attempts view — carry project_id (derived through workflow -> project) and
 --    keep Direct Inference able to join in later without a rewrite.
 -- ============================================================================
-CREATE OR REPLACE VIEW public.attempts AS
+-- NOTE: CREATE OR REPLACE VIEW cannot change a view's column names/types or
+-- insert a column mid-list. This definition does both relative to the previous
+-- migration, so the view MUST be dropped first. Verified against production.
+DROP VIEW IF EXISTS public.attempts;
+CREATE VIEW public.attempts AS
 SELECT
     wr.id                                   AS attempt_id,
     'workflow_run'::TEXT                    AS attempt_source,

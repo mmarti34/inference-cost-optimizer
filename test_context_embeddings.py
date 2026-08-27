@@ -8,10 +8,16 @@ _mock_supabase_mod = types.ModuleType("supabase_client")
 _mock_supabase_mod.supabase = MagicMock()
 sys.modules.setdefault("supabase_client", _mock_supabase_mod)
 
-# Mock openai
-_mock_openai = types.ModuleType("openai")
-_mock_openai.OpenAI = MagicMock()
-sys.modules.setdefault("openai", _mock_openai)
+# Mock openai — only when the real package is absent. A bare ModuleType has no
+# __path__, so installing it unconditionally makes `openai` a non-package for the
+# whole pytest session and breaks every later module doing `from openai.types...`.
+try:  # pragma: no cover - depends on the environment, not the code under test
+    import openai  # noqa: F401
+except ImportError:
+    _mock_openai = types.ModuleType("openai")
+    _mock_openai.__path__ = []
+    _mock_openai.OpenAI = MagicMock()
+    sys.modules.setdefault("openai", _mock_openai)
 
 from context_embeddings import chunk_text
 
