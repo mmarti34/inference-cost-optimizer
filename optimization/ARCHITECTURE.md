@@ -54,11 +54,80 @@ A price sheet says what a call *would* cost. Only a measurement says what it
 | `benchmark.py` | The evidence engine, and the pure `evaluate_conclusion` verdict function. |
 | `outcomes.py` | Outcome recording: delayed, plural, named, correctable, idempotent. |
 | `policies.py` | Constraints that make a strategy invalid; versioned by insert. |
-| `workloads.py` | Identity resolution (explicit / structural) and discovery. |
+| `workloads.py` | Identity resolution (explicit / structural), discovery, and read-only selection of which workload is worth benchmarking. |
 | `allocation.py` | Records which strategy was chosen and why. |
 | `service.py` | Recommendation CRUD, lifecycle transitions, audit trail. |
 
 ---
+
+## The one loop that runs today
+
+```
+observed Runtime workload            workloads.select_optimization_targets
+  -> alternate model candidates      candidates.generate_candidates
+  -> replayed against the SAME       benchmark._execute_arm, via
+     golden inputs                   workflow_runtime.execute_workflow(execution_mode='eval')
+  -> compared under the policy       policies.evaluate + domain.evaluate_materiality
+  -> evidence persisted per ARM      benchmark_candidate_results
+  -> ONE immutable conclusion        benchmark_conclusions
+  -> recommendation, only on         service.create_recommendation, cited through
+     safe_improvement_found          recommendation_evidence, approval_required=TRUE
+```
+
+`POST /{org_id}/workloads/{workload_id}/optimize` runs it end to end and returns
+the verdict. `POST /{org_id}/workloads/{workload_id}/benchmark` runs the same
+engine exploratorily and creates nothing, because discovering a fact and
+proposing an action are different events.
+
+**Model substitution is the only dimension this loop varies.** Everything else
+in `SURFACE_APPLICABLE_DIMENSIONS` is applicable but has no generator behind it,
+and everything in `UNSUPPORTED_DIMENSIONS` refuses at apply time.
+
+### Selection is allowed to say no, and to say why
+
+`select_optimization_targets` is READ-ONLY (discovery is what writes) and ranks
+on **measured spend, then measured volume** — never on which workload looks
+expensive. Two documented floors, both overridable per call:
+
+| Floor | Value | Why |
+|---|---|---|
+| `MIN_RUNS_TO_OPTIMIZE` | 20 runs in the window | Below this a workload's own averages are dominated by individual-case noise. |
+| `MIN_OBSERVED_SPEND_USD` | $0.10 in the window | Excludes only workloads whose entire measured spend rounds to nothing. |
+
+Every workload passed over is returned under `skipped` with structured reason
+codes (`workload_volume_below_threshold`, `no_replay_cases`,
+`workload_not_registered`) and the facts behind them. **A workload missing from
+`targets` was not assessed** — which is an absence of evidence, never a finding
+that it is already efficient.
+
+### Estimated pricing can never become a measured saving
+
+`utils.pricing.get_pricing` returns a loud fallback guess ($0.001/$0.002 per 1k)
+for a model id it cannot resolve. That guess is *cheaper than almost every real
+model*, so treating it as a measurement would make the loop "discover" enormous
+savings that were never observed — the single most dangerous failure mode in a
+cost-optimization product.
+
+`executors.pricing_provenance` resolves an arm's prices from its strategy
+**before** the arm executes. When any model in it is unpriced:
+
+- `mean_cost_usd` / `total_cost_usd` on the arm and `cost_usd` on every per-case
+  row stay **NULL**; the figures land in `*_estimated_usd` with
+  `cost_basis='estimated'` and the responsible models named;
+- the arm is therefore unrankable on a cost objective, so it cannot win;
+- the conclusion carries `cost_pricing_estimated`, whose `more_data` reason says
+  the fix is a price-sheet entry, **not** more replay cases;
+- `verified_savings_usd` is never computed, because its baseline is NULL.
+
+This mirrors `AttemptFacts.cost_measured` on the Direct Inference surface: one
+rule, applied identically wherever a dollar figure is produced.
+
+### Nothing judgeable is ignorance, not efficiency
+
+If not one materiality threshold could be evaluated — because a metric was
+missing on an arm — the conclusion is `insufficient_evidence`, never
+`no_material_improvement`. "Not worth changing" is a knowledge claim, and the
+absence of a comparison is not knowledge.
 
 ## The Work Graph
 
@@ -462,7 +531,18 @@ coverage 64% — $81k/month assessable, $46k/month awaiting sufficient evidence
 - Executor registry synced from `shared/providers.json`, labelled `vendor_metadata`.
 - Strategy ↔ `graph_json` adapter for the dimensions this runtime can genuinely
   apply: **model, provider, prompt, context_length, fallback_chain**.
-- Two candidate generators, each backed by real data.
+- Two candidate generators, each backed by real data — one over the vendor
+  price sheet (`evidence_source='none'`), one over measured history
+  (`evidence_source='observational'`). Neither may be recommended unmeasured.
+- Read-only workload selection with documented floors and structured skip codes.
+- Cost provenance: an estimated price never reaches a measured-cost field, on any
+  row, at any layer.
+- Recommendation creation gated on `safe_improvement_found` alone, cited through
+  `recommendation_evidence`, `approval_required` per policy (default TRUE), with
+  `projected_savings_usd` (measured delta x measured volume) and
+  `verified_savings_usd` (measured over the sample) written to their own columns
+  and `baseline_reference.derived_from_recommendation_id` set so a chain is not
+  counted twice.
 - Golden-input replay benchmark reusing `execute_workflow(execution_mode='eval')`
   and the workflow's own `eval_suites.checks`.
 - Explicit conclusions, structured reason codes, immutable policy-versioned

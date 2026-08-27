@@ -1,9 +1,19 @@
 """
 Optimization layer API.
 
-Everything is guarded with `Depends(require_org_member)`, takes `org_id` in the
-PATH, and re-filters every query by that org_id. There is no `select("*")`
-anywhere in this package.
+Every /api route is guarded with `Depends(require_org_member)`, takes `org_id`
+in the PATH, and re-filters every query by that org_id. There is no
+`select("*")` anywhere in this package.
+
+TWO AUDIENCES, TWO CREDENTIALS. The dashboard is a signed-in human; a customer
+integration is a backend holding a server API key. They do not share an auth
+mechanism and are not collapsed into one endpoint:
+
+    dashboard / internal   POST /api/optimization/{org_id}/outcomes
+                           user auth (require_org_member), org in the path
+
+    customer / server      POST /v1/outcomes
+                           server API key (validate_api_key), org from the key
 
 CONTRACT NOTE: this API returns CODES AND FACTS, never customer-facing prose.
 A conclusion is a stable `conclusion` code plus a `reasons` array whose entries
@@ -14,6 +24,8 @@ Routes:
   GET  /api/optimization/{org_id}/summary
   GET  /api/optimization/{org_id}/workloads
   POST /api/optimization/{org_id}/workloads/discover
+  GET  /api/optimization/{org_id}/optimization-targets
+  POST /api/optimization/{org_id}/workloads/{workload_id}/optimize
   GET  /api/optimization/{org_id}/recommendations
   GET  /api/optimization/{org_id}/recommendations/{rec_id}
   POST /api/optimization/{org_id}/recommendations/{rec_id}/benchmark
@@ -32,7 +44,7 @@ Routes:
   GET  /api/optimization/{org_id}/outcomes
   POST /api/optimization/{org_id}/outcomes
   POST /api/optimization/{org_id}/outcomes/{outcome_id}/correct
-  POST /v1/outcomes                        (customer-facing alias)
+  POST /v1/outcomes                        (customer-facing, server API key)
 """
 from __future__ import annotations
 
@@ -40,9 +52,10 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 
+from api_key_validation import validate_api_key
 from auth_dependency import AuthenticatedUser, require_org_member
 from supabase_client import supabase
 
@@ -63,11 +76,18 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/optimization", tags=["optimization"])
 
-# The customer-facing alias lives outside /api and carries no org in the path;
-# org identity comes from the authenticated principal via require_org_member
-# (X-Org-Id header or body), and every query is re-filtered by the org that
-# dependency actually VERIFIED.
+# The customer-facing surface lives outside /api and carries no org in the
+# path. It is authenticated with a SERVER API KEY — the same credential the
+# customer already uses for POST /v1/chat/completions — and the org is taken
+# from that validated key alone. It does NOT use require_org_member: a
+# customer's backend has no Supabase session, which is exactly why outcome
+# ingestion was previously uncallable by the customer it was built for.
 public_router = APIRouter(prefix="/v1", tags=["optimization-public"])
+
+#: One message for "that attempt is not yours" AND "that attempt does not
+#: exist". Any difference between the two turns this endpoint into an oracle
+#: for another tenant's request ids. Matches main.py's trace endpoint.
+_NOT_FOUND_DETAIL = "Request not found."
 
 
 def _verified_org(user: AuthenticatedUser, org_id: str) -> str:
@@ -103,6 +123,25 @@ class BenchmarkPayload(BaseModel):
         extra = "ignore"
 
 
+class OptimizePayload(BaseModel):
+    """
+    Input to the full optimization loop.
+
+    `create_recommendation` defaults TRUE here and is absent from
+    BenchmarkPayload on purpose: /benchmark is exploratory and must never
+    produce a proposal, while /optimize exists precisely to close the loop.
+    Either way the creation is gated on the EVIDENCE concluding
+    safe_improvement_found — this flag can only decline it, never force it.
+    """
+
+    objective: Optional[str] = None
+    min_sample_size: Optional[int] = None
+    create_recommendation: bool = True
+
+    class Config:
+        extra = "ignore"
+
+
 class PolicyPayload(BaseModel):
     workload_id: Optional[str] = None
     name: Optional[str] = None
@@ -129,6 +168,9 @@ class OutcomePayload(BaseModel):
 
     outcome_type: str
     idempotency_key: str
+    #: Never an input to authorization. On /v1/outcomes the org comes from the
+    #: server API key; this field is accepted only so that a MISMATCH can be
+    #: reported back to the caller instead of being silently discarded.
     org_id: Optional[str] = None
     attempt_id: Optional[str] = None
     request_id: Optional[str] = None
@@ -202,6 +244,36 @@ async def discover_workloads(
     org_id = _verified_org(user, org_id)
     return await asyncio.get_event_loop().run_in_executor(
         None, lambda: workloads_mod.discover_workloads(org_id, lookback_days=lookback_days)
+    )
+
+
+@router.get("/{org_id}/optimization-targets")
+async def optimization_targets(
+    org_id: str,
+    lookback_days: int = 30,
+    min_runs: Optional[int] = None,
+    min_spend_usd: Optional[float] = None,
+    limit: int = 10,
+    user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Which observed workloads are worth spending a benchmark on, ranked on
+    MEASURED spend then MEASURED volume.
+
+    Read-only. Every workload passed over is returned under `skipped` with
+    structured reason codes, because a workload missing from the list must not
+    read as a workload that was assessed and found optimal.
+    """
+    org_id = _verified_org(user, org_id)
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: workloads_mod.select_optimization_targets(
+            org_id,
+            lookback_days=lookback_days,
+            min_runs=min_runs,
+            min_spend_usd=min_spend_usd,
+            limit=limit,
+        ),
     )
 
 
@@ -523,6 +595,61 @@ async def benchmark_workload(
     }
 
 
+@router.post("/{org_id}/workloads/{workload_id}/optimize")
+async def optimize_workload(
+    org_id: str,
+    workload_id: str,
+    payload: Optional[OptimizePayload] = None,
+    user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    The full loop, run to completion: generate model-substitution candidates,
+    replay them and the baseline over the SAME golden inputs, judge the result
+    against the workload's policy, persist every measured arm and one immutable
+    conclusion, and — only on `safe_improvement_found` — create a recommendation
+    that cites the benchmark.
+
+    Unlike /benchmark this AWAITS the verdict, because the verdict is the point.
+    A conclusion of `insufficient_evidence` is a successful response, not an
+    error: it is what OptiML knows, and it is never rendered as "your current
+    configuration is optimal".
+
+    The recommendation, if one is created, is `approval_required` per policy and
+    defaults to requiring a human. Nothing here changes production.
+    """
+    org_id = _verified_org(user, org_id)
+    if workloads_mod.get_workload(org_id, workload_id) is None:
+        raise HTTPException(status_code=404, detail="Workload not found.")
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: benchmark_mod.run_benchmark(
+                org_id,
+                workload_id=workload_id,
+                objective=(payload.objective if payload else None),
+                min_sample_size=(payload.min_sample_size if payload else None),
+                create_recommendation=(payload.create_recommendation if payload else True),
+                actor=user.user_id,
+            ),
+        )
+    except benchmark_mod.BenchmarkError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    rec_id = result.get("recommendation_id")
+    rec_row = service.get_recommendation(org_id, rec_id) if rec_id else None
+    return {
+        **result,
+        "recommendation": (
+            service.recommendation_row_to_response(
+                rec_row, evidence=service.require_evidence(org_id, rec_id)
+            )
+            if rec_row
+            else None
+        ),
+    }
+
+
 @router.get("/{org_id}/benchmarks")
 async def list_benchmarks(
     org_id: str,
@@ -738,26 +865,78 @@ async def create_outcome(
 @public_router.post("/outcomes")
 async def create_outcome_public(
     payload: OutcomePayload,
-    user: AuthenticatedUser = Depends(require_org_member),
-    x_org_id: Optional[str] = Header(None),
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
 ):
     """
-    Customer-facing alias of POST /api/optimization/{org_id}/outcomes.
+    Customer-facing outcome ingestion. Server-to-server.
 
-    The org is taken from the principal that `require_org_member` VERIFIED
-    (X-Org-Id header or an org_id in the body), never from an unverified field.
+    AUTH CONTRACT — this endpoint is called by a customer's BACKEND, holding
+    the same OptiML **server API key** it uses for POST /v1/chat/completions.
+    It is NOT a dashboard endpoint and takes no user session:
+
+      * The Bearer token is validated by `validate_api_key`, the single
+        production key-validation primitive (see routers/openai_compat.py and
+        routers/public_execution.py). No key logic is duplicated here, so
+        revocation, status checks and the legacy-key path all apply unchanged
+        and a disabled key fails closed with 401.
+      * `org_id` comes EXCLUSIVELY from the validated key's OrgContext.
+      * An `org_id` asserted anywhere in the request — body, `X-Org-Id`, or
+        query string — is never trusted. If it conflicts with the key's org the
+        request is REJECTED (403), because silently overriding it would let a
+        customer believe they had written to an org they had not, and silently
+        ignoring it would hide the same mistake.
+      * The referenced attempt is verified to belong to the key's org before
+        anything is attached, and a reference to another org's attempt returns
+        the SAME 404 as one that does not exist anywhere. This mirrors the
+        observability trace endpoint in main.py: a request id is obscurity, not
+        an access control, so the endpoint must not double as an oracle for
+        which ids exist in another tenant.
+
+    The dashboard equivalent, POST /api/optimization/{org_id}/outcomes, keeps
+    user/org-member auth and is unaffected.
     """
-    org_id = getattr(user, "_verified_org_id", None) or payload.org_id or x_org_id
-    if not org_id:
+    # ── Auth: server API key → org. Never relaxed. ───────────────────────
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
-            status_code=400,
-            detail="org_id is required (X-Org-Id header or org_id in the body).",
+            status_code=401, detail="Missing or invalid Authorization header."
         )
-    org_id = _verified_org(user, str(org_id))
+    # validate_api_key raises 401 for malformed, unknown, revoked or disabled
+    # keys. Failing closed is its behaviour, not ours to re-implement.
+    ctx = validate_api_key(authorization.split(" ", 1)[1].strip())
+    org_id = str(ctx.org_id)
+
+    # ── Any asserted org_id must AGREE with the key, or the call is refused ──
+    for source, claimed in (
+        ("body", payload.org_id),
+        ("X-Org-Id header", x_org_id),
+        ("org_id query parameter", request.query_params.get("org_id")),
+    ):
+        if claimed and str(claimed).strip() and str(claimed).strip() != org_id:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"org_id in the {source} does not match the organization this "
+                    "API key belongs to. Omit org_id: it is derived from the key."
+                ),
+            )
+
+    # ── A caller-supplied workload_id is verified, not trusted ──────────────
+    if payload.workload_id:
+        owned = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: workloads_mod.get_workload(org_id, str(payload.workload_id))
+        )
+        if owned is None:
+            raise HTTPException(status_code=404, detail=_NOT_FOUND_DETAIL)
+
     try:
         row, created = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _record_outcome(str(org_id), payload)
+            None, lambda: _record_outcome(org_id, payload)
         )
+    except outcomes_mod.AttemptNotFoundError as exc:
+        # Indistinguishable from "no such id anywhere". Do not echo the ref.
+        raise HTTPException(status_code=404, detail=_NOT_FOUND_DETAIL) from exc
     except outcomes_mod.OutcomeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {

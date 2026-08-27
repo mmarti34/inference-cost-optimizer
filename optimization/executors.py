@@ -85,6 +85,62 @@ def blended_vendor_price(
     return (float(inp) * r + float(out)) / (r + 1.0)
 
 
+#: Cost basis of an arm. `measured` means every model in it resolved to a real
+#: vendor price; `estimated` means at least one fell back to the default guess.
+COST_BASIS_MEASURED = "measured"
+COST_BASIS_ESTIMATED = "estimated"
+
+
+def pricing_provenance(executor_refs) -> dict:
+    """
+    Does a REAL vendor price exist for every model an arm would run?
+
+    `utils.pricing.get_pricing` returns a loud fallback for an unknown model id
+    (`estimated=True`, DEFAULT_PRICING). Any dollar figure computed from that is
+    a guess wearing a dollar sign — and comparing a guessed price against a
+    known one manufactures a saving that was never observed. A caller MUST NOT
+    write such a figure into a measured-cost field.
+
+    Only `executor_type='model'` refs are priced; a software or human step has
+    no token cost and cannot be mispriced by the token price sheet.
+
+    Returns {"basis": 'measured'|'estimated', "priced_models": [...],
+             "estimated_models": [...], "source": ...}. An arm with no model
+    step has nothing to misprice and comes back 'measured' with empty lists.
+    """
+    priced: list[dict] = []
+    estimated: list[dict] = []
+
+    for ref in (executor_refs or []):
+        if not isinstance(ref, dict):
+            continue
+        if (ref.get("executor_type") or "model") != "model":
+            continue
+        model = ref.get("external_id")
+        if not model:
+            continue
+        vendor = ref.get("vendor") or ""
+        try:
+            pricing = get_pricing(vendor, model)
+        except Exception:  # pragma: no cover - providers.json unreadable
+            estimated.append({"vendor": vendor, "model": model, "price_source": "unavailable"})
+            continue
+        entry = {
+            "vendor": vendor,
+            "model": model,
+            "price_source": pricing.get("source"),
+            "resolved_model": pricing.get("resolved_model"),
+        }
+        (estimated if pricing.get("estimated") else priced).append(entry)
+
+    return {
+        "basis": COST_BASIS_ESTIMATED if estimated else COST_BASIS_MEASURED,
+        "priced_models": priced,
+        "estimated_models": estimated,
+        "source": "shared/providers.json",
+    }
+
+
 def vendor_catalog() -> list[dict]:
     """
     Every model in shared/providers.json, flattened, as vendor claims.

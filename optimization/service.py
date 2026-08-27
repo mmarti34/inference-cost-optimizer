@@ -181,6 +181,35 @@ def get_recommendation(org_id: str, rec_id: str) -> Optional[dict]:
         return None
 
 
+def find_ancestor_by_strategy_fingerprint(
+    org_id: str, workload_id: str, fingerprint: Optional[str]
+) -> Optional[dict]:
+    """
+    The recommendation, if any, whose CANDIDATE configuration is the one now
+    serving as this workload's baseline.
+
+    A chained optimization is measured against its parent's result, so the
+    parent's savings are already embedded in the baseline the child improved on.
+    Summing both claims the same dollars twice. Recording the ancestor here lets
+    `domain.attributable_savings` drop it from the total — which is why the
+    identification has to happen at creation time, while the baseline strategy
+    that was actually measured is still in hand.
+
+    Returns None when no live recommendation produced this baseline, which is
+    the ordinary case for a first optimization.
+    """
+    if not fingerprint:
+        return None
+    for status in domain.LIVE_STATUSES:
+        for row in list_recommendations(
+            org_id, status=status, workload_id=workload_id, limit=200
+        ):
+            cand = row.get("candidate_strategy")
+            if isinstance(cand, dict) and cand.get("fingerprint") == fingerprint:
+                return row
+    return None
+
+
 def create_recommendation(
     org_id: str,
     *,

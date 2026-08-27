@@ -50,6 +50,7 @@ from supabase_client import supabase
 from optimization import (
     allocation,
     domain,
+    executors as executors_mod,
     outcomes as outcomes_mod,
     policies,
     strategy as strategy_mod,
@@ -223,6 +224,7 @@ def _execute_arm(
     endpoint_slug: Optional[str],
     checks: list[dict],
     label: str,
+    strategy: Optional[strategy_mod.Strategy] = None,
 ) -> dict:
     """
     Execute one arm over the shared case set and MEASURE it.
@@ -230,8 +232,23 @@ def _execute_arm(
     Every metric returned is measured or None. A case that raises is recorded as
     an error case and counted in the error rate — never dropped, because
     dropping failures would make an unreliable candidate look clean.
+
+    COST PROVENANCE. `execute_workflow` prices every call through
+    `utils.pricing.get_pricing`, which returns a loud fallback guess for a model
+    id it cannot resolve. A dollar figure derived from that guess is NOT a
+    measurement, and comparing it against a real price manufactures a saving
+    that was never observed. So the arm's pricing provenance is resolved from
+    its strategy BEFORE execution, and when any model in it is unpriced the
+    figures land in `mean_cost_estimated_usd` / `total_cost_estimated_usd` and
+    the measured fields stay NULL. Downstream this makes the arm unrankable on
+    a cost objective, which is the honest outcome: we cannot say it is cheaper.
     """
     from workflow_runtime import execute_workflow  # imported lazily: see module docstring
+
+    pricing = executors_mod.pricing_provenance(
+        [s.executor_ref for s in strategy.steps] if strategy else []
+    )
+    cost_is_measured = pricing["basis"] == executors_mod.COST_BASIS_MEASURED
 
     costs: list[float] = []
     latencies: list[float] = []
@@ -279,7 +296,10 @@ def _execute_arm(
             per_case.append({
                 "case_id": case_id,
                 "arm": label,
-                "cost_usd": cost,
+                # An estimated price never lands in a measured field, on any row.
+                "cost_usd": (cost if cost_is_measured else None),
+                "cost_estimated_usd": (None if cost_is_measured else cost),
+                "cost_basis": pricing["basis"],
                 "latency_ms": latency,
                 "error": False,
                 "quality_checks_ran": q["ran"],
@@ -292,6 +312,8 @@ def _execute_arm(
                 "case_id": case_id,
                 "arm": label,
                 "cost_usd": None,
+                "cost_estimated_usd": None,
+                "cost_basis": pricing["basis"],
                 "latency_ms": None,
                 "error": True,
                 "error_detail": str(exc)[:300],
@@ -300,11 +322,19 @@ def _execute_arm(
     n = len(cases)
     quality = (quality_passed / quality_ran) if quality_ran > 0 else None
 
+    mean_cost = domain.mean(costs)
+    total_cost = (round(sum(costs), 8) if costs else None)
+
     return {
         "label": label,
         "n": n,
-        "mean_cost_usd": domain.mean(costs),
-        "total_cost_usd": (round(sum(costs), 8) if costs else None),
+        # Measured columns stay NULL when the price sheet had to guess.
+        "mean_cost_usd": (mean_cost if cost_is_measured else None),
+        "total_cost_usd": (total_cost if cost_is_measured else None),
+        "mean_cost_estimated_usd": (None if cost_is_measured else mean_cost),
+        "total_cost_estimated_usd": (None if cost_is_measured else total_cost),
+        "cost_basis": pricing["basis"],
+        "pricing_provenance": pricing,
         "latency_p50_ms": (int(domain.percentile(latencies, 50)) if latencies else None),
         "latency_p95_ms": (int(domain.percentile(latencies, 95)) if latencies else None),
         "error_rate": (round(errors / n, 4) if n else None),
@@ -333,6 +363,7 @@ def run_benchmark(
     method: str = "golden_replay",
     min_sample_size: Optional[int] = None,
     actor: Optional[str] = None,
+    create_recommendation: bool = False,
 ) -> dict:
     """
     Run a replay benchmark for a workload and record explicit evidence.
@@ -341,6 +372,14 @@ def run_benchmark(
     against a workload with no recommendation in existence; when one IS given,
     the benchmark is CITED by it via `recommendation_evidence` and the
     conclusion maps to a lifecycle transition via domain.CONCLUSION_TO_STATUS.
+
+    `create_recommendation` closes the loop: when the evidence — and ONLY when
+    the evidence — concludes `safe_improvement_found`, a recommendation is
+    created that CITES this benchmark. It is opt-in rather than automatic
+    because a benchmark discovering a fact and a product proposing an action are
+    two different events, and the caller decides whether it wants the second.
+    Every other conclusion creates nothing: there is no path by which
+    `insufficient_evidence` or a policy failure produces a proposal.
 
     Returns the benchmark row plus its conclusion payload. Never raises for an
     evidence shortfall — that is a conclusion, not an error.
@@ -389,6 +428,7 @@ def run_benchmark(
             explicit_candidates=candidates,
             recommendation_id=recommendation_id,
             actor=actor,
+            create_recommendation=create_recommendation,
             candidates_mod=candidates_mod,
             service_mod=service_mod,
         )
@@ -431,6 +471,7 @@ def _run(
     actor: Optional[str],
     candidates_mod,
     service_mod,
+    create_recommendation: bool = False,
 ) -> dict:
     workload_id = str(workload["id"])
     workflow_id = workloads_mod.resolve_workflow_id(org_id, workload)
@@ -559,6 +600,7 @@ def _run(
     baseline_metrics = _execute_arm(
         baseline_graph, cases, org_id=org_id, workflow_id=workflow_id,
         endpoint_slug=endpoint_slug, checks=checks, label="baseline",
+        strategy=baseline_strategy,
     )
     _write_candidate_result(
         org_id, benchmark_id, workload_id, arm="baseline", label="Current configuration",
@@ -582,6 +624,7 @@ def _run(
         metrics = _execute_arm(
             cand_graph, cases, org_id=org_id, workflow_id=workflow_id,
             endpoint_slug=endpoint_slug, checks=checks, label=cand.title,
+            strategy=cand.strategy,
         )
         row = _write_candidate_result(
             org_id, benchmark_id, workload_id, arm="candidate", label=cand.title,
@@ -626,6 +669,7 @@ def _run(
         # Carry the baseline it was measured against, so verified savings are
         # computed from the same run and never from an unrelated baseline.
         verdict["winner"]["baseline_mean_cost_usd"] = baseline_metrics.get("mean_cost_usd")
+        verdict["winner"]["baseline_metrics"] = _public_metrics(baseline_metrics)
 
     return _conclude(
         org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
@@ -638,6 +682,8 @@ def _run(
         selected_result_id=verdict.get("selected_result_id"),
         winner=verdict.get("winner"),
         recommendation_id=recommendation_id, actor=actor, service_mod=service_mod,
+        create_recommendation=create_recommendation,
+        baseline_strategy=baseline_strategy,
     )
 
 
@@ -694,6 +740,47 @@ def evaluate_conclusion(
                 "signal has been recorded for this workload."
             ),
         ))
+
+    # ── Cost provenance. `utils.pricing` returns a loud fallback guess for a
+    # model id it cannot resolve, and a dollar figure built on that guess is not
+    # a measurement. Such an arm arrives here with mean_cost_usd already NULL,
+    # so it cannot win a cost objective; this records WHY, with the models
+    # responsible, and states that the fix is a price-sheet entry rather than
+    # more replay cases.
+    def _estimated_models(metrics: dict) -> list[str]:
+        prov = metrics.get("pricing_provenance") or {}
+        return [
+            f"{e.get('vendor')}/{e.get('model')}"
+            for e in (prov.get("estimated_models") or [])
+        ]
+
+    if baseline.get("cost_basis") == executors_mod.COST_BASIS_ESTIMATED:
+        reasons.append(domain.reason(
+            "cost_pricing_estimated",
+            arm="baseline",
+            models=_estimated_models(baseline) or None,
+            observed_basis=executors_mod.COST_BASIS_ESTIMATED,
+            required_basis=executors_mod.COST_BASIS_MEASURED,
+        ))
+        more_data_reasons.append(domain.reason(
+            "cost_pricing_estimated",
+            arm="baseline",
+            detail=(
+                "Adding a real vendor price for this model to the price sheet "
+                "would make the cost comparison measurable. More replay cases "
+                "would not."
+            ),
+        ))
+    for _m in measured:
+        if _m["metrics"].get("cost_basis") == executors_mod.COST_BASIS_ESTIMATED:
+            reasons.append(domain.reason(
+                "cost_pricing_estimated",
+                arm="candidate",
+                candidate=_m["candidate"].title,
+                models=_estimated_models(_m["metrics"]) or None,
+                observed_basis=executors_mod.COST_BASIS_ESTIMATED,
+                required_basis=executors_mod.COST_BASIS_MEASURED,
+            ))
 
     # ── Which candidates are ELIGIBLE (policy) and which are BETTER (objective)
     eligible: list[dict] = []
@@ -798,6 +885,10 @@ def evaluate_conclusion(
         }
 
     improvement = _improvement(winner["metrics"], baseline, objective, traffic)
+    # Carried so a recommendation built from this verdict extrapolates from the
+    # MEASURED per-call delta and the MEASURED traffic volume, rather than from
+    # the generator's pre-benchmark price-sheet guess.
+    winner["improvement"] = improvement
     material, materiality_detail = domain.evaluate_materiality(improvement, materiality)
 
     confidence = domain.compute_confidence(
@@ -825,6 +916,35 @@ def evaluate_conclusion(
             "materiality_applied": {**materiality, "evaluation": materiality_detail},
             "winner": winner,
             "selected_result_id": winner.get("result_id"),
+        }
+
+    thresholds_evaluated = materiality_detail.get("thresholds") or []
+    unmeasurable_all = bool(thresholds_evaluated) and all(
+        t.get("unmeasurable") for t in thresholds_evaluated
+    )
+    if unmeasurable_all or materiality_detail.get("reason") == "no_thresholds_declared":
+        # Not one materiality threshold could be evaluated. "Not worth changing"
+        # is a KNOWLEDGE claim and this is not knowledge — it is the absence of
+        # a comparison. Reporting it as no_material_improvement would render
+        # ignorance as "your current setup is fine", which is the single thing
+        # this engine exists to refuse.
+        return {
+            "conclusion": domain.CONCLUSION_INSUFFICIENT_EVIDENCE,
+            "reasons": reasons + [domain.reason(
+                "cost_not_measured" if objective in ("cost", "balanced") else "coverage_gap",
+                objective=objective,
+                detail=(
+                    "No materiality threshold could be evaluated because the "
+                    "underlying measurement was missing on at least one arm."
+                ),
+                thresholds=[t.get("metric") for t in thresholds_evaluated] or None,
+            )],
+            "confidence": confidence,
+            "more_data_changes_conclusion": domain.MORE_DATA_YES,
+            "more_data_reasons": more_data_reasons,
+            "materiality_applied": {**materiality, "evaluation": materiality_detail},
+            "winner": None,
+            "selected_result_id": None,
         }
 
     # Eligible, measured, but not worth changing. A KNOWLEDGE state.
@@ -1074,6 +1194,15 @@ def _metrics_from_result_row(row: dict) -> dict:
         "quality_provenance": row.get("quality_provenance") or "unknown",
         "quality_checks_run": (row.get("outcome_metrics") or {}).get("quality_checks_run", 0),
         "cost_variation": (row.get("outcome_metrics") or {}).get("cost_variation"),
+        # Provenance is part of the evidence, not part of the verdict, so a
+        # re-read reproduces exactly what the original run could conclude.
+        "cost_basis": (
+            (row.get("outcome_metrics") or {}).get("cost_basis")
+            or executors_mod.COST_BASIS_MEASURED
+        ),
+        "mean_cost_estimated_usd": (row.get("outcome_metrics") or {}).get("mean_cost_estimated_usd"),
+        "total_cost_estimated_usd": (row.get("outcome_metrics") or {}).get("total_cost_estimated_usd"),
+        "pricing_provenance": (row.get("outcome_metrics") or {}).get("pricing_provenance"),
         "per_case": row.get("per_case_results") or [],
     }
 
@@ -1155,6 +1284,13 @@ def _write_candidate_result(
                 "quality_checks_run": metrics.get("quality_checks_run"),
                 "cost_variation": metrics.get("cost_variation"),
                 "cases_measured": metrics.get("cases_measured"),
+                # Cost provenance travels WITH the arm, so a later reevaluate
+                # re-derives the same verdict from the row alone and can never
+                # promote a guessed price into a measured one.
+                "cost_basis": metrics.get("cost_basis"),
+                "mean_cost_estimated_usd": metrics.get("mean_cost_estimated_usd"),
+                "total_cost_estimated_usd": metrics.get("total_cost_estimated_usd"),
+                "pricing_provenance": metrics.get("pricing_provenance"),
             },
             "per_case_results": metrics.get("per_case"),
         })
@@ -1230,6 +1366,8 @@ def _conclude(
     reasons, confidence, sample_size, success_signal, more_data, more_data_reasons,
     status, error, recommendation_id, actor, service_mod,
     selected_result_id: Optional[str] = None, winner: Optional[dict] = None,
+    create_recommendation: bool = False,
+    baseline_strategy: Optional[strategy_mod.Strategy] = None,
 ) -> dict:
     """Write the conclusion, mirror it onto the benchmark, and — only when the
     benchmark is cited by a recommendation — apply the lifecycle transition."""
@@ -1301,6 +1439,31 @@ def _conclude(
                     benchmark_id, recommendation_id, exc,
                 )
 
+    # A recommendation is created from evidence, and from exactly one kind of
+    # evidence. Any other conclusion — including every ignorance state — ends
+    # here with the facts persisted and nothing proposed.
+    created_recommendation_id: Optional[str] = None
+    if (
+        create_recommendation
+        and recommendation_id is None
+        and conclusion == domain.CONCLUSION_SAFE_IMPROVEMENT
+        and winner is not None
+    ):
+        created_recommendation_id = _create_recommendation_from_evidence(
+            org_id,
+            benchmark_id=benchmark_id,
+            workload=workload,
+            objective=objective,
+            winner=winner,
+            baseline_strategy=baseline_strategy,
+            confidence=confidence,
+            sample_size=sample_size,
+            success_signal=success_signal,
+            conclusion=conclusion,
+            actor=actor,
+            service_mod=service_mod,
+        )
+
     return {
         "benchmark_id": benchmark_id,
         "workload_id": workload_id,
@@ -1312,8 +1475,139 @@ def _conclude(
         "more_data_changes_conclusion": more_data,
         "more_data_reasons": more_data_reasons,
         "conclusion_id": str(conclusion_row.get("id")) if conclusion_row.get("id") else None,
+        "recommendation_id": recommendation_id or created_recommendation_id,
+        "recommendation_created": created_recommendation_id is not None,
         **domain.conclusion_payload(conclusion, reasons=reasons, confidence=confidence),
     }
+
+
+def _create_recommendation_from_evidence(
+    org_id: str,
+    *,
+    benchmark_id: str,
+    workload: dict,
+    objective: str,
+    winner: dict,
+    baseline_strategy: Optional[strategy_mod.Strategy],
+    confidence: Optional[float],
+    sample_size: Optional[int],
+    success_signal,
+    conclusion: str,
+    actor: Optional[str],
+    service_mod,
+) -> Optional[str]:
+    """
+    Turn a `safe_improvement_found` verdict into a recommendation that CITES it.
+
+    Four things this function is careful about:
+
+    1. It refuses unless it holds an executable candidate strategy AND the
+       baseline strategy that was actually measured. The `reevaluate` path
+       carries a stored-result adapter with no strategy object; reconstructing
+       one from a fingerprint would be inventing the thing being recommended.
+    2. `projected_savings_usd` is an EXTRAPOLATION — measured per-call delta x
+       measured traffic — and goes only to the projected column. It is None,
+       never 0.0, when traffic volume was not measured.
+    3. `verified_savings_usd` is the delta measured over THIS benchmark's sample
+       and is written by the lifecycle transition below via
+       `_recommendation_fields`, which routes it through
+       `domain.savings_column('verified')`. The two never cross.
+    4. `baseline_reference` records which recommendation, if any, produced the
+       baseline this improvement was measured against, so a chain is not counted
+       twice by `domain.attributable_savings`.
+
+    `approval_required` comes from the workload's policy and defaults TRUE:
+    nothing here changes production.
+    """
+    cand = winner.get("candidate")
+    cand_strategy = getattr(cand, "strategy", None)
+    if cand_strategy is None or baseline_strategy is None:
+        logger.info(
+            "Benchmark %s concluded %s but carries no executable candidate "
+            "strategy; no recommendation created.",
+            benchmark_id, conclusion,
+        )
+        return None
+
+    workload_id = str(workload["id"])
+    improvement = winner.get("improvement") or {}
+    cost_improvement = improvement.get("cost") or {}
+
+    # Extrapolated from measurements only. None when volume was not measured.
+    projected = cost_improvement.get("absolute")
+    projection_basis = {
+        "kind": "projection",
+        "formula": "measured_per_task_delta_usd * observed_calls_per_day * 30",
+        "measured_per_task_delta_usd": cost_improvement.get("per_task_absolute"),
+        "unit": cost_improvement.get("unit"),
+        "source": f"benchmark:{benchmark_id}",
+        "result": "projected" if projected is not None else "not_projectable",
+    }
+    if projected is None:
+        projection_basis["reason"] = (
+            "No measured production volume for this workload in the window, so a "
+            "monthly figure would be invented."
+        )
+
+    ancestor = service_mod.find_ancestor_by_strategy_fingerprint(
+        org_id, workload_id, baseline_strategy.fingerprint()
+    )
+    baseline_reference = {
+        "kind": "benchmark_baseline",
+        "benchmark_id": benchmark_id,
+        "strategy_fingerprint": baseline_strategy.fingerprint(),
+        "mean_cost_usd": winner.get("baseline_mean_cost_usd"),
+        "measured_over_cases": sample_size,
+        "derived_from_recommendation_id": (str(ancestor["id"]) if ancestor else None),
+        "projection": projection_basis,
+    }
+
+    rec = service_mod.create_recommendation(
+        org_id,
+        workload_id=workload_id,
+        title=getattr(cand, "title", None) or "Candidate configuration",
+        candidate_strategy=cand_strategy,
+        baseline_strategy=baseline_strategy,
+        dimensions=list(getattr(cand, "dimensions", None) or []),
+        generator=getattr(cand, "generator", None),
+        rationale=getattr(cand, "rationale", None),
+        objective=objective,
+        project_id=(str(workload["project_id"]) if workload.get("project_id") else None),
+        evidence_benchmark_ids=[benchmark_id],
+        projected_savings_usd=projected,
+        baseline_reference=baseline_reference,
+        parent_recommendation_id=(str(ancestor["id"]) if ancestor else None),
+        actor=actor,
+    )
+    if not rec:
+        return None
+
+    rec_id = str(rec["id"])
+    fields = _recommendation_fields(
+        conclusion=conclusion, confidence=confidence, sample_size=sample_size,
+        winner=winner, success_signal=success_signal,
+    )
+
+    # discovered -> benchmarking -> verified. The intermediate hop is not
+    # ceremony: the lifecycle has no edge from `discovered` straight to
+    # `verified`, precisely so nothing can reach a verified state without a
+    # measurement having been taken.
+    try:
+        service_mod.transition(
+            org_id, rec_id, domain.STATUS_BENCHMARKING,
+            actor=actor, reason=f"benchmark:{benchmark_id}",
+        )
+        service_mod.transition(
+            org_id, rec_id, domain.CONCLUSION_TO_STATUS[conclusion],
+            actor=actor, reason=f"benchmark:{conclusion}", extra_fields=fields,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Created recommendation %s from benchmark %s but could not advance "
+            "it: %s", rec_id, benchmark_id, exc,
+        )
+
+    return rec_id
 
 
 def _recommendation_fields(*, conclusion, confidence, sample_size, winner, success_signal) -> dict:
@@ -1343,6 +1637,18 @@ def _recommendation_fields(*, conclusion, confidence, sample_size, winner, succe
         "candidate_error_rate": m.get("error_rate"),
         "quality_provenance": m.get("quality_provenance") or "unknown",
     })
+
+    # The baseline half of every comparison the API exposes. NULL means NOT
+    # MEASURED — including the case where the baseline's price had to be
+    # guessed, which leaves mean_cost_usd NULL upstream in _execute_arm.
+    b_metrics = winner.get("baseline_metrics") or {}
+    if b_metrics:
+        fields.update({
+            "baseline_cost": b_metrics.get("mean_cost_usd"),
+            "baseline_quality": b_metrics.get("quality"),
+            "baseline_latency_p95_ms": b_metrics.get("latency_p95_ms"),
+            "baseline_error_rate": b_metrics.get("error_rate"),
+        })
     if conclusion == domain.CONCLUSION_SAFE_IMPROVEMENT:
         b = winner.get("baseline_mean_cost_usd")
         c = m.get("mean_cost_usd")

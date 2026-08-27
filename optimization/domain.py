@@ -832,12 +832,6 @@ MORE_DATA_UNKNOWN = "unknown"
 MORE_DATA_VALUES = (MORE_DATA_YES, MORE_DATA_NO, MORE_DATA_UNKNOWN)
 
 
-MORE_DATA_YES = "yes"
-MORE_DATA_NO = "no"
-MORE_DATA_UNKNOWN = "unknown"
-MORE_DATA_VALUES = (MORE_DATA_YES, MORE_DATA_NO, MORE_DATA_UNKNOWN)
-
-
 # ---------------------------------------------------------------------------
 # Reason codes — the API contract is CODES AND FACTS, never wording
 # ---------------------------------------------------------------------------
@@ -858,6 +852,15 @@ REASON_CODES: dict[str, str] = {
     "outcome_signal_too_weak": "The only available quality signal is too weak to satisfy a hard constraint.",
     "quality_not_measured": "No quality signal was produced by this run.",
     "coverage_gap": "Part of the workload's traffic is not represented in the evidence.",
+    "cost_not_measured": "An arm's cost could not be measured, so no cost comparison is possible.",
+    "cost_pricing_estimated": (
+        "An arm's cost was computed from an estimated fallback price rather than a "
+        "known vendor price, so it is a guess and is not reported as measured."
+    ),
+    # Workload selection
+    "workload_volume_below_threshold": "Observed production volume or spend is below the floor worth benchmarking.",
+    "no_replay_cases": "The workload has no golden inputs to replay, so no controlled comparison can be run.",
+    "workload_not_registered": "Observed traffic has no registered workload; discovery has not been run for it.",
     # Constraint violations
     "quality_below_threshold": "Measured quality is below the policy minimum.",
     "latency_above_threshold": "Measured latency exceeds the policy maximum.",

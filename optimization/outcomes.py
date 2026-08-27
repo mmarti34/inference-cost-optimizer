@@ -51,6 +51,19 @@ class OutcomeError(ValueError):
     """Invalid outcome payload."""
 
 
+class AttemptNotFoundError(OutcomeError):
+    """
+    The referenced attempt does not exist *for this org*.
+
+    Deliberately a SUBCLASS of OutcomeError: every existing caller (the
+    dashboard endpoint) keeps mapping it to the same 400 it always did, while
+    the customer-facing endpoint can map it to a 404 that reads identically
+    whether the id belongs to another tenant or to nobody at all. A caller
+    holding one org's key must not be able to use this endpoint to discover
+    which request ids exist in another org.
+    """
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -141,7 +154,7 @@ def record_outcome(
         # attempt_source still resolves rather than silently failing.
         attempt = attempts_mod.get_attempt(org_id, str(attempt_ref), attempt_source=attempt_source)
         if attempt is None:
-            raise OutcomeError(
+            raise AttemptNotFoundError(
                 "attempt_ref does not identify an attempt belonging to this organization."
             )
         resolved_workload = resolved_workload or attempt.workload_id

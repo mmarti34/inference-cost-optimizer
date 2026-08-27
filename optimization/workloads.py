@@ -267,20 +267,20 @@ def _insert_workload(row: dict) -> Optional[dict]:
 # Structural discovery
 # ---------------------------------------------------------------------------
 
-def discover_workloads(org_id: str, *, lookback_days: int = 30) -> dict:
+def _scan_runtime_traffic(
+    org_id: str, lookback_days: int
+) -> tuple[dict[str, dict], dict[str, Any]]:
     """
-    Discover runtime workloads from observed production traffic.
+    Measured production traffic per endpoint over the window.
 
-    Groups `workflow_runs` with execution_mode='production' by endpoint_slug,
-    INDEPENDENT of served_version: v5 and v6 of an endpoint are the same work,
-    and treating them as different workloads would fragment every measurement.
+    ONE implementation, shared by `discover_workloads` (which upserts) and
+    `select_optimization_targets` (which only reads and ranks). Two scans that
+    grouped traffic slightly differently would let discovery and selection
+    disagree about how big a workload is.
 
-    Upserts one workload per endpoint. Existing workloads are never downgraded:
-    a workload the customer has explicitly named keeps its explicit identity.
-
-    Returns measured counts plus a `coverage` block. Runs with no endpoint_slug
-    (draft/eval executions) are counted and excluded rather than silently
-    dropped.
+    Returns (groups_by_endpoint_slug, coverage). `coverage` always states the
+    window, whether the row cap truncated the scan, and how many runs carried no
+    endpoint_slug — those are counted and excluded, never silently dropped.
     """
     since = _utc_now() - timedelta(days=max(1, lookback_days))
     coverage: dict[str, Any] = {
@@ -304,19 +304,15 @@ def discover_workloads(org_id: str, *, lookback_days: int = 30) -> dict:
         )
         rows = getattr(resp, "data", None) or []
     except Exception as exc:
-        logger.warning("discover_workloads scan failed: %s", type(exc).__name__)
-        return {
-            "discovered": [],
-            "created": 0,
-            "existing": 0,
-            "coverage": {**coverage, "error": "query_failed"},
-        }
+        logger.warning("runtime traffic scan failed: %s", type(exc).__name__)
+        return {}, {**coverage, "error": "query_failed"}
 
     if len(rows) >= _MAX_SCAN_ROWS:
         coverage["truncated"] = True
 
     groups: dict[str, dict] = {}
     without_endpoint = 0
+    runs_without_cost = 0
     for r in rows:
         slug = (r.get("endpoint_slug") or "").strip()
         if not slug:
@@ -327,12 +323,49 @@ def discover_workloads(org_id: str, *, lookback_days: int = 30) -> dict:
             "workflow_ids": set(),
             "run_count": 0,
             "observed_cost_usd": 0.0,
+            "runs_without_cost": 0,
         })
         g["run_count"] += 1
         if r.get("workflow_id"):
             g["workflow_ids"].add(str(r["workflow_id"]))
         if r.get("total_cost") is not None:
             g["observed_cost_usd"] += float(r["total_cost"])
+        else:
+            # total_cost is NULL when pricing could not be resolved. Counted so
+            # observed spend is never presented as complete when it is not.
+            g["runs_without_cost"] += 1
+            runs_without_cost += 1
+
+    coverage["runs_scanned"] = len(rows)
+    coverage["runs_without_endpoint_slug"] = without_endpoint
+    coverage["runs_without_measured_cost"] = runs_without_cost
+    return groups, coverage
+
+
+def discover_workloads(org_id: str, *, lookback_days: int = 30) -> dict:
+    """
+    Discover runtime workloads from observed production traffic.
+
+    Groups `workflow_runs` with execution_mode='production' by endpoint_slug,
+    INDEPENDENT of served_version: v5 and v6 of an endpoint are the same work,
+    and treating them as different workloads would fragment every measurement.
+
+    Upserts one workload per endpoint. Existing workloads are never downgraded:
+    a workload the customer has explicitly named keeps its explicit identity.
+
+    Returns measured counts plus a `coverage` block. Runs with no endpoint_slug
+    (draft/eval executions) are counted and excluded rather than silently
+    dropped.
+    """
+    groups, coverage = _scan_runtime_traffic(org_id, lookback_days)
+    if coverage.get("error"):
+        return {
+            "discovered": [],
+            "created": 0,
+            "existing": 0,
+            "coverage": coverage,
+        }
+    without_endpoint = coverage.get("runs_without_endpoint_slug", 0)
 
     project_by_workflow = _project_ids_for_workflows(
         org_id, {wid for g in groups.values() for wid in g["workflow_ids"]}
@@ -390,8 +423,6 @@ def discover_workloads(org_id: str, *, lookback_days: int = 30) -> dict:
             "observed_cost_usd": round(g["observed_cost_usd"], 8),
         })
 
-    coverage["runs_scanned"] = len(rows)
-    coverage["runs_without_endpoint_slug"] = without_endpoint
     coverage["note"] = (
         "Structural discovery only: production runs grouped by endpoint_slug, "
         "version-independent. Runs with no endpoint_slug (draft/eval) are excluded. "
@@ -424,6 +455,190 @@ def _project_ids_for_workflows(org_id: str, workflow_ids: set[str]) -> dict[str,
         }
     except Exception:  # pragma: no cover
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Selection — which observed workload is worth spending a benchmark on
+# ---------------------------------------------------------------------------
+#
+# Discovery answers "what work is happening here". Selection answers "which of
+# it is worth measuring". They are separate because discovery must register
+# everything it sees, while selection must be allowed to say no — and to say
+# WHY, in codes, so that "we did not look at this workload" is never mistaken
+# for "we looked and found nothing".
+
+#: Below this many measured production runs in the window, a workload's own
+#: averages are dominated by individual-case noise, and a benchmark's verdict
+#: would be extrapolated from traffic that may not recur. A floor on being
+#: worth measuring, not a claim about statistical power — `confidence` reports
+#: that separately.
+MIN_RUNS_TO_OPTIMIZE = 20
+
+#: Below this measured spend over the window, no achievable percentage saving
+#: is worth a customer's attention. Deliberately low: it excludes only
+#: workloads whose entire measured spend rounds to nothing. The real gate is
+#: MIN_RUNS_TO_OPTIMIZE.
+MIN_OBSERVED_SPEND_USD = 0.10
+
+
+def _golden_input_count(org_id: str, workflow_ids: list[str]) -> Optional[int]:
+    """
+    How many replay cases exist for these workflows.
+
+    Returns None — not 0 — when the count could not be read, so "no cases" and
+    "could not tell" stay distinguishable.
+    """
+    if not workflow_ids:
+        return 0
+    try:
+        resp = (
+            supabase.table("golden_inputs")
+            .select("id")
+            .eq("org_id", org_id)
+            .in_("workflow_id", workflow_ids)
+            .limit(_MAX_SCAN_ROWS)
+            .execute()
+        )
+        return len(getattr(resp, "data", None) or [])
+    except Exception as exc:  # pragma: no cover
+        logger.warning("_golden_input_count failed: %s", type(exc).__name__)
+        return None
+
+
+def select_optimization_targets(
+    org_id: str,
+    *,
+    lookback_days: int = 30,
+    min_runs: Optional[int] = None,
+    min_spend_usd: Optional[float] = None,
+    limit: int = 10,
+    require_replay_cases: bool = True,
+) -> dict:
+    """
+    Rank observed runtime workloads by whether they are worth benchmarking.
+
+    Read-only: unlike `discover_workloads` this writes nothing. Ranking is on
+    MEASURED spend over the window, then measured volume — never on a guess
+    about which workload "looks expensive".
+
+    Every workload that is passed over appears in `skipped` with structured
+    reason codes and the facts behind them. A workload absent from `targets` is
+    therefore never silently absent, and its absence is explicitly not a finding
+    that it is already optimal.
+
+    Returns {targets, skipped, floors, coverage}.
+    """
+    floor_runs = int(MIN_RUNS_TO_OPTIMIZE if min_runs is None else min_runs)
+    floor_spend = float(MIN_OBSERVED_SPEND_USD if min_spend_usd is None else min_spend_usd)
+
+    groups, coverage = _scan_runtime_traffic(org_id, lookback_days)
+    floors = {
+        "min_runs": floor_runs,
+        "min_observed_spend_usd": floor_spend,
+        "window_days": lookback_days,
+        "requires_replay_cases": require_replay_cases,
+        "rationale": (
+            "Floors on being worth measuring, applied to MEASURED volume and "
+            "spend in the window. They are not statistical-power thresholds; "
+            "the benchmark's own sample floor and the confidence score cover that."
+        ),
+    }
+    if coverage.get("error"):
+        return {"targets": [], "skipped": [], "floors": floors, "coverage": coverage}
+
+    # Spend first, volume as the tiebreak: eight assessed workloads reads as
+    # excellent right up until the two unassessed ones are most of the bill.
+    ordered = sorted(
+        groups.values(),
+        key=lambda g: (-g["observed_cost_usd"], -g["run_count"]),
+    )
+
+    targets: list[dict] = []
+    skipped: list[dict] = []
+
+    for g in ordered:
+        slug = g["endpoint_slug"]
+        workflow_ids = sorted(g["workflow_ids"])
+        runs = g["run_count"]
+        spend = round(g["observed_cost_usd"], 8)
+
+        base = {
+            "endpoint_slug": slug,
+            "workflow_ids": workflow_ids,
+            "observed_run_count": runs,
+            "observed_cost_usd": spend,
+            "observed_window_days": lookback_days,
+            # Measured spend is incomplete when a run's cost could not be
+            # priced. Reported, so the figure is never read as the whole bill.
+            "runs_without_measured_cost": g.get("runs_without_cost", 0),
+        }
+
+        reasons: list[dict] = []
+
+        workload = _find_by_identity(org_id, "runtime", "endpoint", slug)
+        if workload is None:
+            reasons.append(domain.reason(
+                "workload_not_registered",
+                endpoint_slug=slug,
+                detail="Run workload discovery to register this endpoint first.",
+            ))
+            skipped.append({**base, "workload_id": None, "reasons": reasons})
+            continue
+
+        base["workload_id"] = str(workload["id"])
+        base["workload_name"] = workload.get("name")
+        base["default_objective"] = workload.get("default_objective")
+        base["project_id"] = (
+            str(workload["project_id"]) if workload.get("project_id") else None
+        )
+
+        if runs < floor_runs:
+            reasons.append(domain.reason(
+                "workload_volume_below_threshold",
+                observed=runs, required=floor_runs, unit="runs",
+                window_days=lookback_days,
+            ))
+        if spend < floor_spend:
+            reasons.append(domain.reason(
+                "workload_volume_below_threshold",
+                observed=spend, required=floor_spend, unit="usd",
+                window_days=lookback_days,
+            ))
+
+        cases = _golden_input_count(org_id, workflow_ids)
+        base["replay_cases"] = cases
+        if require_replay_cases and cases == 0:
+            reasons.append(domain.reason(
+                "no_replay_cases",
+                observed=0, unit="cases", dataset="golden_inputs",
+                detail=(
+                    "Promoting production runs via the golden-input import path "
+                    "would make this workload replayable."
+                ),
+            ))
+
+        if reasons:
+            skipped.append({**base, "reasons": reasons})
+            continue
+
+        targets.append(base)
+
+    return {
+        "targets": targets[: max(1, limit)],
+        "skipped": skipped,
+        "floors": floors,
+        "coverage": {
+            **coverage,
+            "endpoints_observed": len(groups),
+            "targets_selected": len(targets[: max(1, limit)]),
+            "skipped_count": len(skipped),
+            "note": (
+                "Selection is READ-ONLY and ranks on measured spend then measured "
+                "volume. A workload in `skipped` was not assessed; that is an "
+                "absence of evidence and is never a finding that it is optimal."
+            ),
+        },
+    }
 
 
 def discover_learned_workloads(org_id: str, **_kwargs) -> dict:
