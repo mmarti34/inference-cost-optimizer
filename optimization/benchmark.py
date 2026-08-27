@@ -51,6 +51,7 @@ from optimization import (
     allocation,
     domain,
     executors as executors_mod,
+    noninferiority,
     outcomes as outcomes_mod,
     policies,
     strategy as strategy_mod,
@@ -89,7 +90,8 @@ CONCLUSION_COLS = (
     "id, org_id, benchmark_id, workload_id, policy_id, policy_key, policy_version, "
     "objective, conclusion, reasons, confidence, confidence_band, materiality_applied, "
     "success_signal, more_data_changes_conclusion, more_data_reasons, "
-    "selected_candidate_result_id, is_current, created_at"
+    "selected_candidate_result_id, quality_safety, quality_safety_policy, "
+    "frontier, consideration, is_current, created_at"
 )
 
 _GOLDEN_INPUT_COLS = (
@@ -304,6 +306,14 @@ def _execute_arm(
                 "error": False,
                 "quality_checks_ran": q["ran"],
                 "quality_checks_passed": q["passed"],
+                # The PAIRED datum. Baseline and candidates replay the same
+                # cases, so retaining a per-case verdict is what makes a paired
+                # non-inferiority test possible instead of pretending the arm
+                # means are independent samples. None when nothing measurable
+                # ran on the case — "no check ran" is not "the check failed".
+                "case_passed": (
+                    (q["passed"] >= q["ran"]) if q["ran"] > 0 else None
+                ),
             })
 
         except Exception as exc:
@@ -317,6 +327,7 @@ def _execute_arm(
                 "latency_ms": None,
                 "error": True,
                 "error_detail": str(exc)[:300],
+                "case_passed": None,
             })
 
     n = len(cases)
@@ -664,6 +675,8 @@ def _run(
         signal=signal,
         sample_size=n,
         traffic=_traffic_for(org_id, workload),
+        opportunities=gen_meta.get("opportunities") or [],
+        generation=gen_meta,
     )
     if verdict.get("winner"):
         # Carry the baseline it was measured against, so verified savings are
@@ -679,17 +692,32 @@ def _run(
         more_data=verdict["more_data_changes_conclusion"],
         more_data_reasons=verdict["more_data_reasons"],
         status="completed", error=None,
-        selected_result_id=verdict.get("selected_result_id"),
+        selected_result_id=(
+            verdict.get("selected_result_id")
+            or verdict.get("leading_candidate_result_id")
+        ),
         winner=verdict.get("winner"),
         recommendation_id=recommendation_id, actor=actor, service_mod=service_mod,
         create_recommendation=create_recommendation,
         baseline_strategy=baseline_strategy,
+        quality_safety=verdict.get("quality_safety"),
+        quality_safety_policy=verdict.get("quality_safety_policy"),
+        frontier=verdict.get("frontier"),
+        consideration=verdict.get("consideration"),
     )
 
 
 # ---------------------------------------------------------------------------
 # The pure verdict function: evidence + policy version + objective -> conclusion
 # ---------------------------------------------------------------------------
+
+#: Which reason code explains a constraint that could not be evaluated because
+#: the underlying metric was never measured. `coverage_gap` is the fallback.
+_UNMEASURED_REASON_CODE = {
+    "min_quality": "outcome_signal_too_weak",
+    "max_quality_regression": "baseline_quality_not_measured",
+}
+
 
 def evaluate_conclusion(
     *,
@@ -701,10 +729,63 @@ def evaluate_conclusion(
     signal: domain.SuccessSignal,
     sample_size: int,
     traffic: Optional[dict] = None,
+    opportunities: Optional[list[dict]] = None,
+    generation: Optional[dict] = None,
 ) -> dict:
     """
     PURE. Given stored evidence, a policy version and an objective, produce a
-    conclusion. No I/O, no mutation.
+    conclusion, the quality-safety evidence behind it, the cost/quality frontier
+    and the candidate consideration funnel. No I/O, no mutation.
+
+    `opportunities` are TIER 2 items: candidates for providers this org has no
+    credential for. They were never executed, so they carry no measurement, can
+    never win, and can never reach `verified`. They are carried through so the
+    frontier can name them with a connect-provider next action instead of
+    silently dropping them.
+    """
+    ctx: dict = {}
+    verdict = _decide(
+        baseline=baseline, measured=measured, policy=policy,
+        materiality=materiality, objective=objective, signal=signal,
+        sample_size=sample_size, traffic=traffic, ctx=ctx,
+    )
+    verdict.setdefault("quality_safety", ctx.get("quality_safety"))
+    verdict["quality_safety_policy"] = ctx.get("quality_safety_policy")
+    verdict["frontier"] = _build_frontier(
+        baseline=baseline,
+        measured=measured,
+        safe=ctx.get("safe") or [],
+        promising=ctx.get("promising") or [],
+        opportunities=opportunities or [],
+        winner=verdict.get("winner"),
+    )
+    verdict["consideration"] = domain.build_funnel(
+        _dispositions(
+            measured=measured,
+            safe=ctx.get("safe") or [],
+            promising=ctx.get("promising") or [],
+            opportunities=opportunities or [],
+            generation=generation or {},
+        )
+    )
+    return verdict
+
+
+def _decide(
+    *,
+    baseline: dict,
+    measured: list[dict],
+    policy: Optional[dict],
+    materiality: dict,
+    objective: str,
+    signal: domain.SuccessSignal,
+    sample_size: int,
+    ctx: dict,
+    traffic: Optional[dict] = None,
+) -> dict:
+    """
+    The verdict itself. `ctx` is an out-parameter carrying the intermediate
+    classifications the wrapper needs to build the frontier and the funnel.
 
     This is what makes a verdict reproducible and re-derivable: `reevaluate`
     calls it over RETAINED candidate results under a NEW policy version, without
@@ -782,7 +863,27 @@ def evaluate_conclusion(
                 required_basis=executors_mod.COST_BASIS_MEASURED,
             ))
 
-    # ── Which candidates are ELIGIBLE (policy) and which are BETTER (objective)
+    # ── SELECTION, IN THREE ORDERED STAGES.
+    #
+    #   1. Exclude candidates that VIOLATE a hard policy constraint. A violator
+    #      is not a lower-ranked option; it is not an option.
+    #   2. Exclude candidates whose quality safety is NOT ESTABLISHED against
+    #      the measured baseline. This is an evidence gate, not a policy
+    #      verdict: failing it means "we cannot yet vouch for this", which is a
+    #      different fact from "this is bad" and reaches a different conclusion.
+    #   3. Among what survives both, minimise the objective's own metric.
+    #
+    # The ordering is the fix. Ranking on cost first and checking quality after
+    # is how a candidate 10 percentage points below baseline came to be the
+    # recommendation: it was the cheapest thing that cleared an absolute floor.
+    quality_safety_cfg = policies.quality_safety_of(policy)
+    require_ni = bool(quality_safety_cfg["require_quality_non_inferiority"])
+    # The REGIME is recorded on every conclusion, even ones where no candidate
+    # got far enough to be assessed. It is what makes a stored verdict
+    # reproducible: "0.05, from the default, at 95%" is part of the verdict.
+    ctx["quality_safety_policy"] = quality_safety_cfg
+
+    # ── Stage 1: hard policy constraints
     eligible: list[dict] = []
     for m in measured:
         metrics = m["metrics"]
@@ -796,6 +897,14 @@ def evaluate_conclusion(
             },
             executor_refs=_executor_refs_of(m["candidate"]),
             quality_provenance=metrics.get("quality_provenance"),
+            # Without the baseline arm, `max_quality_regression` is not a
+            # weaker check — it is an uncheckable one.
+            baseline={
+                "quality": baseline.get("quality"),
+                "error_rate": baseline.get("error_rate"),
+                "latency_p95_ms": baseline.get("latency_p95_ms"),
+                "cost_per_task_usd": baseline.get("mean_cost_usd"),
+            },
         )
         m["policy_evaluation"] = evaluation
         if evaluation["eligible"]:
@@ -805,8 +914,7 @@ def evaluate_conclusion(
                 reasons.append(_violation_reason(v, m["candidate"].title))
             for u in evaluation["unmeasured"]:
                 reasons.append(domain.reason(
-                    "outcome_signal_too_weak" if u["constraint"] == "min_quality"
-                    else "coverage_gap",
+                    _UNMEASURED_REASON_CODE.get(u["constraint"], "coverage_gap"),
                     constraint=u["constraint"], required=u["required"],
                     detail=u["reason"], candidate=m["candidate"].title,
                 ))
@@ -867,8 +975,81 @@ def evaluate_conclusion(
             "selected_result_id": None,
         }
 
-    # ── Rank eligible candidates on the OBJECTIVE's own metric
-    winner = _best_by_objective(eligible, baseline, objective)
+    # ── Stage 2: QUALITY SAFETY, established against the measured baseline.
+    #
+    # `min_quality` and `max_quality_regression` (stage 1) are point-estimate
+    # checks. They are necessary and not sufficient: 27/30 and 30/30 are also
+    # compatible with a much larger true gap than the one observed. This stage
+    # asks the harder question — can we RULE OUT, at the policy's confidence
+    # level, that the candidate is worse than the baseline by more than the
+    # allowed regression? See optimization/noninferiority.py for the test and
+    # its assumptions.
+    #
+    # A candidate that fails here is NOT rejected. It is PROMISING and short of
+    # evidence, which is a different product state with a different next action.
+    safe: list[dict] = []
+    promising: list[dict] = []
+    for m in eligible:
+        assessment = noninferiority.assess(
+            baseline_per_case=baseline.get("per_case"),
+            candidate_per_case=m["metrics"].get("per_case"),
+            margin=quality_safety_cfg["max_quality_regression"],
+            confidence_level=quality_safety_cfg["quality_confidence_level"],
+            baseline_quality=baseline.get("quality"),
+            candidate_quality=m["metrics"].get("quality"),
+        )
+        assessment["required"] = require_ni
+        assessment["policy_source"] = quality_safety_cfg["max_quality_regression_source"]
+        m["quality_safety"] = assessment
+        if assessment["established"] or not require_ni:
+            safe.append(m)
+        else:
+            promising.append(m)
+    ctx["safe"] = safe
+    ctx["promising"] = promising
+
+    # ── Stage 3: rank on the objective's own metric.
+    #
+    # The pool is the SAFE candidates. Only when none are safe do we rank the
+    # promising ones instead — not to promote them, but because the remaining
+    # questions ("was any improvement even measurable?", "was it material?") are
+    # answered identically either way, and answering them wrongly would let a
+    # candidate whose cost was never measured come back as "promising" when the
+    # truth is that we measured nothing. The `safe` list is what decides whether
+    # a material improvement is reported as SAFE or as PROMISING, and that
+    # decision is made at the single branch below.
+    quality_safety_verified = bool(safe)
+    winner = _best_by_objective(safe or promising, baseline, objective)
+    if winner is not None:
+        qs = winner.get("quality_safety") or {}
+        ctx["quality_safety"] = qs
+        if qs.get("established"):
+            reasons.append(domain.reason(
+                "quality_non_inferiority_established",
+                candidate=winner["candidate"].title,
+                method=qs.get("method"),
+                observed_regression=qs.get("observed_regression"),
+                allowed_regression=qs.get("allowed_regression"),
+                sample_size=qs.get("n_pairs"),
+                discordant_b=qs.get("discordant_b"),
+                discordant_c=qs.get("discordant_c"),
+                confidence_level=qs.get("confidence_level"),
+                lower_confidence_bound=qs.get("lower_confidence_bound"),
+            ))
+        elif not require_ni:
+            # The customer switched the evidence gate off. Record that this
+            # verdict rests on a point estimate by their choice, so nothing
+            # downstream can read it as an established safety claim.
+            reasons.append(domain.reason(
+                "non_inferiority_not_established",
+                candidate=winner["candidate"].title,
+                detail_code="non_inferiority_check_disabled_by_policy",
+                detail=(
+                    "The policy does not require non-inferiority evidence, so "
+                    "this verdict rests on point estimates alone."
+                ),
+            ))
+
     if winner is None:
         return {
             "conclusion": domain.CONCLUSION_INSUFFICIENT_EVIDENCE,
@@ -897,6 +1078,77 @@ def evaluate_conclusion(
         quality_provenance=winner["metrics"].get("quality_provenance") or quality_provenance,
         variation=winner["metrics"].get("cost_variation"),
     )
+
+    if material and not quality_safety_verified:
+        # ── PROMISING, NOT SAFE.
+        #
+        # A real, material, policy-clean saving whose quality safety we cannot
+        # yet vouch for. This is the state the original failure had no name for,
+        # so it was rounded UP to `safe_improvement_found` and shipped as a
+        # verified recommendation.
+        #
+        # It returns NO winner. That is load-bearing rather than tidy:
+        # `_conclude` creates a recommendation only for
+        # `safe_improvement_found` WITH a winner, and `_recommendation_fields`
+        # writes `verified_savings_usd` only under the same condition. Leaving
+        # the winner off means there is no code path — present or future — by
+        # which a promising candidate acquires a verified saving or a `verified`
+        # status. The candidate is still fully described, by result id, in
+        # `leading_candidate_result_id` and in the frontier.
+        qs = winner.get("quality_safety") or {}
+        reasons.append(domain.reason(
+            "non_inferiority_not_established",
+            candidate=winner["candidate"].title,
+            method=qs.get("method"),
+            observed_regression=qs.get("observed_regression"),
+            allowed_regression=qs.get("allowed_regression"),
+            sample_size=qs.get("n_pairs"),
+            discordant_b=qs.get("discordant_b"),
+            discordant_c=qs.get("discordant_c"),
+            confidence_level=qs.get("confidence_level"),
+            lower_confidence_bound=qs.get("lower_confidence_bound"),
+            detail_code=qs.get("reason_code"),
+        ))
+        extra = qs.get("additional_cases_required")
+        if extra is not None:
+            # DERIVED: the smallest sample at which the SAME test would pass,
+            # holding the observed discordance rates constant. Not a guessed
+            # round number, and explicitly conditional on the new cases behaving
+            # like the measured ones.
+            more_data_reasons.append(domain.reason(
+                "sample_size_below_threshold",
+                observed=qs.get("n_pairs"),
+                required=qs.get("required_total_cases"),
+                additional_cases_required=extra,
+                unit="cases",
+                dataset="golden_inputs",
+                derived_from=qs.get("method"),
+                candidate=winner["candidate"].title,
+            ))
+        else:
+            more_data_reasons.append(domain.reason(
+                "non_inferiority_not_established",
+                candidate=winner["candidate"].title,
+                detail_code=qs.get("additional_cases_reason"),
+                detail=(
+                    "The number of additional cases needed could not be derived "
+                    "from the observed data."
+                ),
+            ))
+        return {
+            "conclusion": domain.CONCLUSION_PROMISING_UNVERIFIED,
+            "reasons": reasons,
+            "confidence": confidence,
+            "more_data_changes_conclusion": (
+                domain.MORE_DATA_YES if extra is not None else domain.MORE_DATA_UNKNOWN
+            ),
+            "more_data_reasons": more_data_reasons,
+            "materiality_applied": {**materiality, "evaluation": materiality_detail},
+            "winner": None,
+            "selected_result_id": None,
+            "leading_candidate_result_id": winner.get("result_id"),
+            "quality_safety": qs,
+        }
 
     if material:
         return {
@@ -982,6 +1234,7 @@ def evaluate_conclusion(
 def _violation_reason(v: dict, candidate_title: str) -> dict:
     code_by_constraint = {
         "min_quality": "quality_below_threshold",
+        "max_quality_regression": "quality_regression_above_threshold",
         "max_error_rate": "error_rate_above_threshold",
         "max_latency_p95_ms": "latency_above_threshold",
         "max_cost_per_task_usd": "cost_above_threshold",
@@ -990,6 +1243,7 @@ def _violation_reason(v: dict, candidate_title: str) -> dict:
     }
     unit_by_constraint = {
         "min_quality": "score",
+        "max_quality_regression": "score",
         "max_error_rate": "ratio",
         "max_latency_p95_ms": "ms",
         "max_cost_per_task_usd": "usd_per_task",
@@ -1002,7 +1256,222 @@ def _violation_reason(v: dict, candidate_title: str) -> dict:
         shortfall=v.get("shortfall"),
         unit=unit_by_constraint.get(v["constraint"]),
         candidate=candidate_title,
+        # Present only on the relative quality constraint, and load-bearing
+        # there: "0.90" means nothing without "against a baseline of 1.00".
+        baseline_quality=v.get("baseline_quality"),
+        candidate_quality=v.get("candidate_quality"),
+        threshold_source=v.get("source"),
     )
+
+
+def _frontier_entry(m: dict, baseline: dict, *, eligible_status: str) -> dict:
+    """One measured arm as a frontier row: FACTS and CODES, never wording."""
+    metrics = m["metrics"]
+    evaluation = m.get("policy_evaluation") or {}
+    qs = m.get("quality_safety") or {}
+    b_cost = baseline.get("mean_cost_usd")
+    c_cost = metrics.get("mean_cost_usd")
+    b_q, c_q = baseline.get("quality"), metrics.get("quality")
+
+    codes: list[str] = []
+    for v in evaluation.get("violated") or []:
+        codes.append(_violation_reason(v, m["candidate"].title)["code"])
+    for u in evaluation.get("unmeasured") or []:
+        codes.append(_UNMEASURED_REASON_CODE.get(u["constraint"], "coverage_gap"))
+    if eligible_status == "quality_safe" and qs.get("established"):
+        codes.append("quality_non_inferiority_established")
+    if eligible_status == "promising":
+        codes.append(qs.get("reason_code") or "non_inferiority_not_established")
+
+    return {
+        "label": m["candidate"].title,
+        "result_id": m.get("result_id"),
+        "tier": domain.TIER_EXECUTABLE,
+        "evidence_source": "replay",
+        "status": eligible_status,
+        "reason_codes": codes,
+        "mean_cost_usd": c_cost,
+        "cost_delta_ratio": (
+            round((float(b_cost) - float(c_cost)) / float(b_cost), 6)
+            if b_cost and c_cost is not None else None
+        ),
+        "quality": c_q,
+        "quality_delta": (
+            round(float(c_q) - float(b_q), 6)
+            if b_q is not None and c_q is not None else None
+        ),
+        "latency_p95_ms": metrics.get("latency_p95_ms"),
+        "error_rate": metrics.get("error_rate"),
+        "quality_safety": {
+            k: qs.get(k) for k in (
+                "established", "reason_code", "n_pairs", "discordant_b",
+                "discordant_c", "observed_regression", "allowed_regression",
+                "confidence_level", "lower_confidence_bound",
+                "additional_cases_required", "required_total_cases",
+            )
+        } if qs else None,
+    }
+
+
+def _build_frontier(
+    *,
+    baseline: dict,
+    measured: list[dict],
+    safe: list[dict],
+    promising: list[dict],
+    opportunities: list[dict],
+    winner: Optional[dict],
+) -> dict:
+    """
+    The whole consideration set, with the reason each option was or was not
+    eligible — not just the one that won.
+
+    A customer shown only "we recommend X" cannot tell whether OptiML looked at
+    anything else, and cannot make the trade-off themselves. So the frontier
+    names, explicitly:
+
+      largest_observed_savings   the cheapest arm we MEASURED, whether or not it
+                                 is eligible. Often this is the rejected one,
+                                 and saying so out loud is the honest move.
+      quality_preserving         the cheapest measured arm that did not regress
+                                 against the baseline at all.
+      lowest_cost_rejected       the cheapest arm that is NOT adoptable, with
+                                 the codes explaining why.
+      selected                   what actually won, or None.
+      unverified_opportunities   TIER 2. Never measured, never adoptable from
+                                 here; their next action is connecting a
+                                 provider.
+
+    Every figure is measured or None. No prose.
+    """
+    safe_ids = {id(m) for m in safe}
+    promising_ids = {id(m) for m in promising}
+
+    entries = []
+    for m in measured:
+        if id(m) in safe_ids:
+            status = domain.DISPOSITION_QUALITY_SAFE
+        elif id(m) in promising_ids:
+            status = domain.DISPOSITION_PROMISING
+        elif (m.get("policy_evaluation") or {}).get("violated"):
+            status = domain.DISPOSITION_FAILED_POLICY
+        elif m.get("policy_evaluation"):
+            status = domain.DISPOSITION_NOT_MEASURED
+        else:
+            status = domain.DISPOSITION_BENCHMARKED
+        entries.append(_frontier_entry(m, baseline, eligible_status=status))
+
+    def _cheapest(rows: list[dict]) -> Optional[dict]:
+        priced = [r for r in rows if r.get("mean_cost_usd") is not None]
+        return min(priced, key=lambda r: r["mean_cost_usd"]) if priced else None
+
+    b_q = baseline.get("quality")
+    quality_preserving = _cheapest([
+        r for r in entries
+        if r.get("quality") is not None and b_q is not None and r["quality"] >= b_q
+    ]) if b_q is not None else None
+
+    rejected = [r for r in entries if r["status"] != domain.DISPOSITION_QUALITY_SAFE]
+
+    return {
+        "baseline": {
+            "mean_cost_usd": baseline.get("mean_cost_usd"),
+            "quality": baseline.get("quality"),
+            "latency_p95_ms": baseline.get("latency_p95_ms"),
+            "error_rate": baseline.get("error_rate"),
+            "quality_provenance": baseline.get("quality_provenance"),
+        },
+        "largest_observed_savings": _cheapest(entries),
+        "quality_preserving": quality_preserving,
+        "quality_preserving_absent_reason": (
+            None if quality_preserving
+            else ("baseline_quality_not_measured" if b_q is None
+                  else "no_candidate_matched_baseline_quality")
+        ),
+        "lowest_cost_rejected": _cheapest(rejected),
+        "selected": next(
+            (r for r in entries if winner and r.get("result_id") == winner.get("result_id")),
+            None,
+        ),
+        "entries": entries,
+        "unverified_opportunities": list(opportunities or []),
+    }
+
+
+def _dispositions(
+    *,
+    measured: list[dict],
+    safe: list[dict],
+    promising: list[dict],
+    opportunities: list[dict],
+    generation: dict,
+) -> list[dict]:
+    """
+    One disposition per candidate that entered consideration, including the ones
+    that never reached a benchmark.
+
+    Candidate discovery is a funnel and the funnel counts ARE the product: "47
+    considered / 31 incompatible or policy-blocked / 7 benchmarked / 2 promising
+    / 1 verified" is both more useful and more truthful than a four-row results
+    table. Every model that entered leaves with a code saying where it exited.
+    """
+    out: list[dict] = []
+    safe_ids = {id(m) for m in safe}
+    promising_ids = {id(m) for m in promising}
+
+    drop_stage = {
+        "strategy_not_applicable": domain.DISPOSITION_INCOMPATIBLE,
+        "provider_not_permitted": domain.DISPOSITION_POLICY_BLOCKED,
+        "provider_not_configured": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
+        "duplicate_strategy": domain.DISPOSITION_DUPLICATE,
+        "generator_error": domain.DISPOSITION_GENERATOR_ERROR,
+    }
+    for d in (generation.get("dropped") or []):
+        code = d.get("code")
+        if code == "provider_not_configured":
+            # Handled below as a TIER 2 opportunity, not as a drop.
+            continue
+        out.append({
+            "label": d.get("title"),
+            "generator": d.get("generator"),
+            "tier": domain.TIER_EXECUTABLE,
+            "disposition": drop_stage.get(code, domain.DISPOSITION_INCOMPATIBLE),
+            "code": code,
+            "facts": {k: v for k, v in d.items() if k not in ("title", "generator", "code")},
+        })
+
+    for opp in (opportunities or []):
+        out.append({
+            "label": opp.get("label"),
+            "generator": opp.get("generator"),
+            "tier": domain.TIER_OPPORTUNITY,
+            "disposition": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
+            "code": "provider_not_configured",
+            "facts": {"providers": opp.get("providers")},
+        })
+
+    for m in measured:
+        if id(m) in safe_ids:
+            stage, code = domain.DISPOSITION_QUALITY_SAFE, "quality_non_inferiority_established"
+        elif id(m) in promising_ids:
+            stage = domain.DISPOSITION_PROMISING
+            code = (m.get("quality_safety") or {}).get("reason_code")
+        elif (m.get("policy_evaluation") or {}).get("violated"):
+            stage, code = domain.DISPOSITION_FAILED_POLICY, None
+        elif (m.get("policy_evaluation") or {}).get("unmeasured"):
+            stage, code = domain.DISPOSITION_NOT_MEASURED, "coverage_gap"
+        else:
+            stage, code = domain.DISPOSITION_BENCHMARKED, None
+        out.append({
+            "label": m["candidate"].title,
+            "generator": getattr(m["candidate"], "generator", None),
+            "tier": domain.TIER_EXECUTABLE,
+            "disposition": stage,
+            "code": code,
+            "result_id": m.get("result_id"),
+        })
+
+    return out
 
 
 def _best_by_objective(eligible: list[dict], baseline: dict, objective: str) -> Optional[dict]:
@@ -1135,6 +1604,11 @@ def reevaluate(org_id: str, benchmark_id: str, *, objective: Optional[str] = Non
         signal=signal,
         sample_size=int(bench.get("sample_size") or 0),
         traffic=_traffic_for(org_id, workload),
+        # Tier-2 opportunities are a property of candidate GENERATION, which a
+        # re-read does not repeat. Carrying them forward from the previous
+        # conclusion would be re-asserting a fact this pass did not establish.
+        opportunities=[],
+        generation={},
     )
 
     if verdict.get("winner"):
@@ -1153,7 +1627,14 @@ def reevaluate(org_id: str, benchmark_id: str, *, objective: Optional[str] = Non
         signal=signal,
         more_data=verdict["more_data_changes_conclusion"],
         more_data_reasons=verdict["more_data_reasons"],
-        selected_result_id=verdict.get("selected_result_id"),
+        selected_result_id=(
+            verdict.get("selected_result_id")
+            or verdict.get("leading_candidate_result_id")
+        ),
+        quality_safety=verdict.get("quality_safety"),
+        quality_safety_policy=verdict.get("quality_safety_policy"),
+        frontier=verdict.get("frontier"),
+        consideration=verdict.get("consideration"),
     )
 
 
@@ -1296,6 +1777,15 @@ def _write_candidate_result(
         })
 
         if baseline:
+            # Paired discordant counts are a MEASUREMENT, not an interpretation:
+            # they depend only on the two arms' per-case verdicts, never on a
+            # policy. They live on the evidence row so a later re-read can
+            # re-derive a verdict without re-walking every per-case blob. The
+            # non-inferiority VERDICT does not live here — it is policy-versioned
+            # and belongs on benchmark_conclusions.
+            row["outcome_metrics"]["paired_vs_baseline"] = noninferiority.paired_counts(
+                baseline.get("per_case"), metrics.get("per_case")
+            )
             b_cost, c_cost = baseline.get("mean_cost_usd"), metrics.get("mean_cost_usd")
             if b_cost and c_cost is not None:
                 row["cost_delta_pct"] = round((c_cost - b_cost) / b_cost * 100, 4)
@@ -1318,6 +1808,10 @@ def _write_conclusion(
     org_id, *, benchmark_id, workload_id, policy, objective, conclusion, reasons,
     confidence, materiality, signal, more_data, more_data_reasons,
     selected_result_id: Optional[str] = None,
+    quality_safety: Optional[dict] = None,
+    quality_safety_policy: Optional[dict] = None,
+    frontier: Optional[dict] = None,
+    consideration: Optional[dict] = None,
 ) -> dict:
     """
     Insert an IMMUTABLE conclusion row and retire the previous current one.
@@ -1343,6 +1837,16 @@ def _write_conclusion(
         "more_data_changes_conclusion": more_data,
         "more_data_reasons": more_data_reasons,
         "selected_candidate_result_id": selected_result_id,
+        # STRUCTURED, EXPLAINABLE quality evidence — deliberately NOT folded
+        # into the generic `confidence` field. `confidence` answers "how much do
+        # we trust this measurement overall"; this answers "can we rule out a
+        # material quality regression". The live failure that motivated this
+        # split shipped a -10pp regression with confidence 0.171 attached, and
+        # no field anywhere said the regression had never been ruled out.
+        "quality_safety": quality_safety,
+        "quality_safety_policy": quality_safety_policy,
+        "frontier": frontier,
+        "consideration": consideration,
         "is_current": True,
     }
 
@@ -1368,6 +1872,10 @@ def _conclude(
     selected_result_id: Optional[str] = None, winner: Optional[dict] = None,
     create_recommendation: bool = False,
     baseline_strategy: Optional[strategy_mod.Strategy] = None,
+    quality_safety: Optional[dict] = None,
+    quality_safety_policy: Optional[dict] = None,
+    frontier: Optional[dict] = None,
+    consideration: Optional[dict] = None,
 ) -> dict:
     """Write the conclusion, mirror it onto the benchmark, and — only when the
     benchmark is cited by a recommendation — apply the lifecycle transition."""
@@ -1379,6 +1887,8 @@ def _conclude(
         confidence=confidence, materiality=materiality, signal=success_signal,
         more_data=more_data, more_data_reasons=more_data_reasons,
         selected_result_id=selected_result_id,
+        quality_safety=quality_safety, quality_safety_policy=quality_safety_policy,
+        frontier=frontier, consideration=consideration,
     )
 
     _update_benchmark(org_id, benchmark_id, {
@@ -1431,6 +1941,7 @@ def _conclude(
                         conclusion=conclusion, confidence=confidence,
                         sample_size=sample_size, winner=winner,
                         success_signal=success_signal,
+                        quality_safety=quality_safety,
                     ),
                 )
             except Exception as exc:
@@ -1442,6 +1953,10 @@ def _conclude(
     # A recommendation is created from evidence, and from exactly one kind of
     # evidence. Any other conclusion — including every ignorance state — ends
     # here with the facts persisted and nothing proposed.
+    # A recommendation is created ONLY from `safe_improvement_found` WITH a
+    # winner attached. `promising_candidate_unverified` deliberately carries no
+    # winner, so this guard cannot fire for it even by accident: a promising
+    # candidate is a finding to pursue, never a proposal to act on.
     created_recommendation_id: Optional[str] = None
     if (
         create_recommendation
@@ -1462,6 +1977,7 @@ def _conclude(
             conclusion=conclusion,
             actor=actor,
             service_mod=service_mod,
+            quality_safety=quality_safety,
         )
 
     return {
@@ -1477,6 +1993,10 @@ def _conclude(
         "conclusion_id": str(conclusion_row.get("id")) if conclusion_row.get("id") else None,
         "recommendation_id": recommendation_id or created_recommendation_id,
         "recommendation_created": created_recommendation_id is not None,
+        "quality_safety": quality_safety,
+        "quality_safety_policy": quality_safety_policy,
+        "frontier": frontier,
+        "consideration": consideration,
         **domain.conclusion_payload(conclusion, reasons=reasons, confidence=confidence),
     }
 
@@ -1495,6 +2015,7 @@ def _create_recommendation_from_evidence(
     conclusion: str,
     actor: Optional[str],
     service_mod,
+    quality_safety: Optional[dict] = None,
 ) -> Optional[str]:
     """
     Turn a `safe_improvement_found` verdict into a recommendation that CITES it.
@@ -1586,6 +2107,7 @@ def _create_recommendation_from_evidence(
     fields = _recommendation_fields(
         conclusion=conclusion, confidence=confidence, sample_size=sample_size,
         winner=winner, success_signal=success_signal,
+        quality_safety=quality_safety,
     )
 
     # discovered -> benchmarking -> verified. The intermediate hop is not
@@ -1610,7 +2132,10 @@ def _create_recommendation_from_evidence(
     return rec_id
 
 
-def _recommendation_fields(*, conclusion, confidence, sample_size, winner, success_signal) -> dict:
+def _recommendation_fields(
+    *, conclusion, confidence, sample_size, winner, success_signal,
+    quality_safety: Optional[dict] = None,
+) -> dict:
     """
     Measured fields to write onto a recommendation from this evidence.
 
@@ -1625,6 +2150,12 @@ def _recommendation_fields(*, conclusion, confidence, sample_size, winner, succe
         "confidence": confidence,
         "sample_size": sample_size,
         "success_signal": success_signal.to_dict() if success_signal else {},
+        # The non-inferiority evidence travels WITH the recommendation. Without
+        # it a reader of the recommendations table can see `verified` and
+        # `candidate_quality` but has no way to tell whether a regression
+        # against baseline was ever ruled out — which is exactly how the
+        # original failure reached a customer.
+        "quality_safety": quality_safety,
     }
     if winner is None:
         return fields
@@ -1904,6 +2435,15 @@ def benchmark_row_to_response(row: dict, *, conclusion_row: Optional[dict] = Non
         "materiality_threshold": row.get("materiality_threshold") or {},
         "policy_id": (str(row["policy_id"]) if row.get("policy_id") else None),
         "more_data_changes_conclusion": row.get("more_data_changes_conclusion"),
+        # Structured quality-safety evidence, the frontier and the consideration
+        # funnel live on the CONCLUSION, which is policy-versioned and immutable.
+        # They are surfaced here so a caller reading a benchmark does not have to
+        # know that. None means the conclusion row was not loaded, not that the
+        # evidence is absent.
+        "quality_safety": (conclusion_row or {}).get("quality_safety"),
+        "quality_safety_policy": (conclusion_row or {}).get("quality_safety_policy"),
+        "frontier": (conclusion_row or {}).get("frontier"),
+        "consideration": (conclusion_row or {}).get("consideration"),
         "error": row.get("error"),
         "started_at": row.get("started_at"),
         "completed_at": row.get("completed_at"),

@@ -287,12 +287,19 @@ class AlternateModelGenerator:
                 continue
 
             ranked = []
+            #: Models from providers this org has NOT connected. Ranked
+            #: SEPARATELY and appended after the executable ones, never merged
+            #: into the same list: the globally-cheapest models are frequently
+            #: at unconnected vendors, and one merged ranking would crowd out
+            #: the substitution the org could actually run today. They are
+            #: emitted so downstream can retain them as TIER 2 opportunities —
+            #: "connect this provider to evaluate it" — instead of the org being
+            #: shown only the vendors it already pays.
+            ranked_unconfigured = []
             for entry in catalog:
                 if entry["external_id"].lower() in already_tried:
                     continue
                 if entry["external_id"] == base_model:
-                    continue
-                if allowed and str(entry["vendor"]).strip().lower() not in allowed:
                     continue
                 price = executors.blended_vendor_price(
                     entry["vendor"], entry["external_id"], input_output_ratio=io_ratio
@@ -302,11 +309,20 @@ class AlternateModelGenerator:
                 advantage = (base_price - price) / base_price
                 if advantage < self.MIN_PRICE_ADVANTAGE:
                     continue
-                ranked.append((advantage, price, entry))
+                executable = (
+                    not allowed or str(entry["vendor"]).strip().lower() in allowed
+                )
+                (ranked if executable else ranked_unconfigured).append(
+                    (advantage, price, entry)
+                )
 
             ranked.sort(key=lambda t: -t[0])
+            ranked_unconfigured.sort(key=lambda t: -t[0])
 
-            for advantage, price, entry in ranked[: self.max_candidates]:
+            for advantage, price, entry in (
+                ranked[: self.max_candidates]
+                + ranked_unconfigured[: self.max_candidates]
+            ):
                 cand_strategy = _swap_model(
                     baseline, step.step_id, entry["vendor"], entry["external_id"]
                 )
@@ -554,8 +570,20 @@ def generate_candidates(
     """
     Run the registered generators and return deduped candidates.
 
+    Returns (executable candidates, metadata). The metadata carries TWO further
+    lists that must not be conflated:
+
+      `dropped`        candidates that cannot be run and are not opportunities
+                       either — inapplicable dimensions, duplicates, generator
+                       errors. Each carries a code.
+      `opportunities`  TIER 2. Real alternatives from providers this org has not
+                       connected. Not benchmarked (the arm would measure
+                       nothing) but RETAINED, so the product can say "connect
+                       Google to evaluate this" instead of silently narrowing
+                       the customer's options to the vendors they already pay.
+
     Candidates whose dimensions cannot actually be applied to the runtime graph
-    are DROPPED here, with a reason, rather than being benchmarked into a
+    are dropped here, with a reason, rather than being benchmarked into a
     measurement of nothing.
     """
     history = build_history(
@@ -565,6 +593,8 @@ def generate_candidates(
     seen: set[str] = {baseline.fingerprint()}
     out: list[Candidate] = []
     dropped: list[dict] = []
+    #: TIER 2 — retained, never executed. See the provider_not_configured branch.
+    opportunities: list[dict] = []
     configured = _configured_providers(org_id)
     # Generators rank within executable providers; the post-filter below is
     # defence in depth for generators that ignore this.
@@ -606,14 +636,49 @@ def generate_candidates(
             # before producing a measurement of nothing.
             missing = _unconfigured_providers(cand.strategy, configured)
             if missing:
-                dropped.append({
+                # NOT BENCHMARKED, NOT FORGOTTEN.
+                #
+                # Running this arm would produce a 100%-error result with every
+                # metric NULL — a measurement of nothing wearing the costume of
+                # "the alternative was tested and lost". So it still does not
+                # run. But discarding it was the other half of the mistake: a
+                # customer who has only connected OpenAI still deserves to be
+                # told that a model elsewhere looks worth evaluating.
+                #
+                # It is retained as a TIER 2 opportunity: a hypothesis from a
+                # vendor price sheet, explicitly UNVERIFIED, whose next action
+                # is connecting the provider. It carries no measured number, and
+                # optimization/benchmark.py never lets it win, never gives it a
+                # verified saving and never lets it reach `verified` — it is not
+                # in `measured` at all, so there is no path by which it could.
+                opportunities.append({
                     "generator": name,
-                    "title": cand.title,
+                    "label": cand.title,
+                    "tier": domain.TIER_OPPORTUNITY,
                     "code": "provider_not_configured",
                     "providers": sorted(missing),
+                    "dimensions": list(cand.dimensions or []),
+                    "strategy_fingerprint": cand.fingerprint,
+                    "executor_refs": [
+                        st.executor_ref for st in cand.strategy.steps if st.executor_ref
+                    ],
+                    # A price-sheet hypothesis is the WEAKEST evidence class
+                    # there is. Asserted here rather than inherited, so a tier-2
+                    # item can never arrive carrying 'replay'.
+                    "evidence_source": "none",
+                    "evidence_strength": domain.evidence_strength("none"),
+                    "verified": False,
+                    "next_action": "connect_provider",
+                    # Vendor-price extrapolation, and labelled as such. It is a
+                    # reason to benchmark, never a saving.
+                    "projected_savings_usd": cand.projected_savings_usd,
+                    "projection_basis": cand.projection_basis,
+                    "measured_quality": None,
+                    "measured_cost_usd": None,
                     "detail": (
                         "No provider credential is configured for this "
-                        "organization, so the arm could not run."
+                        "organization, so this candidate was NOT executed and "
+                        "nothing about it has been measured."
                     ),
                 })
                 continue
@@ -626,11 +691,20 @@ def generate_candidates(
             seen.add(fp)
             out.append(cand)
 
-    return out, {"history": {
-        "model_stats_count": len(history.get("model_stats") or {}),
-        "traffic": history.get("traffic"),
-        "lookback_days": lookback_days,
-    }, "dropped": dropped, "generators_run": names}
+    return out, {
+        "history": {
+            "model_stats_count": len(history.get("model_stats") or {}),
+            "traffic": history.get("traffic"),
+            "lookback_days": lookback_days,
+        },
+        "dropped": dropped,
+        "opportunities": opportunities,
+        "generators_run": names,
+        "configured_providers": sorted(configured),
+        # Everything that entered consideration, benchmarkable or not. The
+        # funnel is assembled from this by optimization.domain.build_funnel.
+        "considered": len(out) + len(dropped) + len(opportunities),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -1089,6 +1089,14 @@ def _build_summary(org_id: str, lookback_days: int) -> dict:
         ),
     }
     not_yet_assessable = {
+        # A promising candidate is a real finding but NOT a determination: we
+        # found something worth pursuing and cannot yet vouch for it. It belongs
+        # here rather than under `opportunity_found`, or the summary would count
+        # unverified candidates as verified opportunities — the same rounding-up
+        # that produced the incident this bucket exists to prevent.
+        "promising_candidate_unverified": sum(
+            1 for c in conclusions if c == domain.CONCLUSION_PROMISING_UNVERIFIED
+        ),
         "insufficient_evidence": sum(
             1 for c in conclusions if c == domain.CONCLUSION_INSUFFICIENT_EVIDENCE
         ),

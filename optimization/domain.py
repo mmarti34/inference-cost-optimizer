@@ -761,10 +761,26 @@ CONCLUSION_CANDIDATES_FAILED_POLICY = "candidates_failed_policy"
 CONCLUSION_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 CONCLUSION_BENCHMARK_FAILED = "benchmark_failed"
 
+#: A candidate that is cheaper, satisfies every hard policy constraint, and
+#: shows no disqualifying observed regression — but whose evidence is not yet
+#: strong enough to RULE OUT a material quality regression against the measured
+#: baseline. See optimization/noninferiority.py.
+#:
+#: This exists because collapsing it into `safe_improvement_found` is exactly
+#: the bug this vocabulary was extended to fix: a candidate 10 percentage points
+#: below baseline on 30 cases cleared an absolute floor of 0.90 by a margin of
+#: zero and was written as a VERIFIED recommendation. Collapsing it into
+#: `insufficient_evidence` instead would be almost as bad in the other
+#: direction — it would discard the fact that we found something worth pursuing
+#: and would tell the customer nothing actionable. "Promising, run about N more
+#: evaluations" is a different product state from "we could not measure this".
+CONCLUSION_PROMISING_UNVERIFIED = "promising_candidate_unverified"
+
 CONCLUSIONS = (
     CONCLUSION_SAFE_IMPROVEMENT,
     CONCLUSION_NO_MATERIAL_IMPROVEMENT,
     CONCLUSION_CANDIDATES_FAILED_POLICY,
+    CONCLUSION_PROMISING_UNVERIFIED,
     CONCLUSION_INSUFFICIENT_EVIDENCE,
     CONCLUSION_BENCHMARK_FAILED,
 )
@@ -778,7 +794,13 @@ KNOWLEDGE_CONCLUSIONS = (
 
 #: Conclusions that represent IGNORANCE. Structurally separated so that no
 #: aggregate can count them as a finding.
+#:
+#: `promising_candidate_unverified` belongs here and not in KNOWLEDGE: we did
+#: measure something, but we did NOT reach a determination about whether it is
+#: safe to adopt. Counting it as coverage would let "we found something we
+#: cannot yet vouch for" be reported as "this workload has been assessed".
 IGNORANCE_CONCLUSIONS = (
+    CONCLUSION_PROMISING_UNVERIFIED,
     CONCLUSION_INSUFFICIENT_EVIDENCE,
     CONCLUSION_BENCHMARK_FAILED,
 )
@@ -818,10 +840,19 @@ def is_assessable(conclusion: Optional[str]) -> bool:
 #: and the measured improvement was genuinely below the policy's materiality
 #: threshold. We know the answer — not worth changing. 'inconclusive' stays
 #: reserved for the case where we could not tell.
+#: 'promising_candidate_unverified' -> 'inconclusive' (never 'verified'): the
+#: candidate is real and worth pursuing, but the evidence does not yet rule out
+#: a material quality regression. `inconclusive` is the existing state for "we
+#: could not tell", and the lifecycle allows inconclusive -> benchmarking, which
+#: is exactly the next action (run more cases and re-measure). There is no edge
+#: from 'inconclusive' to 'verified' without passing through 'benchmarking'
+#: again, so a promising candidate structurally cannot become a verified
+#: recommendation without new evidence.
 CONCLUSION_TO_STATUS = {
     CONCLUSION_SAFE_IMPROVEMENT: STATUS_VERIFIED,
     CONCLUSION_CANDIDATES_FAILED_POLICY: STATUS_REJECTED,
     CONCLUSION_NO_MATERIAL_IMPROVEMENT: STATUS_REJECTED,
+    CONCLUSION_PROMISING_UNVERIFIED: STATUS_INCONCLUSIVE,
     CONCLUSION_INSUFFICIENT_EVIDENCE: STATUS_INCONCLUSIVE,
     CONCLUSION_BENCHMARK_FAILED: STATUS_FAILED,
 }
@@ -868,6 +899,40 @@ REASON_CODES: dict[str, str] = {
     "cost_above_threshold": "Measured cost per task exceeds the policy maximum.",
     "provider_not_permitted": "A candidate uses a vendor the policy does not permit.",
     "constraint_unenforceable": "A declared constraint cannot be verified by OptiML today.",
+    # Quality safety — RELATIVE to the measured baseline, not an absolute floor
+    "quality_regression_above_threshold": (
+        "Measured quality is below the baseline by more than the policy's "
+        "max_quality_regression. This is a comparison against what the customer "
+        "runs today, not against an absolute floor."
+    ),
+    "non_inferiority_not_established": (
+        "The evidence does not rule out, at the policy's confidence level, that "
+        "the candidate is worse than the baseline by more than the allowed "
+        "regression. Not a claim that the candidate IS worse."
+    ),
+    "quality_non_inferiority_established": (
+        "The evidence rules out, at the policy's confidence level, a quality "
+        "regression larger than the policy allows."
+    ),
+    "paired_cases_unavailable": (
+        "Per-case results could not be paired across the baseline and candidate "
+        "arms, so no paired comparison was possible."
+    ),
+    "baseline_quality_not_measured": (
+        "The baseline arm produced no quality measurement, so a relative "
+        "quality comparison has no reference point."
+    ),
+    # Candidate consideration funnel
+    "provider_not_configured": (
+        "The organization holds no credential for this candidate's provider, so "
+        "it could not be benchmarked. Retained as an UNVERIFIED opportunity."
+    ),
+    "eliminated_by_historical_evidence": (
+        "A prior measurement on this workload already showed this executor to be "
+        "worse, so it was not re-benchmarked."
+    ),
+    "duplicate_strategy": "The candidate is identical to one already considered.",
+    "generator_error": "A candidate generator raised while proposing candidates.",
     # Materiality
     "improvement_below_materiality": "The measured improvement is below the policy's materiality threshold.",
     # Operational
@@ -892,6 +957,120 @@ def reason(code: str, **facts: Any) -> dict:
     out = {"code": code}
     out.update({k: v for k, v in facts.items() if v is not None})
     return out
+
+
+# ---------------------------------------------------------------------------
+# Candidate consideration — TWO TIERS, and an auditable funnel
+# ---------------------------------------------------------------------------
+#
+# A customer must not have to configure every provider before OptiML can
+# discover opportunities. There are two genuinely different kinds of finding and
+# the product needs both, kept strictly apart:
+#
+#   TIER 1 — EXECUTABLE. The provider is configured, the benchmark actually ran,
+#   the numbers are MEASURED. This tier may reach `verified`.
+#
+#   TIER 2 — OPPORTUNITY, UNVERIFIED. A model from a provider the org has not
+#   connected. Derived from a vendor price sheet (evidence_source='none') or, at
+#   best, from observation of comparable work ('observational'). OptiML has NOT
+#   run it. It carries no measured quality figure, no measured cost, no verified
+#   saving, and it can never reach `verified`. Its next action is "connect this
+#   provider so it can be benchmarked".
+#
+# Previously these were DROPPED. Not benchmarking them was right — an arm for a
+# provider with no credential is a 100%-error arm, a measurement of nothing
+# wearing the costume of a failed candidate. Forgetting them was wrong: a
+# customer who has only connected OpenAI still deserves to be told that a model
+# elsewhere is worth evaluating.
+
+TIER_EXECUTABLE = "executable"
+TIER_OPPORTUNITY = "opportunity"
+CANDIDATE_TIERS = (TIER_EXECUTABLE, TIER_OPPORTUNITY)
+
+#: Evidence sources a TIER 2 item may ever carry. 'replay' and stronger require
+#: an execution that by definition did not happen.
+TIER_OPPORTUNITY_MAX_EVIDENCE_STRENGTH = EVIDENCE_STRENGTH["observational"]
+
+#: Where a candidate left the consideration funnel. Ordered from widest to
+#: narrowest; every model that enters consideration leaves with exactly one of
+#: these plus a reason code carrying the facts.
+DISPOSITION_CONSIDERED = "considered"
+DISPOSITION_INCOMPATIBLE = "incompatible"
+DISPOSITION_POLICY_BLOCKED = "policy_blocked"
+DISPOSITION_PROVIDER_NOT_CONFIGURED = "provider_not_configured"
+DISPOSITION_ELIMINATED_BY_HISTORY = "eliminated_by_historical_evidence"
+DISPOSITION_DUPLICATE = "duplicate"
+DISPOSITION_GENERATOR_ERROR = "generator_error"
+DISPOSITION_BENCHMARKED = "benchmarked"
+DISPOSITION_NOT_MEASURED = "not_measured"
+DISPOSITION_FAILED_POLICY = "failed_policy"
+DISPOSITION_PROMISING = "promising"
+DISPOSITION_QUALITY_SAFE = "quality_safe"
+
+#: The funnel stages, in the order a UI should render them. Each stage is a
+#: COUNT of candidates that exited there (or, for the terminal stages, that
+#: reached there).
+FUNNEL_STAGES = (
+    DISPOSITION_CONSIDERED,
+    DISPOSITION_INCOMPATIBLE,
+    DISPOSITION_POLICY_BLOCKED,
+    DISPOSITION_PROVIDER_NOT_CONFIGURED,
+    DISPOSITION_ELIMINATED_BY_HISTORY,
+    DISPOSITION_DUPLICATE,
+    DISPOSITION_GENERATOR_ERROR,
+    DISPOSITION_BENCHMARKED,
+    DISPOSITION_NOT_MEASURED,
+    DISPOSITION_FAILED_POLICY,
+    DISPOSITION_PROMISING,
+    DISPOSITION_QUALITY_SAFE,
+)
+
+#: Dispositions NOTHING emits today. Kept in the vocabulary so the funnel shape
+#: is stable as discovery grows, and listed here so a zero is never mistaken for
+#: "we checked and found none". Same convention as UNBUILT_EXECUTOR_TYPES.
+UNBUILT_DISPOSITIONS = (DISPOSITION_ELIMINATED_BY_HISTORY,)
+
+
+def build_funnel(dispositions: Iterable[dict]) -> dict:
+    """
+    Turn per-candidate dispositions into the auditable consideration funnel.
+
+    Each disposition: {"label", "disposition", "code", "tier", ...facts}.
+    Returns ordered stage counts plus the un-narrated list, so the frontend can
+    render "47 considered / 31 blocked / 7 benchmarked / 2 promising / 1
+    verified" without the backend ever writing that sentence.
+
+    Stages nothing populates yet are reported with `emitted: false` rather than
+    a bare zero, so an unbuilt stage is not read as a measured finding.
+    """
+    items = [d for d in (dispositions or []) if isinstance(d, dict)]
+    counts = {stage: 0 for stage in FUNNEL_STAGES}
+    for d in items:
+        stage = d.get("disposition")
+        if stage in counts:
+            counts[stage] += 1
+    counts[DISPOSITION_CONSIDERED] = len(items)
+
+    return {
+        "considered": len(items),
+        "stages": [
+            {
+                "stage": stage,
+                "count": counts[stage],
+                "emitted": stage not in UNBUILT_DISPOSITIONS,
+            }
+            for stage in FUNNEL_STAGES
+        ],
+        "by_tier": {
+            TIER_EXECUTABLE: sum(
+                1 for d in items if d.get("tier", TIER_EXECUTABLE) == TIER_EXECUTABLE
+            ),
+            TIER_OPPORTUNITY: sum(
+                1 for d in items if d.get("tier") == TIER_OPPORTUNITY
+            ),
+        },
+        "dispositions": items,
+    }
 
 
 CONFIDENCE_BANDS = ("low", "medium", "high")
@@ -954,6 +1133,7 @@ COVERED_CONCLUSIONS = (
 #: "We couldn't run the experiment" must never look like "we evaluated this
 #: workload", and neither must "we're still measuring".
 NOT_COVERED_CONCLUSIONS = (
+    CONCLUSION_PROMISING_UNVERIFIED,
     CONCLUSION_INSUFFICIENT_EVIDENCE,
     CONCLUSION_BENCHMARK_FAILED,
 )

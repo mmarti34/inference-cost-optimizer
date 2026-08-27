@@ -321,10 +321,16 @@ class FakeRuntime:
     candidate "pass" or "miss" the quality floor.
     """
 
-    def __init__(self, *, quality_for=None, latency_for=None, tokens=(1000, 300)):
+    def __init__(self, *, quality_for=None, latency_for=None, tokens=(1000, 300),
+                 n_cases=20):
         self.quality_for = quality_for or {}
         self.latency_for = latency_for or {}
         self.tokens = tokens
+        # How many replay cases the seeded suite holds. The pass/fail split is
+        # computed against this rather than a constant, so a test that needs a
+        # larger sample (to satisfy the non-inferiority evidence bar) still gets
+        # the pass RATE it asked for.
+        self.n_cases = n_cases
         self.calls = []
 
     def model_of(self, graph):
@@ -348,7 +354,7 @@ class FakeRuntime:
         index = int(str(input_text).split()[-1])
         pass_rate = self.quality_for.get(model, 1.0)
         # Deterministic: the first `pass_rate` share of cases match.
-        matches = index < round(pass_rate * 20)
+        matches = index < round(pass_rate * self.n_cases)
 
         self.calls.append({"model": model, "input_text": input_text})
         return {
@@ -409,8 +415,17 @@ def _run_loop(db, runtime, **kwargs):
 # ---------------------------------------------------------------------------
 
 def test_cheaper_and_passing_candidate_yields_safe_improvement_and_a_recommendation(db):
-    _seed(db, production_runs=60)
-    runtime = FakeRuntime()  # every model returns correct output
+    # 60 replay cases, not 20. Under the conservative default (no worse than
+    # baseline by more than 5 percentage points, 95% one-sided) a candidate that
+    # TIES a perfect baseline needs 52 paired cases before non-inferiority is
+    # established. 20 identical passes are genuinely compatible with a true 5pp
+    # deficit, and the loop now says so instead of calling it verified.
+    # production_runs deliberately != golden_inputs: with them equal, the
+    # projected monthly figure and the verified sample figure coincide
+    # numerically and the assertion below that they are different things would
+    # pass for the wrong reason.
+    _seed(db, golden_inputs=60, production_runs=90)
+    runtime = FakeRuntime(n_cases=60)  # every model returns correct output
 
     result = _run_loop(
         db, runtime,
@@ -428,7 +443,7 @@ def test_cheaper_and_passing_candidate_yields_safe_improvement_and_a_recommendat
     baseline_inputs = sorted(c["input_text"] for c in runtime.calls if c["model"] == BASELINE_MODEL)
     candidate_inputs = sorted(c["input_text"] for c in runtime.calls if c["model"] == CHEAP_MODEL)
     assert baseline_inputs == candidate_inputs
-    assert len(baseline_inputs) == 20
+    assert len(baseline_inputs) == 60
 
     arms = db.rows("benchmark_candidate_results")
     assert {a["arm"] for a in arms} == {"baseline", "candidate"}
@@ -461,14 +476,25 @@ def test_cheaper_and_passing_candidate_yields_safe_improvement_and_a_recommendat
     # verified = measured delta over THIS sample; projected = that delta
     # extrapolated over measured monthly volume. Different numbers, by design.
     assert rec["baseline_reference"]["projection"]["result"] == "projected"
-    assert rec["baseline_reference"]["measured_over_cases"] == 20
+    assert rec["baseline_reference"]["measured_over_cases"] == 60
     assert rec.get("realized_savings_usd") is None
     assert rec["baseline_reference"]["benchmark_id"] == result["benchmark_id"]
     # First optimization of this workload: no ancestor to double-count against.
     assert rec["baseline_reference"]["derived_from_recommendation_id"] is None
 
-    # 20 replay cases must not look like a production-scale result.
+    # 60 replay cases must not look like a production-scale result.
     assert rec["confidence"] < 0.5
+
+    # The safety claim is EXPLICIT and structured — not folded into `confidence`.
+    qs = result["quality_safety"]
+    assert qs["established"] is True
+    assert qs["method"] == "tango_score_paired_noninferiority"
+    assert qs["n_pairs"] == 60
+    assert (qs["discordant_b"], qs["discordant_c"]) == (0, 0)
+    assert qs["allowed_regression"] == pytest.approx(0.05)
+    assert qs["observed_regression"] == pytest.approx(0.0)
+    assert qs["lower_confidence_bound"] > -0.05
+    assert rec["quality_safety"]["established"] is True
     assert domain.confidence_band(rec["confidence"]) in ("low", "medium")
 
 
@@ -530,18 +556,70 @@ def test_cheaper_but_quality_below_threshold_fails_policy_and_the_arm_is_retaine
     assert any(r["id"] == near_miss["id"] for r in queried)
 
 
+def test_relaxing_only_the_absolute_floor_does_not_make_a_regression_safe(db):
+    """
+    THE REGRESSION THIS WHOLE CHANGE EXISTS FOR.
+
+    A candidate 10 percentage points below a perfect baseline, re-read under a
+    floor relaxed to exactly its own score. It clears the absolute floor by a
+    margin of zero and is the cheapest thing measured. Under the old semantics
+    that was `safe_improvement_found` and a VERIFIED recommendation. It must now
+    stay a policy failure, because the floor was never the constraint that
+    mattered — the baseline was.
+    """
+    _seed(db, golden_inputs=60, constraints={"min_quality": 0.95}, production_runs=60)
+    runtime = FakeRuntime(quality_for={CHEAP_MODEL: 0.90}, n_cases=60)
+
+    first = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
+    assert first["conclusion"] == domain.CONCLUSION_CANDIDATES_FAILED_POLICY
+
+    # The customer relaxes ONLY the absolute floor, to exactly the candidate's
+    # own measured score.
+    for row in db.store["optimization_policies"]:
+        row["constraints"] = {"min_quality": 0.90}
+        row["version"] = 5
+
+    patches = _patched(db, runtime)
+    for p in patches:
+        p.start()
+    try:
+        second = benchmark_mod.reevaluate(ORG_ID, first["benchmark_id"])
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert second["conclusion"] == domain.CONCLUSION_CANDIDATES_FAILED_POLICY
+    codes = {r["code"] for r in second["reasons"]}
+    assert "quality_below_threshold" not in codes      # the floor IS satisfied
+    assert "quality_regression_above_threshold" in codes
+
+    regression = next(
+        r for r in second["reasons"] if r["code"] == "quality_regression_above_threshold"
+    )
+    # The facts a customer needs to judge it: 0.90 means nothing without 1.00.
+    assert regression["baseline_quality"] == pytest.approx(1.0)
+    assert regression["candidate_quality"] == pytest.approx(0.90)
+    assert regression["observed"] == pytest.approx(0.10)
+    assert regression["required"] == pytest.approx(0.05)
+    assert regression["threshold_source"] == "default"   # nobody configured it
+
+    assert db.rows("optimization_recommendations") == []
+
+
 def test_relaxing_the_quality_floor_is_a_re_read_not_a_re_measurement(db):
     """Re-evaluation runs zero model calls and leaves the original verdict intact."""
-    _seed(db, constraints={"min_quality": 0.95}, production_runs=60)
-    runtime = FakeRuntime(quality_for={CHEAP_MODEL: 0.90})
+    _seed(db, golden_inputs=60, constraints={"min_quality": 0.95}, production_runs=60)
+    runtime = FakeRuntime(quality_for={CHEAP_MODEL: 0.90}, n_cases=60)
 
     first = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
     assert first["conclusion"] == domain.CONCLUSION_CANDIDATES_FAILED_POLICY
     calls_after_benchmark = len(runtime.calls)
 
-    # The customer relaxes the floor to 0.90.
+    # The customer relaxes the floor to 0.90 AND explicitly accepts up to a 20pp
+    # regression against baseline. Both are required now: the absolute floor and
+    # the relative ceiling are separate constraints and are ANDed.
     for row in db.store["optimization_policies"]:
-        row["constraints"] = {"min_quality": 0.90}
+        row["constraints"] = {"min_quality": 0.90, "max_quality_regression": 0.20}
         row["version"] = 5
 
     patches = _patched(db, runtime)
@@ -823,8 +901,8 @@ def test_generated_candidates_carry_honest_evidence_labels(db):
 
 def test_the_loop_runs_end_to_end_from_generated_candidates(db):
     """No caller-supplied candidates: discovery, generation, replay, verdict."""
-    _seed(db, production_runs=120)
-    runtime = FakeRuntime()
+    _seed(db, golden_inputs=60, production_runs=120)
+    runtime = FakeRuntime(n_cases=60)
 
     result = _run_loop(db, runtime, create_recommendation=True, actor="user-1")
 
@@ -973,8 +1051,8 @@ def test_a_recommendation_cannot_be_created_without_a_measured_strategy(db):
     The reevaluate path holds stored rows, not executable strategies. It must
     decline to create a recommendation rather than reconstruct one from a hash.
     """
-    _seed(db, production_runs=60)
-    runtime = FakeRuntime()
+    _seed(db, golden_inputs=60, production_runs=60)
+    runtime = FakeRuntime(n_cases=60)
 
     first = _run_loop(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
     assert first["conclusion"] == domain.CONCLUSION_SAFE_IMPROVEMENT
@@ -1049,8 +1127,8 @@ def _client(db, runtime):
 
 
 def test_optimize_endpoint_returns_the_verdict_and_the_recommendation(db):
-    _seed(db, production_runs=120)
-    runtime = FakeRuntime()
+    _seed(db, golden_inputs=60, production_runs=120)
+    runtime = FakeRuntime(n_cases=60)
     patches = _patched(db, runtime)
     for p in patches:
         p.start()

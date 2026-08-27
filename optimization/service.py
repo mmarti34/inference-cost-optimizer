@@ -43,7 +43,7 @@ RECOMMENDATION_COLS = (
     "approval_required, approved_by, approved_at, promoted_at, decided_by, decided_at, "
     "deployment_id, experiment_id, rolled_back_at, monitoring_status, "
     "realized_window_start, realized_window_end, realized_metrics, audit, "
-    "created_at, updated_at"
+    "quality_safety, created_at, updated_at"
 )
 
 EVIDENCE_COLS = (
@@ -493,6 +493,16 @@ def recommendation_row_to_response(row: dict, *, evidence: Optional[list[dict]] 
             "candidate": row.get("candidate_quality"),
             "provenance": row.get("quality_provenance"),
             "success_signal": row.get("success_signal") or {},
+            # Whether a material regression against the baseline was RULED OUT,
+            # with the paired evidence behind it. NULL means not established —
+            # never "fine". A client reading candidate=0.90 next to
+            # baseline=1.00 must be able to see that this was never checked, or
+            # that it was checked and failed.
+            "safety": row.get("quality_safety"),
+            "regression_ruled_out": (
+                bool((row.get("quality_safety") or {}).get("established"))
+                if row.get("quality_safety") else None
+            ),
         },
         "latency": {
             "baseline_p95_ms": row.get("baseline_latency_p95_ms"),

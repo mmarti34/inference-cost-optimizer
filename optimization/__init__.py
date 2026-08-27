@@ -21,6 +21,12 @@ EMPIRICAL EVIDENCE:
                     Runtime adapter to/from workflow graph_json.
     candidates.py   Candidate generators (recommendation engine stages 1-2).
     benchmark.py    The replay evidence engine.
+    noninferiority.py
+                    Paired non-inferiority statistics over the per-case
+                    pass/fail data both arms produce. Answers "can we RULE OUT
+                    a material quality regression against the customer's
+                    measured baseline", which an absolute quality floor and a
+                    point estimate both fail to answer. Pure, no I/O.
     outcomes.py     Outcome recording: delayed arrival, idempotent, ranked.
     attempts.py     Thin domain adapter over the EXISTING tracing tables.
     policies.py     Constraints that make a strategy invalid, not merely worse.
@@ -40,6 +46,7 @@ __all__ = [
     "strategy",
     "candidates",
     "benchmark",
+    "noninferiority",
     "outcomes",
     "attempts",
     "policies",

@@ -36,6 +36,46 @@ POLICY_COLS = (
     "materiality, created_at, updated_at"
 )
 
+#: THE CONSERVATIVE QUALITY-SAFETY DEFAULT.
+#:
+#: `min_quality` and `max_quality_regression` answer different questions and
+#: both are kept:
+#:
+#:   min_quality             an ABSOLUTE floor. "Never run anything below 0.9,
+#:                           whatever the baseline does." Owned entirely by the
+#:                           customer; OptiML declares no default for it,
+#:                           because inventing an absolute floor for someone
+#:                           else's workload would be a fabrication.
+#:   max_quality_regression  a RELATIVE ceiling on degradation. "Do not make my
+#:                           workload materially worse than it is today."
+#:
+#: The second is the one OptiML must default, because a customer who never
+#: configured a policy still expects not to be handed a regression. The live
+#: failure this default exists to prevent: a candidate measured 10 percentage
+#: points below baseline cleared a `min_quality: 0.90` floor by a margin of
+#: exactly zero, won on cost, and shipped as VERIFIED.
+#:
+#: 0.05 is a judgement, and here is the reasoning rather than a vibe. The cost
+#: objective's default materiality is a 5% relative improvement; accepting a
+#: quality loss looser than the gain we demand would be incoherent, so 5pp is a
+#: ceiling, not a target. It is also NOT the effective bar: establishing
+#: non-inferiority at a 5pp margin with 95% one-sided confidence requires the
+#: OBSERVED regression to sit very close to zero — a 3pp observed regression on
+#: 100 paired cases does not clear it. A tighter nominal margin (0.02) is
+#: available to any customer who wants it and is a supported policy value; it is
+#: not the default only because at 95% confidence it needs roughly 133 perfectly
+#: tied cases before anything can be concluded, and a default that can never
+#: conclude is not conservatism, it is silence.
+#:
+#: require_non_inferiority defaults TRUE. With it FALSE a customer is choosing
+#: to act on point estimates alone; that is their right, and it is recorded as
+#: their choice rather than assumed.
+DEFAULT_QUALITY_SAFETY = {
+    "max_quality_regression": 0.05,
+    "quality_confidence_level": 0.95,
+    "require_quality_non_inferiority": True,
+}
+
 #: Conservative by default: OptiML does nothing on its own and a human approves
 #: anything that touches production. auto_rollback defaults TRUE because
 #: rolling back is the safe direction.
@@ -51,6 +91,7 @@ DEFAULT_AUTOMATION = {
 #: Constraints this codebase can actually check against measured evidence.
 ENFORCEABLE_CONSTRAINTS = (
     "min_quality",
+    "max_quality_regression",
     "max_error_rate",
     "max_latency_p95_ms",
     "max_cost_per_task_usd",
@@ -166,6 +207,34 @@ def materiality_of(policy: Optional[dict], objective: str = "cost") -> dict:
     return normalized
 
 
+def quality_safety_of(policy: Optional[dict]) -> dict:
+    """
+    The quality-safety regime in force, with its SOURCE stamped per field.
+
+    A caller can therefore tell "the customer asked for 2pp" apart from "nobody
+    said, so OptiML applied its conservative default" — which matters, because
+    only the first is a customer commitment and only the second may be argued
+    with in the UI.
+    """
+    c = constraints_of(policy)
+    out: dict = {}
+    for key, default in DEFAULT_QUALITY_SAFETY.items():
+        if key in c and c[key] is not None:
+            raw = c[key]
+            value = bool(raw) if isinstance(default, bool) else float(raw)
+            out[key] = value
+            out[f"{key}_source"] = "policy"
+        else:
+            out[key] = default
+            out[f"{key}_source"] = "default"
+
+    out["min_quality"] = c.get("min_quality")
+    out["min_quality_source"] = "policy" if c.get("min_quality") is not None else "unset"
+    out["policy_id"] = str(policy["id"]) if policy and policy.get("id") else None
+    out["policy_version"] = (policy or {}).get("version")
+    return out
+
+
 def success_signal_of(policy: Optional[dict]) -> dict:
     s = (policy or {}).get("success_signal")
     return s if isinstance(s, dict) else {}
@@ -204,6 +273,7 @@ def evaluate(
     measured: dict,
     executor_refs: Optional[list[dict]] = None,
     quality_provenance: Optional[str] = None,
+    baseline: Optional[dict] = None,
 ) -> dict:
     """
     Check a candidate's MEASURED metrics against a policy.
@@ -212,6 +282,12 @@ def evaluate(
     A None value means "not measured" and can never satisfy a constraint — it
     produces an `unmeasured` entry, which is treated as a failure to satisfy,
     not as a pass.
+
+    `baseline` carries the SAME keys measured for the baseline arm of the same
+    run. It is what makes `max_quality_regression` checkable: that constraint is
+    relative to what the customer runs today, and without the baseline it is not
+    a weaker check, it is an uncheckable one — reported as `unmeasured`, never
+    as satisfied.
 
     Returns:
         {
@@ -309,6 +385,63 @@ def evaluate(
             })
         else:
             _check_min("min_quality", "quality")
+
+    # ── max_quality_regression: the RELATIVE constraint.
+    #
+    # This is checked whether or not the policy names it, because OptiML applies
+    # a conservative default (see DEFAULT_QUALITY_SAFETY). An absolute floor
+    # cannot express "do not make my workload worse than it is today", and the
+    # two constraints are ANDed: a candidate must clear the floor AND stay
+    # within the allowed regression. A candidate that ties the floor exactly
+    # while sitting 10pp under baseline satisfies the first and fails this one,
+    # which is the entire point of adding it.
+    safety = quality_safety_of(policy)
+    allowed_regression = float(safety["max_quality_regression"])
+    cand_q = measured.get("quality")
+    base_q = (baseline or {}).get("quality")
+
+    if cand_q is None:
+        unmeasured.append({
+            "constraint": "max_quality_regression",
+            "required": allowed_regression,
+            "reason": (
+                "Candidate quality was not measured, so its regression against "
+                "the baseline cannot be computed."
+            ),
+        })
+    elif base_q is None:
+        unmeasured.append({
+            "constraint": "max_quality_regression",
+            "required": allowed_regression,
+            "reason": (
+                "Baseline quality was not measured, so there is no reference "
+                "point for a relative quality comparison."
+            ),
+        })
+    elif domain.provenance_rank(quality_provenance) < domain.MIN_QUALITY_PROVENANCE_RANK_FOR_CONSTRAINT:
+        unmeasured.append({
+            "constraint": "max_quality_regression",
+            "required": allowed_regression,
+            "reason": (
+                f"Quality signal provenance '{quality_provenance}' is below the "
+                "minimum rank required to judge a quality regression."
+            ),
+        })
+    else:
+        regression = float(base_q) - float(cand_q)
+        if regression <= allowed_regression:
+            satisfied.append("max_quality_regression")
+        else:
+            violated.append({
+                "constraint": "max_quality_regression",
+                "required": allowed_regression,
+                "measured": round(regression, 8),
+                "shortfall": round(regression - allowed_regression, 8),
+                "direction": "regression_exceeds_maximum",
+                "baseline_quality": float(base_q),
+                "candidate_quality": float(cand_q),
+                "source": safety["max_quality_regression_source"],
+            })
 
     _check_max("max_error_rate", "error_rate")
     _check_max("max_latency_p95_ms", "latency_p95_ms")
@@ -496,6 +629,11 @@ def policy_row_to_response(row: dict) -> dict:
         "automation": automation_of(row),
         "success_signal": row.get("success_signal") or {},
         "materiality": row.get("materiality") or domain.copy_default_materiality("cost"),
+        # The quality-safety regime actually in force, with each field marked
+        # 'policy' or 'default'. A UI must be able to show the customer that a
+        # conservative default is protecting them even though they configured
+        # nothing.
+        "quality_safety": quality_safety_of(row),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         # Which declared constraints OptiML can actually verify. Surfaced so a
