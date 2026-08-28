@@ -901,3 +901,51 @@ def test_the_ruleset_version_records_the_change():
     earlier one."""
     assert er.REDACTION_VERSION == 2
     assert capture_input_text("x")[1]["redaction_version"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The gate must fail CLOSED on unknown provenance.
+#
+# Found during the production proof: replay_gate treated "we could not capture
+# provenance" as "nothing was redacted", so a row whose capture FAILED — the
+# case where a secret is most likely to have gone unexamined — was eligible for
+# automatic promotion into replay evidence. Unknown is not clean.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("capture", [
+    None,
+    {"status": "unavailable", "reason": "capture_failed", "redacted": False},
+    {"status": "unavailable", "reason": "oversize", "redacted": False},
+    {"status": "unavailable", "reason": "not_captured_at_this_call_site", "redacted": False},
+    {"status": "captured", "redacted": False,
+     "node_results_capture": {"status": "unavailable", "reason": "capture_failed",
+                              "redacted": False}},
+])
+def test_unknown_capture_provenance_is_not_promotable(capture):
+    g = replay_gate(capture)
+    assert g["eligible"] is False
+    assert "capture_provenance_unavailable" in g["reasons"]
+
+
+def test_no_capture_argument_at_all_fails_closed():
+    g = replay_gate()
+    assert g["eligible"] is False
+    assert "capture_provenance_unavailable" in g["reasons"]
+
+
+@pytest.mark.parametrize("status", ["absent", "empty"])
+def test_a_real_observation_of_no_variables_stays_promotable(status):
+    """`absent` and `empty` are measured facts, not missing provenance."""
+    g = replay_gate({"status": status, "redacted": False})
+    assert g["eligible"] is True
+    assert g["reasons"] == []
+
+
+def test_the_two_review_reasons_stay_distinct():
+    """"We removed something" and "we cannot tell" are different findings."""
+    redacted = replay_gate({"status": "captured", "redacted": True,
+                            "redacted_kinds": ["email"]})
+    unknown = replay_gate({"status": "unavailable", "reason": "capture_failed",
+                           "redacted": False})
+    assert redacted["reasons"] == ["redacted_input_requires_review"]
+    assert unknown["reasons"] == ["capture_provenance_unavailable"]

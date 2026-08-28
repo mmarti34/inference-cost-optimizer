@@ -772,6 +772,11 @@ INPUT_TEXT_CAPTURE_KEY = "input_text_capture"
 # would otherwise claim to reproduce faithfully. Backend returns the code; the
 # frontend owns the wording.
 REVIEW_REDACTED_INPUT = "redacted_input_requires_review"
+#: The row's redaction provenance could not be read, or capture ran and failed.
+#: Distinct from REVIEW_REDACTED_INPUT on purpose: "we removed something" and
+#: "we cannot tell whether anything needed removing" are different facts, and
+#: collapsing them would hide the second behind the first.
+REVIEW_UNKNOWN_PROVENANCE = "capture_provenance_unavailable"
 
 # Every namespaced capture record nested inside `variables_capture`. The replay
 # gate walks all of them, so adding a persisted field to the boundary means
@@ -1020,18 +1025,37 @@ def replay_gate(*captures: Any) -> dict[str, Any]:
     kinds: set[str] = set()
     paths: set[str] = set()
     try:
+        readable = 0
         for capture in captures:
             if not isinstance(capture, dict):
                 continue
+            readable += 1
             parts = [capture]
             for nested_key in _NESTED_CAPTURE_KEYS:
                 parts.append(capture.get(nested_key))
             for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                # UNKNOWN IS NOT CLEAN. `unavailable` means capture was
+                # attempted and produced nothing usable — capture_failed,
+                # oversize, variables_not_a_mapping. Those are precisely the
+                # cases where a secret is most likely to have gone unexamined,
+                # so `redacted: False` on them is an absence of evidence, not
+                # evidence of absence. Treating them as promotable would let
+                # the one row nobody could inspect become replay evidence.
+                # `absent` and `empty` are REAL observations and stay eligible.
+                if part.get("status") == "unavailable":
+                    if REVIEW_UNKNOWN_PROVENANCE not in reasons:
+                        reasons.append(REVIEW_UNKNOWN_PROVENANCE)
                 if _capture_says_redacted(part):
                     if REVIEW_REDACTED_INPUT not in reasons:
                         reasons.append(REVIEW_REDACTED_INPUT)
                     kinds.update(_capture_kinds(part))
                     paths.update(_capture_paths(part))
+        # No readable provenance at all — a legacy row whose fresh capture also
+        # failed, or a caller that passed nothing. Same rule: fail closed.
+        if readable == 0 and REVIEW_UNKNOWN_PROVENANCE not in reasons:
+            reasons.append(REVIEW_UNKNOWN_PROVENANCE)
     except BaseException:  # noqa: BLE001 — a gate that crashes must fail CLOSED
         return {
             "eligible": False,
