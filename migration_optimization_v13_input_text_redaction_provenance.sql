@@ -1,0 +1,149 @@
+-- ============================================================================
+-- Migration: OptiML optimization layer v13 — COMMENT ONLY.
+--            `workflow_runs.variables_capture` now also carries the
+--            provenance of the `input_text` redaction.
+--
+-- RUN AFTER: migration_optimization_v12_capture_input_variables.sql
+--
+-- *** NOT APPLIED, AND NOT RUN BY THE AGENT THAT WROTE IT. ***
+-- No SQL of any kind was executed: no DDL, no DML, no SELECT, no migration
+-- tool. Apply this by hand after review, after v12.
+--
+-- THIS MIGRATION CONTAINS NOTHING BUT `COMMENT ON COLUMN`.
+-- No ADD COLUMN, no ALTER TYPE, no CREATE, no DROP, no RENAME, no INDEX, no
+-- INSERT, no UPDATE, no DELETE, no policy, no grant, no role, no view. A
+-- COMMENT changes a catalog entry and nothing else: it rewrites no rows, locks
+-- nothing that matters, and is a no-op on re-run. It cannot alter RLS, org
+-- isolation or authentication, and it does not try to.
+--
+-- ORDERING RELATIVE TO THE CODE: THIS ONE IS ORDER-INDEPENDENT. Unlike v12, no
+-- code path depends on it. The accompanying code writes a new KEY inside the
+-- existing JSONB column, which needs no DDL at all. Applying this late leaves
+-- the column's documentation stale; it breaks nothing.
+--
+--
+-- ── WHAT CHANGED IN THE CODE, AND WHY THIS COMMENT MUST FOLLOW IT ──────────
+--
+-- v12 closed the capture side of the evidence bridge: `variables` and
+-- `variables_capture` were added and written REDACTED, through
+-- evidence_redaction.py.
+--
+-- It did not close the older ingress. `workflow_runs.input_text` predates both
+-- columns, and workflow_runtime.execute_workflow contains:
+--
+--     if variables and input_text == "" and input_node_id:
+--         input_text = json.dumps(variables)
+--
+-- so a variable-driven workflow with an Input node has been writing its
+-- customer-supplied variables into `input_text` as an untyped JSON string with
+-- NO REDACTION AT ALL. Measured at the time of the fix: 683 of the 685 stored
+-- inputs arrived by that path. A live scan of the current rows found no
+-- addresses and no credential-shaped strings, so this is not being treated as
+-- a known incident — but shipping a redacted capture column while leaving the
+-- older plaintext column open would give the SAME customer request two
+-- different storage guarantees, which is not a guarantee at all.
+--
+-- The code now routes `input_text` through the same module, at the same
+-- persist boundary, on every write site. The provenance of that redaction had
+-- to go somewhere. It goes HERE, as a namespaced key inside the JSONB column
+-- that already exists, rather than in a new column:
+--
+--     variables_capture = {
+--       ...            -- everything v12 documented, unchanged
+--       "input_text_capture":    {status, mode, redacted, truncated,
+--                                 source_chars, stored_chars, redaction_version,
+--                                 redactions?, redacted_paths?, redacted_kinds?,
+--                                 truncations?, truncated_paths?}
+--       "node_results_capture":  {status, redacted, truncated, entry_count,
+--                                 redaction_version, redactions?,
+--                                 redacted_paths?, redacted_kinds?, ...}
+--     }
+--
+-- THE TRACE IS THE THIRD COPY, AND IT WAS THE LAST ONE OPEN.
+-- `node_results` records the Input node's `input_text[:200]` and the Prompt
+-- node's variable-interpolated template `[:200]`, plus `error_detail`, which
+-- providers routinely echo credentials into. Redacting `input_text` while
+-- leaving `node_results` alone stored the same secret 200 characters away ON
+-- THE SAME ROW — the inconsistent guarantee this whole change exists to
+-- remove. It now goes through the same module, at the same persist boundary.
+-- Structure is preserved because it is load-bearing: the entry count is the
+-- trace's step count, `status`/`error`/`error_status` produce every error rate
+-- in the product, and `node_id` is the join key that other entries in the same
+-- trace (`selected`, `candidates`, `router_selected_node_id`) refer to by
+-- value. Only what a step SAYS is redacted.
+--
+-- THE RULESET VERSION IS NOW 2 (`redaction_version`), for two changes:
+--   * `input_text` and `node_results` are inside the boundary;
+--   * the national-id rule no longer excludes the whole 9xx area. The IRS
+--     issues ITINs as 9XX-XX-XXXX with group digits in 50-65, 70-88, 90-92 or
+--     94-99; excluding all of 9xx kept real taxpayer identifiers in plaintext.
+--     `000` and `666` remain excluded — no scheme issues them — so this is a
+--     narrowing of a false negative, not a loosening of precision.
+-- Rows written by ruleset 1 are NOT reinterpreted and NOT rewritten; the
+-- version field is exactly what lets a reader tell them apart.
+--
+-- A JSONB column absorbing an additional key needs no schema change, so the
+-- fix ships without a structural migration. What it DOES need is for the
+-- column's documented meaning to stop being narrower than its contents — a
+-- column whose comment lies is worse than one with no comment, because the
+-- next reader will trust it. That is the entire purpose of this file.
+--
+--
+-- ── WHAT IS *NOT* DONE HERE, DELIBERATELY ─────────────────────────────────
+--
+-- NOTHING IS BACKFILLED, AND NO HISTORICAL ROW IS REWRITTEN. There is no
+-- UPDATE in this file and none in the accompanying code. Existing
+-- `input_text` values stay exactly as they were written. Retroactive
+-- sanitisation would change replay semantics and make previously published
+-- benchmark evidence unreproducible — the recorded runs
+--   policy v1  benchmark      88813bfb-5581-45a0-abf6-884732a0b19b
+--   policy v2  benchmark      4d5ca24d-93b6-4b8a-a4e7-1c5fcba9fec7
+--   second win benchmark      fb723f70-b53d-4e5e-be2c-91d67b688eb0
+-- are evidence, and evidence that can be edited afterwards is not evidence.
+-- The fix applies to writes after deployment and to nothing else.
+--
+-- NO COLUMN IS ADDED TO `golden_inputs`. The promotion path
+-- (workflow_management.import_golden_input_from_production) now re-runs the
+-- redaction at its own write boundary and REFUSES to promote a run whose
+-- content redaction modified, returning the structured code
+-- `redacted_input_requires_review` until a human explicitly acknowledges it;
+-- an acknowledged case is recorded as source = 'imported_from_production_redacted'.
+-- That uses only values in columns that already exist. A dedicated capture
+-- column on `golden_inputs` would say it better, and remains the separate,
+-- additive change that v12's closing note already listed.
+-- ============================================================================
+
+
+COMMENT ON COLUMN public.workflow_runs.variables_capture IS
+  'Provenance for the REDACTED CONTENT PERSISTED ON THIS ROW — how it was obtained and what was done to it. WITHOUT THIS, REDACTION WOULD BE SILENT, and a curated eval case that no longer reproduces the original behaviour would look like a mystery instead of a known, recorded modification. Two independent records live here, both produced by the SAME ruleset in evidence_redaction.py so they can never disagree about one request. (1) TOP LEVEL — provenance for the `variables` column. Shape: {status, reason?, redacted, truncated, key_count?, redaction_version, redactions?, redacted_paths?, redacted_kinds?, type_changed?, truncations?, truncated_paths?}. `status` vocabulary, all four disjoint: captured = variables is populated; absent = the caller supplied no variables at all (an input_text-driven workflow); empty = the caller supplied a mapping with zero keys, which is a real observation and NOT the same as absent; unavailable = capture was attempted and did not produce a usable value, with `reason` giving the code (capture_failed, oversize, variables_not_a_mapping, not_captured_at_this_call_site, pre_execution_failure_no_variables_captured). Only `captured` has a non-NULL `variables`. `redactions` lists one entry per modified location as {path, kinds} using dotted/indexed paths ("customer.email", "reviews[3]"). `type_changed` is true when a redaction altered a value''s JSON type — the one case is a numeric value that passed the Luhn checksum and an issuer-prefix check and so became a marker string. (2) KEY `input_text_capture` — provenance for the `input_text` column on the SAME row, added after v12 (see migration v13). `input_text` is the older and wider ingress: workflow_runtime substitutes json.dumps(variables) for an empty input_text when the workflow has an Input node, and 683 of the 685 inputs stored before the fix arrived that way, unredacted. It is now redacted at every persist site by the same module. Shape: {status, mode, redacted, truncated, source_chars, stored_chars, redaction_version, redactions?, redacted_paths?, redacted_kinds?, truncations?, truncated_paths?}. `mode` is json when the text parsed as a JSON object/array — in which case KEY HINTS were available and the decisions are identical to what the `variables` column records — or text otherwise, where the path is reported as "$" because free text has no key structure. `status` uses the same vocabulary as the top level (captured / absent / empty / unavailable). REDACTION RUNS BEFORE TRUNCATION, so a secret straddling the 5000-character storage cap cannot survive as a usable prefix; the [:5000] slice itself is recorded here rather than marked inline, preserving this table''s existing storage convention. `redaction_version` identifies the ruleset that produced the row, so a later ruleset change does not silently reinterpret old rows. (3) KEY `node_results_capture` — provenance for the `node_results` column on the SAME row: the execution trace is the third copy of the same request (the Input node stores input_text[:200], the Prompt node stores the interpolated template, error entries store error_detail) and is redacted by the same module. Shape: {status, redacted, truncated, entry_count, redaction_version, redactions?, redacted_paths?, redacted_kinds?, truncations?, truncated_paths?}, with paths indexed by trace entry ("[0].output", "[3].error_detail"). STRUCTURE IS PRESERVED BECAUSE IT IS LOAD-BEARING: `entry_count` equals the stored entry count, and `node_id`, `type`, `status`, `error`, `error_status`, `model`, `provider` and the router''s node references are backend- or graph-generated identifiers and enumerations that pass through unredacted — every error rate in the product is computed from them, and redacting a node_id would break the trace''s references to itself. Only what a step SAYS is redacted. THE VALUE THAT EXECUTED IS NOT WHAT IS STORED: redaction happens at the INSERT, never in the execution path, so the model received the verbatim input, the caller received the verbatim trace, and only the database holds the sanitised copy. THIS ROW IS NOT AUTOMATICALLY REPLAY-ELIGIBLE when `redacted` is true at ANY of the three levels — the promotion path refuses it with the code `redacted_input_requires_review` until a human approves it or substitutes a fixture. NOT BACKFILLABLE and NEVER BACKFILLED: rows written before each half of this shipped keep exactly what they were written with. Structured codes and measured facts ONLY — no customer-facing prose; the frontend owns all wording.';
+
+
+-- ── VERIFICATION (read-only; run these by hand, they change nothing) ────────
+--
+-- 1. The comment is in place:
+--
+--    SELECT col_description('public.workflow_runs'::regclass, ordinal_position)
+--      FROM information_schema.columns
+--     WHERE table_schema = 'public' AND table_name = 'workflow_runs'
+--       AND column_name = 'variables_capture';
+--
+-- 2. After deploying the code, input_text redaction is actually happening, and
+--    the two halves agree about the same requests:
+--
+--    SELECT variables_capture->'input_text_capture'->>'status' AS it_status,
+--           (variables_capture->'node_results_capture'->>'redacted')::boolean AS nr_redacted,
+--           variables_capture->'input_text_capture'->>'mode'   AS it_mode,
+--           (variables_capture->'input_text_capture'->>'redacted')::boolean AS it_redacted,
+--           (variables_capture->>'redacted')::boolean          AS vars_redacted,
+--           COUNT(*)
+--      FROM public.workflow_runs
+--     WHERE created_at > now() - interval '1 day'
+--     GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC;
+--
+-- 3. Nothing historical moved. Run BEFORE and AFTER deploying; the count for
+--    rows created before the deploy must not change:
+--
+--    SELECT COUNT(*), MAX(created_at)
+--      FROM public.workflow_runs
+--     WHERE variables_capture IS NULL;
+-- ============================================================================

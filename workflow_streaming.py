@@ -25,7 +25,7 @@ from workflow_runtime import (
     _entry_point_ids,
     _execute_tool,
 )
-from evidence_redaction import capture_variables
+from evidence_redaction import capture_variables, persist_input_text, persist_node_results
 from context_runtime import resolve_node_context, build_context_trace
 
 
@@ -58,9 +58,9 @@ def _insert_workflow_run_linear(
             "workflow_id": workflow_id,
             "org_id": org_id,
             "user_id": None,
-            "input_text": (input_text or "")[:5000] or None,
+            # input_text and node_results are set below, at the persist
+            # boundary.
             "final_output": (final_output or "")[:10000] or None,
-            "node_results": node_results,
             "total_cost": round(total_cost, 6),
             "total_latency_ms": total_latency_ms,
             "endpoint_slug": endpoint_slug or None,
@@ -86,6 +86,14 @@ def _insert_workflow_run_linear(
                 "truncated": False,
             }
         row["variables"] = _vars_value
+        # ── Redaction boundary for input_text ─────────────────────────────
+        # Same boundary, same ruleset, same module as `variables` above; the
+        # streamed value the caller received is untouched, only what is
+        # written here is redacted. persist_input_text never raises.
+        row["input_text"], _vars_capture = persist_input_text(input_text, _vars_capture)
+        # Same boundary for the trace. The list is not modified, so the steps
+        # already streamed to the caller are unaffected.
+        row["node_results"], _vars_capture = persist_node_results(node_results, _vars_capture)
         row["variables_capture"] = _vars_capture
         if experiment_id is not None:
             row["experiment_id"] = experiment_id

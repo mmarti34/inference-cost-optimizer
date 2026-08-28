@@ -25,6 +25,7 @@ from api_key_validation import validate_api_key
 from rate_limiting import check_and_increment_usage
 from plan_enforcement import check_monthly_request_limit, increment_monthly_usage
 from workflow_runtime import execute_workflow, validate_workflow_variables
+from evidence_redaction import persist_input_text
 from workflow_streaming import stream_workflow_async
 from conversation_service import (
     get_or_create_conversation,
@@ -642,11 +643,25 @@ async def public_execute(
         if _wf_id and not _execution_started and _err_status not in (401, 403, 404, 429):
             try:
                 _err_detail_str = (e.detail if isinstance(e.detail, str) else str(e.detail or ""))[:500]
+                # ── Redaction boundary ─────────────────────────────────────
+                # This row is written BEFORE execution starts, but
+                # `body.input_text` is still customer-controlled content being
+                # persisted, so it goes through the same module as every other
+                # write site. The request itself already failed; this is
+                # evidence only, and persist_input_text never raises.
+                _redacted_input, _input_capture = persist_input_text(body.input_text)
                 supabase.table("workflow_runs").insert({
                     "workflow_id": _wf_id,
                     "org_id": log_entry.get("org_id"),
                     "user_id": None,
-                    "input_text": ((body.input_text or "")[:5000] if body.input_text else None),
+                    "input_text": _redacted_input,
+                    "variables_capture": {
+                        "status": "unavailable",
+                        "reason": "pre_execution_failure_no_variables_captured",
+                        "redacted": False,
+                        "truncated": False,
+                        **_input_capture,
+                    },
                     "final_output": None,
                     "node_results": [{
                         "node_id": "pre_execution",
@@ -675,11 +690,20 @@ async def public_execute(
         # ── Persist failed workflow_run for non-HTTP errors too ──
         if _wf_id and not _execution_started:
             try:
+                # Same redaction boundary as the HTTPException path above.
+                _redacted_input_g, _input_capture_g = persist_input_text(body.input_text)
                 supabase.table("workflow_runs").insert({
                     "workflow_id": _wf_id,
                     "org_id": log_entry.get("org_id"),
                     "user_id": None,
-                    "input_text": ((body.input_text or "")[:5000] if body.input_text else None),
+                    "input_text": _redacted_input_g,
+                    "variables_capture": {
+                        "status": "unavailable",
+                        "reason": "pre_execution_failure_no_variables_captured",
+                        "redacted": False,
+                        "truncated": False,
+                        **_input_capture_g,
+                    },
                     "final_output": None,
                     "node_results": [{
                         "node_id": "pre_execution",

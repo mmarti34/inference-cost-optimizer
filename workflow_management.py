@@ -18,6 +18,12 @@ from plan_enforcement import check_workflow_limit
 logger = logging.getLogger(__name__)
 
 from workflow_runtime import execute_workflow
+from evidence_redaction import (
+    persist_golden_input,
+    capture_node_results,
+    replay_gate,
+    REVIEW_REDACTED_INPUT,
+)
 from routing.resolver import get_promoted_deployment_by_version, get_latest_promoted_deployment
 
 router = APIRouter()
@@ -1343,12 +1349,20 @@ async def list_golden_inputs(org_id: str, workflow_id: str, _user: Authenticated
 async def create_golden_input(payload: GoldenInputCreate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a golden input (test case). Requires auth and org access."""
     try:
+        # ── Redaction boundary ─────────────────────────────────────────────
+        # `golden_inputs` persists customer request content exactly as
+        # `workflow_runs` does, and this payload is customer-controlled, so it
+        # goes through the same centralized module. Redaction happens on the
+        # values being WRITTEN; nothing here executes.
+        _gi_text, _gi_vars, _gi_capture = persist_golden_input(
+            payload.input_text, payload.variables
+        )
         insert = {
             "org_id": payload.org_id,
             "workflow_id": payload.workflow_id,
             "name": payload.name,
-            "input_text": payload.input_text,
-            "variables": payload.variables,
+            "input_text": _gi_text,
+            "variables": _gi_vars,
             "expected_output": payload.expected_output,
             "source": payload.source or "manual",
             "source_run_id": payload.source_run_id,
@@ -1368,6 +1382,18 @@ async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate, 
     """Update a golden input. Requires auth and org access."""
     try:
         update = {k: v for k, v in payload.model_dump(exclude_unset=True).items()}
+        # Same redaction boundary as creation: an update is another write of
+        # customer-controlled content into the same persisted evidence field,
+        # so it cannot be a route around the boundary. Only the fields the
+        # caller actually supplied are touched.
+        if "input_text" in update or "variables" in update:
+            _u_text, _u_vars, _u_capture = persist_golden_input(
+                update.get("input_text"), update.get("variables")
+            )
+            if "input_text" in update:
+                update["input_text"] = _u_text
+            if "variables" in update:
+                update["variables"] = _u_vars
         if not update:
             # Fetch existing and return
             result = supabase.table("golden_inputs").select(_GOLDEN_INPUT_COLS).eq("id", golden_input_id).single().execute()
@@ -1399,35 +1425,112 @@ class ImportFromProductionPayload(BaseModel):
     workflow_id: str
     run_id: str
     name: Optional[str] = None
+    # Explicit human approval to promote a run whose persisted content was
+    # modified by redaction. Defaults to False, so redaction can never
+    # SILENTLY produce a case that claims to reproduce production. A human may
+    # instead curate the case by hand or substitute a safe fixture.
+    acknowledge_redaction: bool = False
 
     class Config:
         extra = "ignore"
 
 
+# Columns needed for promotion. The two capture columns arrive with migration
+# v12; if that migration has not been applied yet the select is retried
+# without them, so this endpoint keeps working and the gate falls back to the
+# redaction pass performed at the write boundary below.
+_PROMOTE_RUN_COLS = "id, workflow_id, org_id, input_text, final_output, node_results, variables, variables_capture"
+_PROMOTE_RUN_COLS_LEGACY = "id, workflow_id, org_id, input_text, final_output, node_results"
+
+
 @router.post("/golden-inputs/import-from-production")
 async def import_golden_input_from_production(payload: ImportFromProductionPayload, _user: AuthenticatedUser = Depends(require_org_member)):
-    """Create a golden input from a workflow run (e.g. production run). Requires auth and org access."""
+    """Create a golden input from a workflow run (e.g. production run). Requires auth and org access.
+
+    THE PROMOTION GATE. Replay evidence must never pretend to be faithful. If
+    redaction modified what is being promoted — either recorded on the run at
+    write time, or found again at this boundary on a row that predates it —
+    the case is NOT promoted automatically: the endpoint returns 409 with the
+    structured reason `redacted_input_requires_review`. Nothing is deleted and
+    nothing is rewritten; the sanitised run stays exactly where it is for
+    inspection and curation, and a human can re-issue this request with
+    `acknowledge_redaction` to accept the sanitised case, or build a safe
+    fixture by hand. An unredacted secret is never retained to keep a case
+    replayable.
+    """
     try:
-        run = (
-            supabase.table("workflow_runs")
-            .select("id, workflow_id, org_id, input_text, final_output, node_results")
-            .eq("id", payload.run_id)
-            .eq("org_id", payload.org_id)
-            .eq("workflow_id", payload.workflow_id)
-            .single()
-            .execute()
-        )
+        def _fetch(cols: str):
+            return (
+                supabase.table("workflow_runs")
+                .select(cols)
+                .eq("id", payload.run_id)
+                .eq("org_id", payload.org_id)
+                .eq("workflow_id", payload.workflow_id)
+                .single()
+                .execute()
+            )
+
+        try:
+            run = _fetch(_PROMOTE_RUN_COLS)
+        except Exception:
+            run = _fetch(_PROMOTE_RUN_COLS_LEGACY)
         if not run.data:
             raise HTTPException(status_code=404, detail="Run not found")
         r = run.data
+
+        # ── Redaction boundary ─────────────────────────────────────────────
+        # Historical rows are IMMUTABLE and are never rewritten, so a run
+        # persisted before this boundary shipped still holds plaintext
+        # input_text. Promotion is a NEW write of that content into another
+        # persisted evidence field, so it is redacted here rather than trusted
+        # for its age. Re-redacting an already-redacted value is a no-op: the
+        # markers match no pattern.
+        _gi_text, _gi_vars, _gi_capture = persist_golden_input(
+            r.get("input_text"), r.get("variables")
+        )
+
+        # The execution trace is not copied into `golden_inputs` (there is no
+        # column for it), but it IS part of the same request, so a run whose
+        # trace carried something redactable is judged by the same gate. On a
+        # row written after the boundary shipped this is already recorded in
+        # `variables_capture`; on a legacy row it is found here.
+        _nr_safe, _nr_capture = capture_node_results(r.get("node_results"))
+
+        # The gate reads the provenance recorded on the run at write time AND
+        # everything this boundary just found — input, variables and trace.
+        gate = replay_gate(
+            r.get("variables_capture"),
+            _gi_capture,
+            {"node_results_capture": _nr_capture},
+        )
+        if not gate["eligible"] and not payload.acknowledge_redaction:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": REVIEW_REDACTED_INPUT,
+                    "reasons": gate["reasons"],
+                    "redacted_kinds": gate["redacted_kinds"],
+                    "redacted_paths": gate["redacted_paths"],
+                    "run_id": str(r["id"]),
+                    # The sanitised run is preserved and readable through the
+                    # existing run endpoints; nothing was discarded.
+                    "sanitized_run_preserved": True,
+                    "resolution": "resubmit_with_acknowledge_redaction_or_curate_fixture",
+                },
+            )
+
         insert = {
             "org_id": r["org_id"],
             "workflow_id": r["workflow_id"],
             "name": payload.name or f"From run {payload.run_id[:8]}",
-            "input_text": r.get("input_text"),
-            "variables": None,
+            "input_text": _gi_text,
+            "variables": _gi_vars,
             "expected_output": r.get("final_output"),
-            "source": "imported_from_production",
+            # A promoted case that carries redactions says so in its source,
+            # so a reader never mistakes it for a faithful production replay.
+            # (`golden_inputs` has no capture column; adding one is a separate,
+            # additive change — see migration v12's closing note.)
+            "source": "imported_from_production" if gate["eligible"] else "imported_from_production_redacted",
             "source_run_id": r["id"],
         }
         result = supabase.table("golden_inputs").insert(insert).execute()

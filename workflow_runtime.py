@@ -31,7 +31,7 @@ from model_target import ModelTarget
 from provider_resilience import call_with_resilience
 from context_runtime import resolve_node_context, build_context_trace
 from context_embeddings import search_similar as _search_kb
-from evidence_redaction import capture_variables
+from evidence_redaction import capture_variables, persist_input_text, persist_node_results
 # SM v1 prompt injection removed — v2 compresses context sources instead
 # (prompt_assembler.py still used by the /synthetic-mind/stats dashboard)
 
@@ -2586,9 +2586,9 @@ def execute_workflow(
                         "workflow_id": workflow_id,
                         "org_id": org_id,
                         "user_id": user_id or None,
-                        "input_text": input_text[:5000] if input_text else None,
+                        # input_text and node_results are set below, at the
+                        # persist boundary.
                         "final_output": (prev or "")[:10000] if prev else None,
-                        "node_results": node_results,
                         "total_cost": out["total_cost"],
                         "total_latency_ms": total_latency,
                         "endpoint_slug": endpoint_slug if endpoint_slug else None,
@@ -2597,6 +2597,31 @@ def execute_workflow(
                     }
                     _vars_value, _vars_capture = _capture_variables_once()
                     row["variables"] = _vars_value
+                    # ── Redaction boundary for the OLDER, WIDER ingress ───────
+                    # `input_text` is customer-controlled and, when the caller
+                    # sent named variables and an empty input_text, it is
+                    # `json.dumps(variables)` (see above). It reached this table
+                    # unredacted while `variables` was redacted — the same
+                    # request with two different storage guarantees.
+                    # Redaction happens HERE, on the value being written, and
+                    # NOT on the local that drove execution: `input_text` is the
+                    # Input node's value and is what the model actually
+                    # received. Mutating it would silently change production
+                    # behaviour. Best-effort like every other capture: it cannot
+                    # raise, so it can never become a customer-facing error.
+                    row["input_text"], _vars_capture = persist_input_text(
+                        input_text, _vars_capture
+                    )
+                    # The trace is the THIRD copy of the same request on this
+                    # row: the Input node records input_text[:200] and the
+                    # Prompt node records the variable-interpolated template.
+                    # Redacting input_text and not this would leave the same
+                    # secret 200 characters away. The list handed in is not
+                    # modified — `node_results` above is still the verbatim
+                    # trace this call returns to the caller.
+                    row["node_results"], _vars_capture = persist_node_results(
+                        node_results, _vars_capture
+                    )
                     row["variables_capture"] = _vars_capture
                     if experiment_id is not None:
                         row["experiment_id"] = experiment_id
@@ -2660,9 +2685,9 @@ def execute_workflow(
                     "workflow_id": workflow_id,
                     "org_id": org_id,
                     "user_id": user_id or None,
-                    "input_text": (input_text[:5000] if input_text else None),
+                    # input_text and node_results are set below, at the
+                    # persist boundary.
                     "final_output": None,
-                    "node_results": node_results,
                     "total_cost": round(total_cost, 6),
                     "total_latency_ms": total_latency,
                     "endpoint_slug": endpoint_slug if endpoint_slug else None,
@@ -2674,6 +2699,13 @@ def execute_workflow(
                 # success path does.
                 _fail_vars_value, _fail_vars_capture = _capture_variables_once()
                 _fail_row["variables"] = _fail_vars_value
+                # Same redaction boundary as the success path; see there.
+                _fail_row["input_text"], _fail_vars_capture = persist_input_text(
+                    input_text, _fail_vars_capture
+                )
+                _fail_row["node_results"], _fail_vars_capture = persist_node_results(
+                    node_results, _fail_vars_capture
+                )
                 _fail_row["variables_capture"] = _fail_vars_capture
                 if experiment_id is not None:
                     _fail_row["experiment_id"] = experiment_id
@@ -2734,9 +2766,9 @@ def execute_workflow(
                     "workflow_id": workflow_id,
                     "org_id": org_id,
                     "user_id": user_id or None,
-                    "input_text": (input_text[:5000] if input_text else None),
+                    # input_text and node_results are set below, at the
+                    # persist boundary.
                     "final_output": None,
-                    "node_results": node_results,
                     "total_cost": round(total_cost, 6),
                     "total_latency_ms": total_latency,
                     "endpoint_slug": endpoint_slug if endpoint_slug else None,
@@ -2745,6 +2777,13 @@ def execute_workflow(
                 }
                 _g_vars_value, _g_vars_capture = _capture_variables_once()
                 _fail_row_g["variables"] = _g_vars_value
+                # Same redaction boundary as the success path; see there.
+                _fail_row_g["input_text"], _g_vars_capture = persist_input_text(
+                    input_text, _g_vars_capture
+                )
+                _fail_row_g["node_results"], _g_vars_capture = persist_node_results(
+                    node_results, _g_vars_capture
+                )
                 _fail_row_g["variables_capture"] = _g_vars_capture
                 if experiment_id is not None:
                     _fail_row_g["experiment_id"] = experiment_id
