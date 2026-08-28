@@ -981,7 +981,83 @@ def list_service_api_keys(org_id: str, _user: AuthenticatedUser = Depends(requir
 
 @app.delete("/delete-service-api-key/{key_id}")
 def delete_service_api_key(key_id: str, _user: AuthenticatedUser = Depends(require_auth)):
-    result = supabase.table("service_api_keys").delete().eq("id", key_id).execute()
+    """
+    Revoke one server API key belonging to an org the caller is a member of.
+
+    CROSS-TENANT DESTRUCTIVE WRITE, fixed. This used `require_auth` — any
+    authenticated user, with no org membership proven — and deleted from
+    `service_api_keys` filtered ONLY by `key_id`. The service-role client
+    bypasses RLS, so any signed-in user who knew a key id could revoke ANOTHER
+    TENANT'S production key and take their traffic down. `/delete-key` directly
+    below has always scoped its delete by org; this one simply did not.
+
+    The guard cannot be `require_org_member`: there is no org in the path and a
+    DELETE carries no body, so that dependency would demand an X-Org-Id header
+    the existing frontend does not send here. Membership is therefore proven
+    against the KEY'S OWN org, which is stricter than a caller-supplied one —
+    the caller cannot name the org they are checked against.
+
+    "No such key" and "not your key" return the SAME 404: a key id belonging to
+    another tenant must not be confirmable, matching this file's other
+    org-scoped surfaces.
+    """
+    _NOT_FOUND = HTTPException(status_code=404, detail="Service API key not found.")
+
+    try:
+        found = (
+            supabase.table("service_api_keys")
+            .select("id, org_id")
+            .eq("id", key_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("service key lookup failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Error revoking service API key.") from exc
+
+    rows = found.data or []
+    if not rows:
+        raise _NOT_FOUND
+    key_org_id = str(rows[0].get("org_id") or "")
+    if not key_org_id:
+        raise _NOT_FOUND
+
+    # A cursor token is scoped to exactly one org and proves nothing elsewhere.
+    cursor_org = getattr(_user, "_cursor_org_id", None)
+    if cursor_org:
+        if str(cursor_org) != key_org_id:
+            logger.warning(
+                "cross-tenant service-key revoke refused: cursor token org mismatch"
+            )
+            raise _NOT_FOUND
+    else:
+        try:
+            member = (
+                supabase.table("organization_members")
+                .select("role")
+                .eq("org_id", key_org_id)
+                .eq("user_id", _user.user_id)
+                .eq("status", "active")
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            logger.warning("membership check failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=500, detail="Error verifying organization access.") from exc
+        if not (member.data or []):
+            # Same 404 as "no such key" — do not confirm that this id exists.
+            logger.warning(
+                "cross-tenant service-key revoke refused: user=%s key_org=%s",
+                _user.user_id, key_org_id,
+            )
+            raise _NOT_FOUND
+
+    # Belt and braces: scope the DELETE itself, so even a logic slip above
+    # cannot widen it beyond the org the key belongs to.
+    supabase.table("service_api_keys").delete() \
+        .eq("id", key_id) \
+        .eq("org_id", key_org_id) \
+        .execute()
     return {"status": "deleted", "id": key_id}
 
 @app.delete("/delete-key")

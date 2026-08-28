@@ -170,3 +170,107 @@ def test_the_org_comes_from_the_verified_guard_not_the_body(as_member):
                 assert val == ORG_ID, (
                     f"{table} filtered by the body's org_id, not the verified one"
                 )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /delete-service-api-key/{key_id}
+#
+# Cross-tenant DESTRUCTIVE write, not an information leak. It used require_auth
+# — any authenticated user, no org membership proven — and deleted from
+# service_api_keys filtered only by key_id, with the service-role client
+# bypassing RLS. Any signed-in user who knew a key id could revoke another
+# tenant's production key.
+# ---------------------------------------------------------------------------
+
+KEY_ID = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+
+class _KeyRecorder(_Recorder):
+    """Records deletes as well as filters."""
+
+    def __init__(self, rows_by_table, member_rows):
+        super().__init__(rows_by_table)
+        self.rows_by_table["organization_members"] = member_rows
+        self.deletes: list[tuple[str, list]] = []
+
+    def table(self, name):
+        self.filters.setdefault(name, [])
+        return _KeyChain(self, name)
+
+
+class _KeyChain(_Chain):
+    def __init__(self, rec, table):
+        super().__init__(rec, table)
+        self._deleting = False
+
+    def delete(self):
+        self._deleting = True
+        return self
+
+    def execute(self):
+        if self._deleting:
+            self._rec.deletes.append((self._table, list(self._rec.filters[self._table])))
+        return MagicMock(data=self._rec.rows_by_table.get(self._table, []))
+
+
+@pytest.fixture
+def as_authed(monkeypatch):
+    user = AuthenticatedUser(user_id=PAYLOAD["user_id"], email="a@b.c")
+    main.app.dependency_overrides[main.require_auth] = lambda: user
+    yield user
+    main.app.dependency_overrides.clear()
+
+
+def _delete(rec):
+    with patch.object(main, "supabase", rec):
+        return TestClient(main.app).delete(f"/delete-service-api-key/{KEY_ID}")
+
+
+def test_a_foreign_tenants_key_cannot_be_revoked(as_authed):
+    """The key belongs to OTHER_ORG_ID and the caller is not a member."""
+    rec = _KeyRecorder(
+        {"service_api_keys": [{"id": KEY_ID, "org_id": OTHER_ORG_ID}]},
+        member_rows=[],  # caller is not a member of the key's org
+    )
+    resp = _delete(rec)
+
+    assert resp.status_code == 404
+    assert rec.deletes == [], "a foreign tenant's key was deleted"
+
+
+def test_an_unknown_key_is_indistinguishable_from_a_foreign_one(as_authed):
+    unknown = _KeyRecorder({"service_api_keys": []}, member_rows=[])
+    foreign = _KeyRecorder(
+        {"service_api_keys": [{"id": KEY_ID, "org_id": OTHER_ORG_ID}]}, member_rows=[]
+    )
+    r1, r2 = _delete(unknown), _delete(foreign)
+
+    assert r1.status_code == r2.status_code == 404
+    assert r1.json() == r2.json()
+    assert unknown.deletes == foreign.deletes == []
+
+
+def test_your_own_key_is_still_revocable_and_the_delete_is_org_scoped(as_authed):
+    rec = _KeyRecorder(
+        {"service_api_keys": [{"id": KEY_ID, "org_id": ORG_ID}]},
+        member_rows=[{"role": "member"}],
+    )
+    resp = _delete(rec)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "deleted"
+    assert len(rec.deletes) == 1
+    table, applied = rec.deletes[0]
+    assert table == "service_api_keys"
+    assert ("id", KEY_ID) in applied
+    assert ("org_id", ORG_ID) in applied, "the DELETE itself must be org-scoped"
+
+
+def test_membership_is_checked_against_the_keys_org_not_a_supplied_one(as_authed):
+    """The caller cannot name the org they are checked against."""
+    rec = _KeyRecorder(
+        {"service_api_keys": [{"id": KEY_ID, "org_id": OTHER_ORG_ID}]},
+        member_rows=[],
+    )
+    _delete(rec)
+    assert ("org_id", OTHER_ORG_ID) in rec.filters["organization_members"]
