@@ -109,6 +109,12 @@ SERVER_KEY_CREATED = "server_api_key.created"
 SERVER_KEY_REVOKED = "server_api_key.revoked"
 SERVER_KEY_REVOKE_REFUSED = "server_api_key.revoke.refused"
 SERVER_KEY_UPDATED = "server_api_key.updated"
+#: A refused NON-revoke edit (e.g. a rate-limit change) on a key that is not
+#: the caller's. Distinct from SERVER_KEY_REVOKE_REFUSED on purpose: "someone
+#: reached for a key that is not theirs" and "someone tried to take a key out
+#: of service" are different incidents, and collapsing them would make the
+#: revoke count wrong in whichever direction the collapse went.
+SERVER_KEY_UPDATE_REFUSED = "server_api_key.update.refused"
 
 # Cursor tokens (long-lived org-scoped bearer tokens for the editor plugin)
 CURSOR_TOKEN_CREATED = "cursor_token.created"
@@ -156,6 +162,7 @@ ACTIONS = frozenset({
     SERVER_KEY_REVOKED,
     SERVER_KEY_REVOKE_REFUSED,
     SERVER_KEY_UPDATED,
+    SERVER_KEY_UPDATE_REFUSED,
     CURSOR_TOKEN_CREATED,
     CURSOR_TOKEN_REVOKED,
     CURSOR_TOKEN_REVOKE_REFUSED,
@@ -187,6 +194,7 @@ ACTIONS = frozenset({
 #: these, so the two ways of querying refusals can never disagree.
 REFUSAL_ACTIONS = frozenset({
     SERVER_KEY_REVOKE_REFUSED,
+    SERVER_KEY_UPDATE_REFUSED,
     CURSOR_TOKEN_REVOKE_REFUSED,
     PROVIDER_CREDENTIAL_DELETE_REFUSED,
     ORG_SECRET_UPDATE_REFUSED,

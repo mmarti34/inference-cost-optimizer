@@ -6,8 +6,9 @@ import asyncio
 import json
 import logging
 import math
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+import audit
 from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
 from resource_access import (
     DEPLOYMENT_NOT_FOUND,
@@ -50,6 +51,7 @@ EVAL_RUN_NOT_FOUND = "Eval run not found"
 ROUTING_POLICY_NOT_FOUND = "Routing policy not found"
 CUSTOM_METRIC_NOT_FOUND = "Custom metric not found"
 AUTO_GRADED_METRIC_NOT_FOUND = "Auto-graded metric not found"
+ROLLBACK_RULE_NOT_FOUND = "Rollback rule not found"
 
 
 def _nr_has_error(nr: Any) -> bool:
@@ -403,7 +405,10 @@ async def delete_workflow(workflow_id: str, _user: AuthenticatedUser = Depends(r
             )
             raise HTTPException(status_code=403, detail="You do not have access to this workflow.")
         # Delete in order to respect FKs: runs -> deployments (eval_runs CASCADE from deployment) -> golden_inputs, eval_suites -> workflow
-        supabase.table("workflow_runs").delete().eq("workflow_id", workflow_id).execute()
+        # `workflow_runs` carries `org_id`; the cascade is scoped by it as well
+        # as by workflow_id, so a slip in the ownership check above still cannot
+        # erase another tenant's execution history.
+        supabase.table("workflow_runs").delete().eq("workflow_id", workflow_id).eq("org_id", caller_org_id).execute()
         supabase.table("workflow_deployments").delete().eq("workflow_id", workflow_id).execute()
         supabase.table("golden_inputs").delete().eq("workflow_id", workflow_id).execute()
         supabase.table("eval_suites").delete().eq("workflow_id", workflow_id).execute()
@@ -725,7 +730,7 @@ class PromoteOverridePayload(BaseModel):
 
 
 @router.post("/workflow-deployments/{deployment_id}/promote")
-async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload, _user: AuthenticatedUser = Depends(require_org_member)):
+async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload, request: Request, _user: AuthenticatedUser = Depends(require_org_member)):
     """Admin override: promote a deployment despite failed eval. Sets status=promoted, promoted_at=now(), override_reason."""
     # Was filtered on deployment_id alone: possession of a foreign deployment
     # UUID changed what ANOTHER tenant's live production endpoint serves.
@@ -749,6 +754,21 @@ async def promote_deployment_override(deployment_id: str, payload: PromoteOverri
         if not result.data or len(result.data) == 0:
             raise HTTPException(status_code=404, detail=DEPLOYMENT_NOT_FOUND)
         row = result.data[0]
+        # An ADMIN OVERRIDE that puts a version live despite a failed eval: the
+        # single most consequential thing this router does to another user's
+        # production environment, and until now it left no record of who did it.
+        audit.record(
+            audit.DEPLOYMENT_PROMOTED,
+            principal=_user,
+            resource_type=audit.RESOURCE_DEPLOYMENT,
+            resource_id=deployment_id,
+            metadata={
+                "workflow_id": row.get("workflow_id"),
+                "version": row.get("version"),
+                "new_status": "promoted",
+            },
+            request=request,
+        )
         # The org comes from the guard, never read back out of the fetched row.
         org_id = caller_org_id
         endpoint_slug = (row.get("endpoint_slug") or "").strip()
@@ -769,7 +789,7 @@ class ActivateDeploymentPayload(BaseModel):
 
 
 @router.post("/workflow-deployments/{deployment_id}/activate")
-async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPayload, _user: AuthenticatedUser = Depends(require_org_member)):
+async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPayload, request: Request, _user: AuthenticatedUser = Depends(require_org_member)):
     """Re-activate an existing deployment as the live version (rollback without creating a new version).
 
     Sets the target deployment to status=promoted and demotes any other promoted
@@ -787,11 +807,15 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
         org_id = caller_org_id
         endpoint_slug = (target.get("endpoint_slug") or "").strip()
 
-        # Demote all other promoted deployments on the same endpoint
+        # Demote all other promoted deployments on the same endpoint.
+        # `.data` was discarded here, which meant the versions this call took
+        # OUT of production were the one part of a rollback nothing recorded.
+        _demoted = []
         if org_id and endpoint_slug:
-            supabase.table("workflow_deployments").update({
+            _demote_result = supabase.table("workflow_deployments").update({
                 "status": "rolled_back",
             }).eq("org_id", org_id).eq("endpoint_slug", endpoint_slug).eq("status", "promoted").neq("id", deployment_id).execute()
+            _demoted = _demote_result.data or []
 
         # Promote the target
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -812,6 +836,36 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
             raise HTTPException(status_code=404, detail=DEPLOYMENT_NOT_FOUND)
         row = result.data[0]
 
+        # One row per version this call took out of production, and one for the
+        # version it put in. Both halves matter: "which version is live now" and
+        # "what did it displace" are different questions during an incident.
+        for _d in _demoted:
+            audit.record(
+                audit.DEPLOYMENT_ROLLED_BACK,
+                principal=_user,
+                resource_type=audit.RESOURCE_DEPLOYMENT,
+                resource_id=_d.get("id"),
+                metadata={
+                    "workflow_id": _d.get("workflow_id"),
+                    "version": _d.get("version"),
+                    "prior_status": "promoted",
+                    "new_status": "rolled_back",
+                },
+                request=request,
+            )
+        audit.record(
+            audit.DEPLOYMENT_PROMOTED,
+            principal=_user,
+            resource_type=audit.RESOURCE_DEPLOYMENT,
+            resource_id=deployment_id,
+            metadata={
+                "workflow_id": row.get("workflow_id"),
+                "version": row.get("version"),
+                "new_status": "promoted",
+            },
+            request=request,
+        )
+
         # End any running experiments on this endpoint
         if org_id and endpoint_slug:
             await asyncio.to_thread(_end_experiments_on_endpoint_sync, org_id, endpoint_slug, "rollback")
@@ -824,7 +878,7 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
 
 
 @router.delete("/workflow-deployments/{deployment_id}")
-async def delete_deployment(deployment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
+async def delete_deployment(deployment_id: str, request: Request, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a deployment version. Cannot delete the currently promoted (live) deployment."""
     # Was id-only on both the fetch and the DELETE: any org member could
     # destroy any tenant's non-live deployment version.
@@ -833,12 +887,27 @@ async def delete_deployment(deployment_id: str, _user: AuthenticatedUser = Depen
         row = get_deployment_for_org(deployment_id, _user, columns="id, org_id, status")
         if row.get("status") == "promoted":
             raise HTTPException(status_code=400, detail="Cannot delete the currently live deployment. Rollback first.")
-        (
+        _deleted = (
             supabase.table("workflow_deployments")
             .delete()
             .eq("id", deployment_id)
             .eq("org_id", caller_org_id)
             .execute()
+        )
+        # A deployment row IS the served graph for its version. Destroying one
+        # destroys the ability to roll back to it, so the record has to survive
+        # the row.
+        audit.record(
+            audit.DEPLOYMENT_DELETED,
+            principal=_user,
+            resource_type=audit.RESOURCE_DEPLOYMENT,
+            resource_id=deployment_id,
+            metadata={
+                "workflow_id": (_deleted.data or [{}])[0].get("workflow_id"),
+                "version": (_deleted.data or [{}])[0].get("version"),
+                "prior_status": row.get("status"),
+            },
+            request=request,
         )
         return {"ok": True}
     except HTTPException:
@@ -2746,13 +2815,23 @@ def _compute_experiment_results(
 ) -> dict:
     """Compute results from workflow_runs for this experiment. Always includes an entry for each expected_variant_names so UI has control/candidate.
     When org_id is set, also aggregates custom_metrics from api_request_log and merges into variant results.
-    Computes per-metric CIs and significance when two variants are present."""
-    runs = (
+    Computes per-metric CIs and significance when two variants are present.
+
+    `org_id` MUST be the org the caller was verified for (or, on the auto-conclude
+    path, the org read off the already-owned `experiments` row). `workflow_runs`
+    carries `org_id`, so the run aggregation below is filtered by it: an
+    `experiment_id` that ever reached here from an unchecked path can no longer
+    aggregate another tenant's production traffic. Both call sites gate the
+    experiment first, so this is a SECOND layer, not the only one.
+    """
+    runs_q = (
         supabase.table("workflow_runs")
         .select("variant_name, total_latency_ms, total_cost, node_results")
         .eq("experiment_id", experiment_id)
-        .execute()
     )
+    if org_id:
+        runs_q = runs_q.eq("org_id", str(org_id))
+    runs = runs_q.execute()
     from collections import defaultdict
     by_variant = defaultdict(list)
     for r in runs.data or []:
@@ -3499,10 +3578,15 @@ async def get_experiment_timeseries(
         if not since:
             since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
+        # `workflow_runs` carries `org_id`, so the per-bucket aggregation is
+        # filtered by the VERIFIED org and not merely by the experiment id.
+        # The ownership check above already proved this experiment is ours;
+        # this keeps the read itself scoped rather than trusting that proof.
         runs = (
             supabase.table("workflow_runs")
             .select("variant_name, total_latency_ms, total_cost, node_results, created_at")
             .eq("experiment_id", experiment_id)
+            .eq("org_id", verified_org_id(_user))
             .gte("created_at", since)
             .order("created_at", desc=False)
             .execute()
@@ -3630,13 +3714,29 @@ class ConcludeBody(BaseModel):
         extra = "ignore"
 
 
-async def _conclude_experiment_internal(experiment_id: str, row: dict, winner_version: int, reason: str) -> None:
+async def _conclude_experiment_internal(
+    experiment_id: str,
+    row: dict,
+    winner_version: int,
+    reason: str,
+    *,
+    actor_id: Optional[str] = None,
+    request: Any = None,
+) -> None:
     """Shared conclude logic: deactivate routing, promote winner if needed, update experiment.
 
     `row` MUST already have been ownership-checked by the caller (the request
     handlers fetch it doubly scoped, so `row["org_id"]` is the guard's org and
     not an attacker-chosen one). Every statement below is additionally scoped
     to that org so the check and the write are one statement.
+
+    `actor_id`/`request` are for the AUDIT ROW only and never influence a query.
+    They are set on the manual path (`PUT /experiments/{id}/conclude`, where a
+    person pressed the button) and left None on the auto-conclude path, where
+    the decision was the significance test's and there is no human to name.
+    NOTE there is deliberately no `org_id` parameter: the org is read off the
+    already-owned `row`, so a caller cannot file this event under a tenant of
+    their choosing.
     """
     org_id = str(row["org_id"])
     slug = (row.get("endpoint_slug") or "").strip()
@@ -3687,6 +3787,26 @@ async def _conclude_experiment_internal(experiment_id: str, row: dict, winner_ve
                     "promoted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "override_reason": "experiment_conclusion",
                 }).eq("id", new_dep_id).eq("org_id", org_id).execute()
+                # Concluding an experiment INSERTS AND PROMOTES a deployment, so
+                # it is a production change and belongs in the same log as every
+                # other promotion — not buried as a side effect of an experiment
+                # status update. The org is the one on the ownership-checked
+                # `experiments` row the server already holds; on the
+                # auto-conclude path there is no human actor to name.
+                audit.record_server_derived(
+                    audit.DEPLOYMENT_PROMOTED,
+                    org_id=org_id,
+                    derived_from="experiments.org_id",
+                    actor_id=actor_id,
+                    resource_type=audit.RESOURCE_DEPLOYMENT,
+                    resource_id=new_dep_id,
+                    metadata={
+                        "workflow_id": workflow_id,
+                        "version": next_version,
+                        "new_status": "promoted",
+                    },
+                    request=request,
+                )
     update = {
         "status": "concluded",
         "winner_version": winner_version,
@@ -3743,7 +3863,7 @@ async def _maybe_auto_conclude(experiment_id: str) -> None:
 
 
 @router.put("/experiments/{experiment_id}/conclude")
-async def conclude_experiment(experiment_id: str, body: Optional[ConcludeBody] = None, _user: AuthenticatedUser = Depends(require_org_member)):
+async def conclude_experiment(request: Request, experiment_id: str, body: Optional[ConcludeBody] = None, _user: AuthenticatedUser = Depends(require_org_member)):
     """Conclude experiment: set winner, deactivate routing policy. If winner is not latest promoted, create new deployment with winner's graph so it serves 100%."""
     winner_version = body.winner_version if body else None
     if winner_version is None:
@@ -3772,7 +3892,10 @@ async def conclude_experiment(experiment_id: str, body: Optional[ConcludeBody] =
         variant_versions = [int(v["version"]) for v in variants if v.get("version") is not None]
         if winner_version not in variant_versions:
             raise HTTPException(status_code=400, detail=f"Version {winner_version} is not a variant in this experiment")
-        await _conclude_experiment_internal(experiment_id, row, winner_version, "manual")
+        await _conclude_experiment_internal(
+            experiment_id, row, winner_version, "manual",
+            actor_id=_user.user_id, request=request,
+        )
         updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).eq("org_id", caller_org_id).single().execute()
         return _experiment_to_response(updated.data)
     except HTTPException:
@@ -3936,16 +4059,22 @@ async def list_rollback_rules(org_id: str, endpoint_slug: str, _user: Authentica
 @router.get("/rollback-rules/detail/{rule_id}")
 async def get_rollback_rule(rule_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get a single rollback rule by id."""
+    # Mechanism B: `.eq("id", rule_id)` alone, with the org then taken back out
+    # of the fetched row by `_rollback_rule_to_response`. A rollback rule names
+    # the endpoint it guards and the thresholds that trigger it — i.e. the
+    # tenant's production topology and its tolerance for failure.
+    fetch_owned_row("rollback_rules", rule_id, _user, "id, org_id", ROLLBACK_RULE_NOT_FOUND)
     try:
         result = (
             supabase.table("rollback_rules")
             .select(_ROLLBACK_RULE_COLS)
             .eq("id", rule_id)
+            .eq("org_id", verified_org_id(_user))
             .single()
             .execute()
         )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Rollback rule not found")
+            raise HTTPException(status_code=404, detail=ROLLBACK_RULE_NOT_FOUND)
         return _rollback_rule_to_response(result.data)
     except HTTPException:
         raise
@@ -4013,16 +4142,24 @@ async def create_rollback_rule(payload: RollbackRuleCreate, _user: Authenticated
 @router.put("/rollback-rules/{rule_id}")
 async def update_rollback_rule(rule_id: str, payload: RollbackRuleUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update a rollback rule."""
+    # Mechanism B, and the worst of this resource class: the fetch AND the
+    # update were both `.eq("id", rule_id)` alone. `enabled: false` on another
+    # tenant's rule silently disarms the automatic rollback that protects their
+    # live endpoint; rewriting `conditions` can instead make it fire on healthy
+    # traffic. Neither leaves a trace in their UI.
+    caller_org_id = verified_org_id(_user)
+    fetch_owned_row("rollback_rules", rule_id, _user, "id, org_id", ROLLBACK_RULE_NOT_FOUND)
     try:
         result = (
             supabase.table("rollback_rules")
             .select(_ROLLBACK_RULE_COLS)
             .eq("id", rule_id)
+            .eq("org_id", caller_org_id)
             .single()
             .execute()
         )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Rollback rule not found")
+            raise HTTPException(status_code=404, detail=ROLLBACK_RULE_NOT_FOUND)
         update = {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
         if payload.enabled is not None:
             update["enabled"] = payload.enabled
@@ -4034,8 +4171,11 @@ async def update_rollback_rule(rule_id: str, payload: RollbackRuleUpdate, _user:
             supabase.table("rollback_rules")
             .update(update)
             .eq("id", rule_id)
+            .eq("org_id", caller_org_id)
             .execute()
         )
+        if not out.data:
+            raise HTTPException(status_code=404, detail=ROLLBACK_RULE_NOT_FOUND)
         return _rollback_rule_to_response(out.data[0])
     except HTTPException:
         raise
@@ -4046,8 +4186,14 @@ async def update_rollback_rule(rule_id: str, payload: RollbackRuleUpdate, _user:
 @router.delete("/rollback-rules/{rule_id}", status_code=204)
 async def delete_rollback_rule(rule_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a rollback rule."""
+    # Mechanism B: an id-only DELETE. Any member of any org could destroy any
+    # tenant's automatic-rollback protection. The endpoint answers 204 whether
+    # or not a row matched, so scoping the DELETE keeps the response
+    # byte-identical while making the statement a no-op across tenants.
     try:
-        supabase.table("rollback_rules").delete().eq("id", rule_id).execute()
+        supabase.table("rollback_rules").delete().eq("id", rule_id).eq("org_id", verified_org_id(_user)).execute()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4223,6 +4369,27 @@ def _execute_automatic_rollback_sync(rule: dict) -> None:
         "promoted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "override_reason": "automatic_rollback",
     }).eq("id", new_dep_id).execute()
+    # THE MACHINE PATH INTO PRODUCTION. No human is on the request — the monitor
+    # cycle decided this — so there is no `AuthenticatedUser` and `actor_id` is
+    # NULL. The org is the one the SERVER read off the `rollback_rules` row it
+    # was handed, never anything a client sent, which is what `derived_from`
+    # records for a reviewer. Without this row, "why did our live version change
+    # at 03:00" has no answer at all.
+    audit.record_server_derived(
+        audit.DEPLOYMENT_ROLLED_BACK,
+        org_id=org_id,
+        derived_from="rollback_rules.org_id",
+        resource_type=audit.RESOURCE_DEPLOYMENT,
+        resource_id=new_dep_id,
+        metadata={
+            "workflow_id": workflow_id,
+            "version": next_version,
+            "new_status": "promoted",
+            # The deployment this one displaced, so "what was live before" is
+            # answerable from the same row.
+            "deployment_id": str(current.get("id") or ""),
+        },
+    )
     # Deactivate any active routing policy for this endpoint
     policies = (
         supabase.table("routing_policies")
@@ -4307,7 +4474,19 @@ async def trigger_rollback_monitor(org_id: Optional[str] = None, _user: Authenti
     NOT machine-callable; the scheduler in background_jobs.py runs this loop on a
     timer, and POST /control-loop/run is the service-key path for external cron.
     """
-    summary = await run_rollback_monitor_cycle(org_id=org_id)
+    # UNSCOPED FAN-OUT, closed here. `org_id` is an Optional QUERY parameter and
+    # `run_rollback_monitor_cycle(org_id=None)` evaluates and executes rollback
+    # rules for EVERY organization. The guard accepts an org supplied in any one
+    # source, so satisfying it with `X-Org-Id` alone left this parameter None and
+    # a single ordinary member of a single org could force a rollback sweep
+    # across every tenant on the platform. It is not the Mechanism-A divergence
+    # either: absence is not a conflicting value, so the guard could not see it.
+    #
+    # The cycle now runs for the org the guard actually verified, and only that
+    # org. The all-orgs sweep remains where it belongs — the in-process
+    # scheduler in background_jobs.py and the service-key cron path — neither of
+    # which comes through this handler.
+    summary = await run_rollback_monitor_cycle(org_id=verified_org_id(_user))
     return summary
 
 
