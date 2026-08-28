@@ -1092,54 +1092,21 @@ def _debug_logging_enabled() -> bool:
     return os.environ.get("OPTIML_DEBUG", "false").lower() == "true"
 
 
-@app.get("/debug/api-keys")
-def debug_api_keys():
-    """Debug endpoint to check API keys and database connectivity.
-    Only available when OPTIML_DEBUG=true. Disabled in production by default.
-    """
-    import os
-    if os.environ.get("OPTIML_DEBUG", "false").lower() != "true":
-        raise HTTPException(status_code=404, detail="Not Found")
-    try:
-        # Check if supabase is connected
-        if not supabase:
-            return {"error": "Supabase client not initialized"}
-        
-        # Get all service API keys (don't select api_key column for security)
-        key_result = supabase.table("service_api_keys").select("id, org_id, created_at").execute()
-        
-        # Get all prompt templates
-        prompt_result = supabase.table("prompt_templates").select("id, org_id, prompt, provider, model, name, project_id, created_at").limit(5).execute()
-        
-        return {
-            "status": "success",
-            "supabase_connected": True,
-            "service_api_keys_count": len(key_result.data) if key_result.data else 0,
-            "prompt_templates_count": len(prompt_result.data) if prompt_result.data else 0,
-            "sample_api_keys": [
-                {
-                    "id": key["id"],
-                    "org_id": key.get("org_id"),
-                    "created_at": key.get("created_at"),
-                    "api_key_preview": "***encrypted***"
-                }
-                for key in (key_result.data or [])[:3]
-            ],
-            "sample_prompts": [
-                {
-                    "id": prompt["id"],
-                    "name": prompt["name"],
-                    "user_id": prompt["user_id"],
-                    "org_id": prompt["org_id"]
-                }
-                for prompt in (prompt_result.data or [])[:3]
-            ]
-        }
-    except Exception as e:
-        return {
-            "error": str(e),
-            "supabase_connected": False
-        }
+# REMOVED: `GET /debug/api-keys`.
+# It had NO authentication dependency. It was gated only by OPTIML_DEBUG=true,
+# and a configuration flag is not an authorization boundary: flipping one
+# environment variable turned it into an unauthenticated, cross-tenant metadata
+# endpoint returning service_api_keys ids and org_ids for EVERY organization,
+# plus prompt-template ids, names and org_ids. It selected the `prompt` text
+# column into memory as well, though it did not return it.
+#
+# The ids it handed out were exactly the input DELETE /delete-service-api-key
+# accepted, which until this release deleted by key_id alone — an unauthenticated
+# listing feeding an authenticated cross-tenant destructive write.
+#
+# Deleted rather than protected. The diagnostics it offered (is Supabase
+# reachable, how many rows exist) are a local/admin script's job, not a route on
+# the production API surface. Do not reintroduce it behind an env var.
 
 # ============================================================================
 # Observability Endpoints
