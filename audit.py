@@ -149,6 +149,17 @@ ORGANIZATION_UPDATED = "organization.updated"
 RECOMMENDATION_ACCEPTED = "optimization_recommendation.accepted"
 RECOMMENDATION_REJECTED = "optimization_recommendation.rejected"
 
+# Webhook triggers (a customer-controlled egress path into their own systems,
+# authenticated by a signing secret this table stores). Creating one opens that
+# path; rotating the secret changes who can drive it; deleting one closes it.
+WEBHOOK_CREATED = "webhook_trigger.created"
+WEBHOOK_UPDATED = "webhook_trigger.updated"
+WEBHOOK_SECRET_ROTATED = "webhook_trigger.secret_rotated"
+WEBHOOK_DELETED = "webhook_trigger.deleted"
+WEBHOOK_CREATE_REFUSED = "webhook_trigger.create.refused"
+WEBHOOK_UPDATE_REFUSED = "webhook_trigger.update.refused"
+WEBHOOK_DELETE_REFUSED = "webhook_trigger.delete.refused"
+
 # Deployments
 DEPLOYMENT_PROMOTED = "workflow_deployment.promoted"
 DEPLOYMENT_ACTIVATED = "workflow_deployment.activated"
@@ -188,6 +199,13 @@ ACTIONS = frozenset({
     DEPLOYMENT_ACTIVATED,
     DEPLOYMENT_ROLLED_BACK,
     DEPLOYMENT_DELETED,
+    WEBHOOK_CREATED,
+    WEBHOOK_UPDATED,
+    WEBHOOK_SECRET_ROTATED,
+    WEBHOOK_DELETED,
+    WEBHOOK_CREATE_REFUSED,
+    WEBHOOK_UPDATE_REFUSED,
+    WEBHOOK_DELETE_REFUSED,
 })
 
 #: Actions that record a DENIED attempt. `record()` stamps outcome=refused for
@@ -200,6 +218,9 @@ REFUSAL_ACTIONS = frozenset({
     ORG_SECRET_UPDATE_REFUSED,
     ORG_SECRET_DELETE_REFUSED,
     MEMBER_REMOVE_REFUSED,
+    WEBHOOK_CREATE_REFUSED,
+    WEBHOOK_UPDATE_REFUSED,
+    WEBHOOK_DELETE_REFUSED,
 })
 
 
@@ -213,6 +234,7 @@ RESOURCE_ORG_MEMBER = "organization_member"
 RESOURCE_ORGANIZATION = "organization"
 RESOURCE_RECOMMENDATION = "optimization_recommendation"
 RESOURCE_DEPLOYMENT = "workflow_deployment"
+RESOURCE_WEBHOOK_TRIGGER = "webhook_trigger"
 
 
 # ─── Refusal reason codes ────────────────────────────────────────────────────
