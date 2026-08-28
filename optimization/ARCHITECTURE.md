@@ -568,6 +568,18 @@ coverage 64% — $81k/month assessable, $46k/month awaiting sufficient evidence
 - Lifecycle state machine with audit trail; `accept` creates a real candidate
   deployment reusing `workflow_deployments`.
 - Summary with real numbers, three coverage figures, and explicit nulls.
+- **Two optimization dimensions**, not one:
+  - **Model substitution** — `AlternateModelGenerator`, `CheaperMeasuredModelGenerator`.
+  - **Context efficiency** (`context_reduction`) — `ContextReductionGenerator`,
+    on the existing `prompt` and `context_length` dimensions. Model, provider,
+    sampling parameters, tools and output contract are held fixed and the
+    invariance is asserted on the applied graphs, not assumed. Token savings are
+    measured by `optimization.context_accounting`: text rewrites via
+    `count_tokens` on the exact before/after string, budget changes via
+    `profile_strategy_context`, which re-profiles the candidate through the same
+    function and the same tokenizer that produced the baseline. Never derived
+    from character counts — chars-per-token varies with exactly the content
+    being cut. A variant that cannot be measured is excluded, not benchmarked.
 
 ### Documented extension points (each refuses rather than fabricates)
 - **`temperature` / `max_tokens` / `top_p`** — applicability is **per surface**,
@@ -581,8 +593,6 @@ coverage 64% — $81k/month assessable, $46k/month awaiting sufficient evidence
 - **`caching`, `reasoning_effort`, `retrieval`, `reranking`** — no mechanism
   exists in `workflow_runtime` / `context_runtime`. Listed in
   `UNSUPPORTED_DIMENSIONS` with the reason.
-- **`PromptCompressionGenerator`** — needs a per-component token breakdown and a
-  quality signal able to detect tail degradation. Raises.
 - **`CallCountReductionGenerator`** — needs per-step outcome attribution and an
   executable software executor. Raises.
 - **`discover_learned_workloads`** — needs input embeddings, a stability

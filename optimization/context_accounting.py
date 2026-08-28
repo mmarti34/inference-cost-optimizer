@@ -645,6 +645,92 @@ def _select_node(graph: dict, step_id: Optional[str]) -> Optional[dict]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def count_tokens(text: Optional[str], *, tokenizer: Optional[str] = None) -> Optional[int]:
+    """
+    Tokens in `text` under a NAMED encoding, or None.
+
+    `tokenizer` is an encoding name as reported by `ContextProfile.tokenizer`
+    (e.g. "o200k_base"), so a before/after pair is counted the same way the
+    baseline profile was. Passing None returns None: without knowing which
+    tokenizer produced the number it is being compared against, a count is not
+    a comparable measurement.
+
+    None also means None on the way out — never a character-derived estimate.
+    Chars-per-token varies with exactly the content being cut, so an estimate
+    here would be wrong in the direction that flatters the recommendation.
+    """
+    if text is None or not tokenizer:
+        return None
+    try:
+        import tiktoken
+    except Exception:
+        logger.info("tiktoken unavailable; count_tokens returning None")
+        return None
+    try:
+        enc = tiktoken.get_encoding(str(tokenizer))
+    except Exception as exc:
+        logger.info("Unknown encoding %r: %s", tokenizer, type(exc).__name__)
+        return None
+    return _count(enc, text)
+
+
+def profile_strategy_context(
+    org_id: str,
+    workload: dict,
+    strategy: Any,
+    *,
+    cases: list[dict],
+    step_id: Optional[str] = None,
+) -> Optional[ContextProfile]:
+    """
+    Profile a CANDIDATE strategy's context, comparably to the baseline.
+
+    A budget change (contextConfig.packaging.maxChars) does not produce text
+    the caller holds — the runtime assembles it at execution time. So the only
+    honest way to measure what the candidate would send is to apply the
+    strategy to the same graph and decompose the result through the same code
+    path, with the same tokenizer, over the same cases.
+
+    That is what this does: identical to `profile_workload_context` except the
+    graph is transformed first. Both profiles therefore describe strings built
+    by the runtime's own assembly, and their totals are subtractable.
+
+    Returns None when the strategy cannot be applied to the graph. An
+    unapplicable strategy is not a zero-saving candidate; it is a candidate
+    that was never measured, and the caller must treat it that way.
+    """
+    if not cases or strategy is None:
+        return None
+
+    graph = _load_workload_graph(org_id, workload)
+    if not graph:
+        return None
+
+    from optimization import strategy as strategy_mod
+
+    try:
+        graph = strategy_mod.apply_to_graph(graph, strategy)
+    except (strategy_mod.UnsupportedDimension, strategy_mod.StrategyApplyError) as exc:
+        logger.info(
+            "Candidate strategy not applicable to graph: %s: %s",
+            type(exc).__name__, exc,
+        )
+        return None
+
+    return _profile_graph(org_id, workload, graph, cases=cases, step_id=step_id)
+
+
+def _load_workload_graph(org_id: str, workload: dict) -> Optional[dict]:
+    """The graph behind a workload, or None when it has none (direct inference)."""
+    from optimization import workloads as workloads_mod
+
+    workflow_id = workloads_mod.resolve_workflow_id(org_id, workload)
+    if not workflow_id:
+        # Direct-inference workloads have no graph. Nothing to decompose here.
+        return None
+    return _load_graph(org_id, workload, workflow_id)
+
+
 def profile_workload_context(
     org_id: str,
     workload: dict,
@@ -670,17 +756,27 @@ def profile_workload_context(
     if not cases:
         return None
 
-    from optimization import workloads as workloads_mod
-
-    workflow_id = workloads_mod.resolve_workflow_id(org_id, workload)
-    if not workflow_id:
-        # Direct-inference workloads have no graph. Nothing to decompose here.
-        return None
-
-    graph = _load_graph(org_id, workload, workflow_id)
+    graph = _load_workload_graph(org_id, workload)
     if not graph:
         return None
 
+    return _profile_graph(org_id, workload, graph, cases=cases, step_id=step_id)
+
+
+def _profile_graph(
+    org_id: str,
+    workload: dict,
+    graph: dict,
+    *,
+    cases: list[dict],
+    step_id: Optional[str] = None,
+) -> Optional[ContextProfile]:
+    """
+    The decomposition proper, over an already-loaded graph.
+
+    Shared by the baseline and candidate entry points so that a candidate is
+    never measured by a different method than the thing it is compared to.
+    """
     node = _select_node(graph, step_id)
     if node is None:
         return None

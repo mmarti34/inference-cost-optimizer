@@ -1866,13 +1866,17 @@ def _dispositions(
 
     # Where each exclusion code exits the funnel. The preflight codes come from
     # optimization.eligibility, which owns that mapping so the two cannot drift.
+    #
+    # Generator-side codes come from domain.EXCLUSION_CODE_TO_DISPOSITION, which
+    # is the single source of truth for that half. They were listed here by hand
+    # once; every new code — the context_reduction family included — would then
+    # have needed adding in two places, and a code missing from this dict fell
+    # back to DISPOSITION_INCOMPATIBLE, quietly filing it under the wrong exit.
+    # build_funnel re-derives the disposition anyway, so a mismatch here was
+    # invisible rather than loud.
     drop_stage = {
         **eligibility_mod.CODE_TO_DISPOSITION,
-        "strategy_not_applicable": domain.DISPOSITION_INCOMPATIBLE,
-        "provider_not_permitted": domain.DISPOSITION_POLICY_BLOCKED,
-        "provider_not_configured": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
-        "duplicate_strategy": domain.DISPOSITION_DUPLICATE,
-        "generator_error": domain.DISPOSITION_GENERATOR_ERROR,
+        **domain.EXCLUSION_CODE_TO_DISPOSITION,
     }
     for d in (generation.get("dropped") or []):
         code = d.get("code")
