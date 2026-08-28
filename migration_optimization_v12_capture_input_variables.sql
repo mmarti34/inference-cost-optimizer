@@ -1,0 +1,256 @@
+-- ============================================================================
+-- Migration: OptiML optimization layer v12 — PRODUCTION INPUT VARIABLES ARE
+--            CAPTURED, so variable-driven traffic can become evidence.
+--
+-- RUN AFTER: migration_optimization_v11_context_reduction_vocabulary.sql
+--
+-- *** NOT APPLIED, AND NOT RUN BY THE AGENT THAT WROTE IT. ***
+-- The agent executed no SQL of any kind: no DDL, no DML, no SELECT, no
+-- migration tool. Apply this by hand after review.
+--
+-- IDEMPOTENT BY CONSTRUCTION. Two `ADD COLUMN IF NOT EXISTS` and four
+-- `COMMENT ON`. There is no RENAME, no DROP, no CREATE TABLE, no INSERT, no
+-- UPDATE and no DELETE. Re-running it is a no-op. Both columns are NULLABLE
+-- with no default, so adding them rewrites no rows, takes only a brief
+-- ACCESS EXCLUSIVE lock on the catalog entry, and leaves every existing row
+-- reading exactly as it did before: NULL.
+--
+-- NO VIEW IS TOUCHED. `public.attempts` reads `public.workflow_runs`, but it
+-- names its columns explicitly (wr.id, wr.org_id, wr.node_results, …) and
+-- neither of the new columns appears in it. Adding a column to a base table
+-- does not retype or reorder a view's output, so the `DROP VIEW IF EXISTS`
+-- dance that migration_optimization_v3 and v6 needed — CREATE OR REPLACE VIEW
+-- cannot change a view's column names, types or ordering — does not apply.
+-- Nothing here re-creates the view, so there is no window in which it is
+-- missing.
+--
+-- ORDERING RELATIVE TO THE CODE: APPLY THIS MIGRATION FIRST.
+-- Unlike v10 and v11, this migration is NOT order-independent. The accompanying
+-- code WRITES both new columns on every workflow_runs insert. If the code ships
+-- first, PostgREST rejects the insert with "column does not exist" — and while
+-- every insert site already swallows its own exception (so no customer request
+-- would fail), the run itself would not be recorded at all, which would lose
+-- observability. Apply the DDL, confirm both columns exist, then deploy.
+--
+-- HISTORY IS PRESERVED, EXACTLY. Not one existing row is read or written:
+--   policy v1  benchmark      88813bfb-5581-45a0-abf6-884732a0b19b
+--              recommendation 41d79006-bc14-4180-9d3d-97e71d6a2809
+--   policy v2  benchmark      4d5ca24d-93b6-4b8a-a4e7-1c5fcba9fec7
+--              recommendation 25eabede-0261-4b42-9882-c01c850d54f1
+--              (the first verified win)
+--   second win benchmark      fb723f70-b53d-4e5e-be2c-91d67b688eb0
+--              (gpt-4o -> gpt-4.1, -20.0% cost, quality 0.9643 -> 0.9714)
+--
+-- NOTHING HERE WEAKENS AUTH, RLS OR ORG ISOLATION. No policy, function, grant,
+-- role or view is created, altered or dropped. A new column on an existing
+-- table is covered by exactly the policies already attached to that table:
+-- RLS in PostgreSQL is enforced per ROW, not per column, so the new columns
+-- inherit `workflow_runs`' posture with no policy change and no way to widen it.
+--
+-- READ THIS BEFORE APPLYING — the posture being inherited is weaker than the
+-- repository average, and that is precisely why these columns are redacted at
+-- WRITE time rather than on read:
+--
+--   * migration_enable_rls.sql runs `ALTER TABLE public.workflow_runs ENABLE
+--     ROW LEVEL SECURITY;` and relies on the pre-existing policies "Members can
+--     create runs" / "Members can view org runs".
+--   * migration_workflow_runs_eval_mode.sql then runs
+--     `ALTER TABLE workflow_runs DISABLE ROW LEVEL SECURITY;`
+--     as a "belt-and-suspenders" measure, on the reasoning that the backend
+--     uses the service-role key and bypasses RLS anyway.
+--
+-- Which of the two is currently in force is a property of the database, not of
+-- this repository, and this migration does not assume an answer, does not
+-- change it, and must not be read as endorsing either. VERIFY IT before
+-- applying, with the read-only query in the VERIFICATION section below. If RLS
+-- is in fact disabled, then org isolation for this table rests entirely on the
+-- API layer, and every byte written into `variables` is a byte protected only
+-- by that layer — which is the argument for the redaction module, not against
+-- the column.
+--
+--
+-- ── WHAT WAS WRONG ──────────────────────────────────────────────────────────
+--
+-- `workflow_runs` had `input_text` and no `variables`. A workflow whose input
+-- is a set of NAMED VARIABLES therefore recorded nothing about its inputs.
+--
+-- Measured in production before this change:
+--
+--     "Review Summary"  — five variables (artist, venue, review_count,
+--                         reviews, date)
+--                       — 358 production runs
+--                       — 0 stored inputs
+--
+--     all production traffic, all time
+--                       — 685 runs carrying any input
+--                       — 169 distinct inputs
+--
+-- The asymmetry is the bug, and it is a one-sided one. `golden_inputs` ALREADY
+-- has `variables`, `source` and `source_run_id`; replay already accepts
+-- variables; the production-derived-case bridge was designed and built. Only
+-- the capture half was missing, so the consumer waits on data the producer
+-- never wrote. Every day this stands is another day of traffic that cannot be
+-- recovered into eval cases, and it cannot be backfilled: the values were never
+-- anywhere but in memory.
+--
+-- A partial exception worth knowing about, because it explains why the count is
+-- 685 and not 0: workflow_runtime.execute_workflow contains
+--
+--     if variables and input_text == "" and input_node_id:
+--         input_text = json.dumps(variables)
+--
+-- so a variable-driven workflow that ALSO has an Input node and was called with
+-- input_text exactly "" has been storing its variables as an untyped, unredacted
+-- JSON string in `input_text`. That is not capture — it is a side effect with
+-- three preconditions, it loses the mapping's identity as a mapping, and it
+-- applies no redaction whatsoever. This migration does not change that
+-- behaviour (existing rows and replay depend on `input_text` as it stands); it
+-- is recorded here because the new `variables` column is the typed, redacted,
+-- unconditional replacement for it, and because that path is a standing PII
+-- exposure that should be addressed on its own terms.
+--
+--
+-- ── WHY REDACTION IS PART OF THE SCHEMA, NOT A LATER FEATURE ────────────────
+--
+-- Capturing real customer input means capturing whatever the customer put in
+-- it. `evidence_redaction.py` redacts at WRITE time — before the value reaches
+-- this table — because a value that is never written cannot leak, cannot be
+-- exported, and cannot be reached by whatever the RLS posture above turns out
+-- to be.
+--
+-- Redaction is therefore LOSSY BY DESIGN, and that loss must be VISIBLE. A case
+-- with redacted fields may not reproduce the original behaviour on replay. If
+-- the curation step downstream cannot see which fields were changed, it will
+-- eventually discover it as an unexplained replay divergence and mistrust the
+-- whole dataset. `variables_capture` exists so that never happens: it is the
+-- provenance record that travels with the value.
+-- ============================================================================
+
+
+-- ── The columns ─────────────────────────────────────────────────────────────
+--
+-- Both NULLABLE with NO DEFAULT. NULL is the honest value for every row that
+-- existed before this migration and for every run whose variables could not be
+-- captured. An empty object `{}` is never written to mean "we do not know":
+-- absent, empty and unavailable are three distinct states, and all three are
+-- named in `variables_capture.status`.
+
+ALTER TABLE public.workflow_runs
+  ADD COLUMN IF NOT EXISTS variables JSONB;
+
+ALTER TABLE public.workflow_runs
+  ADD COLUMN IF NOT EXISTS variables_capture JSONB;
+
+
+-- ── What the columns mean ───────────────────────────────────────────────────
+
+COMMENT ON COLUMN public.workflow_runs.variables IS
+  'The named input variables that drove this run, REDACTED AT WRITE TIME by evidence_redaction.py before insert. Structure-preserving: keys, nesting and types survive; only sensitive VALUES are replaced, each by a marker naming what was removed ("[redacted:email]", "[redacted:phone]", "[redacted:payment_card]", "[redacted:national_id]", "[redacted:credential]"). String values longer than 5000 characters are truncated with an explicit "[truncated:N chars]" suffix, matching the input_text[:5000] convention on this table. NULL means NO VARIABLES ARE STORED, and variables_capture.status says which of the reasons applies — it is NEVER a silent stand-in for an empty mapping, and `{}` is never written to mean "we do not know". Capture is best-effort by construction: every insert site computes this inside its own exception guard, so a redaction or serialisation failure yields NULL with a recorded reason and the run still inserts. It can never turn into a customer-facing error. NOT BACKFILLABLE: rows created before this migration are NULL forever, because those values only ever existed in process memory.';
+
+COMMENT ON COLUMN public.workflow_runs.variables_capture IS
+  'Provenance for the `variables` column — how it was obtained and what was done to it. WITHOUT THIS, REDACTION WOULD BE SILENT, and a curated eval case that no longer reproduces the original behaviour would look like a mystery instead of a known, recorded modification. Shape: {status, reason?, redacted, truncated, key_count?, redaction_version, redactions?, redacted_paths?, redacted_kinds?, type_changed?, truncations?, truncated_paths?}. `status` vocabulary, all four disjoint: captured = variables is populated; absent = the caller supplied no variables at all (an input_text-driven workflow); empty = the caller supplied a mapping with zero keys, which is a real observation and NOT the same as absent; unavailable = capture was attempted and did not produce a usable value, with `reason` giving the code (capture_failed, oversize, variables_not_a_mapping, not_captured_at_this_call_site). Only `captured` has a non-NULL `variables`. `redactions` lists one entry per modified location as {path, kinds} using dotted/indexed paths ("customer.email", "reviews[3]"), so a reader can tell EXACTLY which fields differ from what production actually ran. `type_changed` is true when a redaction altered a value''s JSON type — the one case is a numeric value that passed the Luhn checksum and an issuer-prefix check and so became a marker string. `redaction_version` identifies the ruleset that produced the row, so a later ruleset change does not silently reinterpret old rows. Structured codes and measured facts ONLY — no customer-facing prose; the frontend owns all wording.';
+
+
+-- ── How the redaction decides, recorded where the reader will look ─────────
+--
+-- Not a comment on these columns, but the reason a reader can trust them. The
+-- patterns are deliberately strict rather than greedy, because an over-eager
+-- redactor destroys far more evidence than it protects:
+--
+--   payment_card  A digit run is redacted only if it passes the LUHN checksum
+--                 AND carries a recognised issuer prefix (Visa / Mastercard /
+--                 Amex / Discover / JCB / Diners / UnionPay / Maestro, with the
+--                 length each scheme actually uses). "any 16 digits" would eat
+--                 order numbers and account references; a same-length order
+--                 number fails Luhn about nine times in ten and fails the
+--                 prefix test besides.
+--   phone         Matched in E.164 form (explicit leading +, 8-15 digits), or
+--                 in an explicitly GROUPED national form requiring real
+--                 separators, or when the KEY says the value is a phone number.
+--                 A bare run of digits with no separators and no key evidence
+--                 is NOT a phone number: a 13-digit millisecond timestamp, a
+--                 version string like 2.10.4, an IPv4 address and an ISO date
+--                 all survive untouched.
+--   national_id   US SSN in punctuated form with the administratively invalid
+--                 ranges (000/666/9xx area, 00 group, 0000 serial) excluded;
+--                 UK NINO by its letter/digit structure; anything else only
+--                 when the key names it.
+--   email         Local part + domain + a 2-24 letter TLD.
+--   credential    PEM private-key blocks (including unterminated ones), JWTs,
+--                 Bearer/Basic authorization values, and the documented key
+--                 prefixes of the major providers (sk-, sk-ant-, AKIA/ASIA,
+--                 gh[pousr]_, github_pat_, xox*-, AIza, SG., stripe live/test,
+--                 glpat-, npm_, hf_, dop_v1_, shpat_, ya29.). Plus a whole-value
+--                 rule when the KEY names a secret, and a narrow entropy rule
+--                 for one whitespace-free 24-256 character token carrying upper
+--                 case, lower case and digits — which prose, a lowercase slug, a
+--                 UUID and a base64 image payload all fail by construction.
+--                 `token` alone is NOT treated as a secret key name, so
+--                 max_tokens and token_count are not redacted into uselessness.
+--
+-- Where the two errors are genuinely balanced, it redacts: a false positive
+-- costs one replay case, a false negative writes a customer's PII into this
+-- table.
+
+
+-- ── VERIFICATION (read-only; run these by hand, they change nothing) ────────
+--
+-- 1. Both columns exist, are jsonb, and are nullable:
+--
+--    SELECT column_name, data_type, is_nullable, column_default
+--      FROM information_schema.columns
+--     WHERE table_schema = 'public' AND table_name = 'workflow_runs'
+--       AND column_name IN ('variables', 'variables_capture');
+--
+-- 2. The actual RLS posture of this table, and the policies attached to it —
+--    resolving the enable/disable question raised in the header:
+--
+--    SELECT relname, relrowsecurity, relforcerowsecurity
+--      FROM pg_class WHERE oid = 'public.workflow_runs'::regclass;
+--
+--    SELECT polname, polcmd, pg_get_expr(polqual, polrelid) AS using_expr
+--      FROM pg_policy WHERE polrelid = 'public.workflow_runs'::regclass;
+--
+-- 3. The attempts view is unchanged and still valid:
+--
+--    SELECT COUNT(*) FROM public.attempts;
+--
+-- 4. After deploying the code, capture is actually happening — and the
+--    breakdown by status distinguishes "captured" from the three ways of
+--    having nothing, which is the whole point of the second column:
+--
+--    SELECT variables_capture->>'status' AS status,
+--           variables_capture->>'reason' AS reason,
+--           COUNT(*)
+--      FROM public.workflow_runs
+--     WHERE created_at > now() - interval '1 day'
+--     GROUP BY 1, 2 ORDER BY 3 DESC;
+--
+-- 5. How much of the captured evidence carries redactions, which is the number
+--    that tells curation how much of the dataset may not replay faithfully:
+--
+--    SELECT (variables_capture->>'redacted')::boolean AS redacted, COUNT(*)
+--      FROM public.workflow_runs
+--     WHERE variables IS NOT NULL
+--     GROUP BY 1;
+
+
+-- ── NOT DONE HERE, AND DELIBERATELY SO ─────────────────────────────────────
+--
+-- No index is created. Nothing queries `variables` by content yet, and a GIN
+-- index on a column that is about to start filling with every production run
+-- would be paid for on every insert before a single reader existed. Add one
+-- when a query needs it.
+--
+-- No column is added to `golden_inputs`, and
+-- workflow_management.import_golden_input_from_production still hard-codes
+-- `"variables": None`. That endpoint is the consumer side of this bridge, and
+-- once these columns are populated it should carry both of them forward —
+-- which needs one more additive column on `golden_inputs` to hold the capture
+-- record, so that a curated case shows its redactions rather than hiding them.
+-- That is a separate change with its own review, and it is listed here so it
+-- is not lost: capture without it still writes the evidence, it just is not
+-- promoted automatically yet.
+--
+-- Nothing is backfilled. There is nothing to backfill from.
+-- ============================================================================

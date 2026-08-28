@@ -25,6 +25,7 @@ from workflow_runtime import (
     _entry_point_ids,
     _execute_tool,
 )
+from evidence_redaction import capture_variables
 from context_runtime import resolve_node_context, build_context_trace
 
 
@@ -41,8 +42,15 @@ def _insert_workflow_run_linear(
     experiment_id: str | None = None,
     variant_name: str | None = None,
     served_version: int | None = None,
+    variables: dict[str, Any] | None = None,
+    variables_supplied: bool = False,
 ) -> str | None:
-    """Insert a workflow run for the linear streaming path so /usage and observability see it."""
+    """Insert a workflow run for the linear streaming path so /usage and observability see it.
+
+    `variables_supplied` distinguishes "this call site does not know the run's
+    variables" from "the run genuinely had none", so an un-wired caller can
+    never be misread as a run without inputs.
+    """
     if not workflow_id:
         return None
     try:
@@ -59,6 +67,26 @@ def _insert_workflow_run_linear(
             "version": version,
             "execution_mode": "production",
         }
+        # Evidence capture, best-effort: never allowed to break the stream.
+        try:
+            if variables_supplied:
+                _vars_value, _vars_capture = capture_variables(variables)
+            else:
+                _vars_value, _vars_capture = None, {
+                    "status": "unavailable",
+                    "reason": "not_captured_at_this_call_site",
+                    "redacted": False,
+                    "truncated": False,
+                }
+        except BaseException:  # noqa: BLE001
+            _vars_value, _vars_capture = None, {
+                "status": "unavailable",
+                "reason": "capture_failed",
+                "redacted": False,
+                "truncated": False,
+            }
+        row["variables"] = _vars_value
+        row["variables_capture"] = _vars_capture
         if experiment_id is not None:
             row["experiment_id"] = experiment_id
         if variant_name is not None:
@@ -225,6 +253,9 @@ async def stream_workflow_async(
     Async generator yielding SSE payloads: step_start, token (for streamable AI step), step_end, done, then data: [DONE].
     For linear workflows with one OpenAI AI step, streams tokens; otherwise runs execute_workflow in a thread.
     """
+    # Read before the `or {}` normalisation so "no variables supplied" and
+    # "empty object supplied" stay distinguishable for evidence capture.
+    _raw_variables = variables
     variables = variables or {}
     nodes_by_id = _nodes_by_id(graph_json)
     edges_out = _edges_out(graph_json)
@@ -628,6 +659,8 @@ async def stream_workflow_async(
                         experiment_id=experiment_id,
                         variant_name=variant_name,
                         served_version=served_version,
+                        variables=_raw_variables,
+                        variables_supplied=True,
                     )
                     yield _sse_event("done", {
                         "request_id": request_id, "served_version": served_version,

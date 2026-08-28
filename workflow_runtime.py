@@ -31,6 +31,7 @@ from model_target import ModelTarget
 from provider_resilience import call_with_resilience
 from context_runtime import resolve_node_context, build_context_trace
 from context_embeddings import search_similar as _search_kb
+from evidence_redaction import capture_variables
 # SM v1 prompt injection removed — v2 compresses context sources instead
 # (prompt_assembler.py still used by the /synthetic-mind/stats dashboard)
 
@@ -1393,6 +1394,40 @@ def execute_workflow(
     last_content_type: str = "text"
 
     queue: list[tuple[str, str | None]] = [(nid, None) for nid in entry_points]
+
+    # ── Evidence capture: the named inputs that actually drove this run ─────
+    # `workflow_runs` stored `input_text` and nothing else, so a workflow driven
+    # by named variables recorded NOTHING about its inputs and none of its
+    # traffic could ever become an evaluation case. Capture is redacted at write
+    # time (evidence_redaction) and is BEST-EFFORT AND TOTAL: it can never turn
+    # into a customer-facing failure. `_raw_variables` is read before the
+    # `or {}` normalisation below so that "caller sent nothing" and "caller sent
+    # an empty object" stay distinguishable instead of collapsing into `{}`.
+    _raw_variables = variables
+    _capture_cache: dict[str, tuple[Any, dict[str, Any]]] = {}
+
+    def _capture_variables_once() -> tuple[Any, dict[str, Any]]:
+        """Redact + summarise the run's variables, at most once, never raising."""
+        if "v" not in _capture_cache:
+            try:
+                _capture_cache["v"] = capture_variables(_raw_variables)
+            except BaseException as _cap_err:  # noqa: BLE001 — see above
+                _logger.warning(
+                    "evidence capture failed (%s); recording variables as unavailable",
+                    type(_cap_err).__name__,
+                )
+                _capture_cache["v"] = (
+                    None,
+                    {
+                        "status": "unavailable",
+                        "reason": "capture_failed",
+                        "error_type": type(_cap_err).__name__,
+                        "redacted": False,
+                        "truncated": False,
+                    },
+                )
+        return _capture_cache["v"]
+
     variables = variables or {}
 
     # Track what's currently executing so we can record it in error node_results
@@ -2560,6 +2595,9 @@ def execute_workflow(
                         "version": version,
                         "execution_mode": mode,
                     }
+                    _vars_value, _vars_capture = _capture_variables_once()
+                    row["variables"] = _vars_value
+                    row["variables_capture"] = _vars_capture
                     if experiment_id is not None:
                         row["experiment_id"] = experiment_id
                     if variant_name is not None:
@@ -2631,6 +2669,12 @@ def execute_workflow(
                     "version": version,
                     "execution_mode": _mode,
                 }
+                # Failing inputs are exactly the edge cases an evaluation set
+                # needs most, so the error paths capture no less than the
+                # success path does.
+                _fail_vars_value, _fail_vars_capture = _capture_variables_once()
+                _fail_row["variables"] = _fail_vars_value
+                _fail_row["variables_capture"] = _fail_vars_capture
                 if experiment_id is not None:
                     _fail_row["experiment_id"] = experiment_id
                 if variant_name is not None:
@@ -2699,6 +2743,9 @@ def execute_workflow(
                     "version": version,
                     "execution_mode": _mode_g,
                 }
+                _g_vars_value, _g_vars_capture = _capture_variables_once()
+                _fail_row_g["variables"] = _g_vars_value
+                _fail_row_g["variables_capture"] = _g_vars_capture
                 if experiment_id is not None:
                     _fail_row_g["experiment_id"] = experiment_id
                 if variant_name is not None:
