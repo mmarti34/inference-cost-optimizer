@@ -10,6 +10,13 @@ from supabase_client import supabase
 
 _COLS = "id, workflow_id, project_id, org_id, version, endpoint_slug, graph_json, created_at"
 
+#: The single detail returned when no promoted deployment matches.
+#: Every resolver miss uses this exact string, and routers/openai_compat.py
+#: imports it so its tenant-boundary rejection is byte-identical to an ordinary
+#: miss. A caller must not be able to tell "no such deployment anywhere" from
+#: "a deployment that is not yours".
+NO_PROMOTED_DEPLOYMENT_DETAIL = "No promoted deployment found."
+
 
 def _get_promoted_deployment_sync(org_id: str, endpoint_slug: str, version: int) -> Optional[dict]:
     result = (
@@ -184,7 +191,7 @@ async def resolve_version(
     if deployment:
         return (deployment.get("version", 0), None, None)
 
-    raise HTTPException(status_code=404, detail="No promoted deployment found.")
+    raise HTTPException(status_code=404, detail=NO_PROMOTED_DEPLOYMENT_DETAIL)
 
 
 async def resolve_version_and_deployment(
@@ -246,7 +253,7 @@ async def resolve_version_and_deployment(
     if deployment:
         return (deployment.get("version", 0), None, None, deployment)
 
-    raise HTTPException(status_code=404, detail="No promoted deployment found.")
+    raise HTTPException(status_code=404, detail=NO_PROMOTED_DEPLOYMENT_DETAIL)
 
 
 async def update_workflow_run_routing(

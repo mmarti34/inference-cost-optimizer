@@ -3,8 +3,11 @@ Public production endpoint: POST /api/public/{org_slug}/{endpoint_slug}
 
 Enterprise org-scoped routing: org_slug identifies the tenant; API key must belong to that org.
 - Validate Authorization Bearer (service API key).
-- Resolve org_slug → org_id; enforce key.org_id == org_id (403 if mismatch).
-- Look up deployment by (key org_id, endpoint_slug); 404 if not found.
+- Resolve org_slug → org_id; enforce key.org_id == org_id.
+- Look up deployment by (key org_id, endpoint_slug).
+- TENANT OPACITY: an unknown org, an org that is not the key's, and the key's
+  own org with no such deployment all return one byte-identical 404 that echoes
+  nothing the caller supplied. See _TENANT_OPAQUE_DETAIL below.
 - No graph_json from client; only deployed workflow. Optional ?version=vN.
 - Every request (success or failure) is logged to api_request_log for metrics.
 """
@@ -129,6 +132,65 @@ def get_org_id_from_slug(org_slug: str) -> Optional[str]:
                     return org_id
     except Exception:
         pass
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Tenant opacity
+# ═════════════════════════════════════════════════════════════════════════════
+#: The ONE 404 every org-scoped failure on this server-API-key surface returns.
+#:
+#: These routes take the tenant from the URL (``/{org_slug}/...``) while the
+#: authorization comes from the key.  Any difference between "no such org",
+#: "an org that is not yours" and "your org, no such resource" is therefore an
+#: org-enumeration oracle for anyone holding a single valid key: it does not
+#: expose customer content, but it confirms which organizations exist, by slug.
+#: This surface previously answered 403 "API key does not belong to this
+#: organization." for a real foreign org and 404 "Organization not found." for
+#: an unknown one, so the whole org namespace was probeable.
+#:
+#: This detail string echoes NOTHING the caller supplied — not the org slug,
+#: not the endpoint slug, not the request id — and is byte-identical in every
+#: branch.  Same rule as POST /v1/outcomes (routers/optimization_router.py
+#: ``_NOT_FOUND_DETAIL``): a reference to another tenant's real resource must
+#: be indistinguishable from a reference to nothing at all.
+_TENANT_OPAQUE_DETAIL = "Not found."
+
+
+def _tenant_opaque_404(reason: str, org_slug: str, endpoint_slug: str) -> HTTPException:
+    """
+    Return the uniform 404 while recording the TRUE reason server-side.
+
+    Uniform to the caller, specific to us.  The response carries no
+    distinguishing information; this operator-only log line keeps the real
+    reason (unknown org / foreign org / missing resource) so the branches stay
+    debuggable.  The reason deliberately does NOT go into ``api_request_log``:
+    that table is customer-visible, and the row is written under the caller's
+    own org, so a specific message there would hand back exactly what the
+    response withholds.
+    """
+    logger.warning(
+        "tenant-opaque 404 reason=%s org_slug=%r endpoint_slug=%r",
+        reason,
+        org_slug,
+        endpoint_slug,
+    )
+    return HTTPException(status_code=404, detail=_TENANT_OPAQUE_DETAIL)
+
+
+def _classify_tenant(org_slug: str, key_org_id: str) -> Optional[str]:
+    """
+    Resolve the path's org slug and compare it to the key's org.
+
+    Returns None when the slug is the key's own org, otherwise the internal
+    reason code for the mismatch.  The caller must treat every non-None value
+    identically; only ``_tenant_opaque_404`` gets to see which one it was.
+    """
+    org_id_from_slug = get_org_id_from_slug((org_slug or "").strip())
+    if not org_id_from_slug:
+        return "org_slug_resolves_to_no_org"
+    if str(org_id_from_slug) != str(key_org_id):
+        return "org_slug_belongs_to_another_org"
     return None
 
 
@@ -302,31 +364,52 @@ async def public_execute(
         token = authorization.split(" ", 1)[1]
         ctx = validate_api_key(token)
 
-        # 2. Resolve org_slug → org_id
-        org_id_from_slug = get_org_id_from_slug(org_slug.strip())
-        if not org_id_from_slug:
-            raise HTTPException(status_code=404, detail="Organization not found.")
-        log_entry["org_id"] = org_id_from_slug
+        # The request log is attributed to the AUTHENTICATED KEY'S org, always,
+        # and is set here — before the tenant check — so that a rejected
+        # cross-tenant probe is still recorded, just never against the tenant
+        # whose slug was in the URL.  Previously this was set from the path slug
+        # ahead of the check, which let any keyholder write 403 rows into
+        # ANOTHER org's api_request_log simply by probing their endpoints.
+        log_entry["org_id"] = ctx.org_id
 
-        # 3. Enforce tenant boundary
-        if org_id_from_slug != ctx.org_id:
-            log_entry["http_status"] = 403
-            log_entry["error_type"] = "auth"
-            log_entry["error_message"] = "API key does not belong to this organization"
-            raise HTTPException(
-                status_code=403,
-                detail="API key does not belong to this organization.",
-            )
+        # 2+3. Resolve org_slug → org_id and enforce the tenant boundary.
+        # Nothing is raised here: the three failure modes an attacker would
+        # try to separate — unknown org, foreign org, own org with no such
+        # deployment — must all leave through the SAME 404 below, having done
+        # the same lookups.
+        tenant_reason = _classify_tenant(org_slug, ctx.org_id)
 
         # 4+5. Resolve version AND load deployment in one pass
-        # (eliminates the redundant second DB query for the deployment)
+        # (eliminates the redundant second DB query for the deployment).
+        #
+        # ALWAYS scoped to ctx.org_id — the key's own org, never the org named
+        # in the path — so this reads no other tenant's rows.  It runs even
+        # when the tenant check has already failed: skipping it would make the
+        # rejected path measurably cheaper than the accepted one and rebuild
+        # the oracle out of response time.
         pinned_version = _parse_version(version)
-        resolved_version, experiment_id, variant_name, deployment = await resolve_version_and_deployment(
-            org_id=ctx.org_id,
-            endpoint_slug=slug_clean,
-            request_headers=dict(request.headers),
-            pinned_version=pinned_version,
-        )
+        try:
+            resolved_version, experiment_id, variant_name, deployment = await resolve_version_and_deployment(
+                org_id=ctx.org_id,
+                endpoint_slug=slug_clean,
+                request_headers=dict(request.headers),
+                pinned_version=pinned_version,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                # "No promoted deployment found." was a third distinguishable
+                # shape: it said "your org, no such endpoint". Same 404 now.
+                raise _tenant_opaque_404(
+                    tenant_reason or "no_promoted_deployment_for_endpoint_slug",
+                    org_slug,
+                    slug_clean,
+                ) from exc
+            raise
+        if tenant_reason is not None:
+            # A real deployment was found — in the CALLER'S own org. It is
+            # discarded unread: the org they named is not theirs (or is not an
+            # org at all), so they get the same 404 as everyone else.
+            raise _tenant_opaque_404(tenant_reason, org_slug, slug_clean)
         log_entry["served_version"] = resolved_version
         log_entry["experiment_id"] = str(experiment_id) if experiment_id else None
         log_entry["variant_name"] = variant_name
@@ -750,26 +833,38 @@ async def public_feedback(
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
     token = authorization.split(" ", 1)[1]
     ctx = validate_api_key(token)
-    org_id_from_slug = get_org_id_from_slug((org_slug or "").strip())
-    if not org_id_from_slug:
-        raise HTTPException(status_code=404, detail="Organization not found.")
-    if str(org_id_from_slug) != str(ctx.org_id):
-        raise HTTPException(status_code=403, detail="API key does not belong to this organization.")
+
+    # Same tenant-opacity rule as public_execute: unknown org, foreign org and
+    # "your org, no such request id" are one indistinguishable 404. Classified
+    # now, raised only after the request-id lookup below, so the rejected path
+    # performs the same work as the accepted one.
+    tenant_reason = _classify_tenant(org_slug, ctx.org_id)
 
     request_id = (body.request_id or "").strip()
     if not request_id:
+        # Malformed input, identical for every caller and every org slug:
+        # it reveals nothing about which organizations exist.
         raise HTTPException(status_code=400, detail="request_id required.")
-    metrics = body.metrics if isinstance(body.metrics, dict) else {}
-    if not metrics:
-        return {"status": "ok"}
 
     import asyncio
     loop = asyncio.get_event_loop()
-    log_entry = await loop.run_in_executor(None, get_api_request_log_sync, request_id)
-    if not log_entry:
-        raise HTTPException(status_code=404, detail="Request not found.")
-    if str(log_entry.get("org_id")) != str(ctx.org_id):
-        raise HTTPException(status_code=404, detail="Request not found.")
+    row = await loop.run_in_executor(None, get_api_request_log_sync, request_id)
+    # A request id is obscurity, not access control: a row belonging to another
+    # org is treated exactly as a row that does not exist.
+    if row is None:
+        row_reason = "request_id_matches_no_row"
+    elif str(row.get("org_id")) != str(ctx.org_id):
+        row_reason = "request_id_belongs_to_another_org"
+    else:
+        row_reason = None
+    if tenant_reason is not None or row_reason is not None:
+        raise _tenant_opaque_404(
+            tenant_reason or row_reason, org_slug, endpoint_slug
+        )
+
+    metrics = body.metrics if isinstance(body.metrics, dict) else {}
+    if not metrics:
+        return {"status": "ok"}
 
     await update_api_request_log_metrics(request_id, metrics)
     return {"status": "ok"}

@@ -942,7 +942,14 @@ def test_workflow_mode_streams_in_openai_chunk_format(client, authed):
 
 
 def test_workflow_from_another_org_is_refused(client, authed):
-    """Tenant boundary is asserted even though the resolver is org-scoped."""
+    """
+    Tenant boundary is asserted even though the resolver is org-scoped — and
+    the refusal is opaque.
+
+    This used to answer 403 "This deployment does not belong to your
+    organization.", which told the caller the slug named a real deployment
+    somewhere else. It is now the same 404 as a slug that names nothing.
+    """
     foreign = dict(DEPLOYMENT, org_id=OTHER_ORG_ID)
     p1, p2, p3, p4 = _patch_workflow(deployment=foreign)
     with p1, p2 as execute, p3, p4:
@@ -952,8 +959,9 @@ def test_workflow_from_another_org_is_refused(client, authed):
             json={"model": "optiml/support-triage", "messages": [{"role": "user", "content": "hi"}]},
         )
         execute.assert_not_called()
-    assert response.status_code == 403
-    assert response.json()["error"]["type"] == "permission_error"
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "workflow_not_found"
+    assert "does not belong" not in response.text
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1362,3 +1370,65 @@ def test_bridge_never_raises_into_the_request_path():
     )
     with patch("optimization.workloads.resolve_workload", side_effect=RuntimeError("db down")):
         optimization_bridge.record_direct_inference_attempt(attempt)  # must not raise
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TENANT OPACITY on the OpenAI-compatible surface
+#
+# This surface takes no org from the caller — the org comes from the key and
+# the resolver is org-scoped — so it cannot be walked the way
+# /api/public/{org_slug}/{endpoint_slug} could. What it CAN do is answer
+# differently once, on the defence-in-depth assertion below: a 403 saying "this
+# deployment does not belong to your organization" would confirm that a slug
+# names a real deployment in some other tenant. Same rule applies: same 404.
+# ═════════════════════════════════════════════════════════════════════════════
+
+from routing.resolver import NO_PROMOTED_DEPLOYMENT_DETAIL
+
+
+def _chat_workflow(client, slug="concert-reviews"):
+    return client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json={"model": f"optiml/{slug}", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+
+def test_foreign_deployment_is_the_same_404_as_no_deployment(client, authed, mock_deployment_other_org):
+    """
+    If the resolver ever hands back another org's deployment, the caller must
+    learn nothing from it. Byte-identical to the ordinary miss.
+    """
+    async def _foreign(**kwargs):
+        return (4, None, None, mock_deployment_other_org)
+
+    async def _missing(**kwargs):
+        raise HTTPException(status_code=404, detail=NO_PROMOTED_DEPLOYMENT_DETAIL)
+
+    with patch.object(openai_compat, "resolve_version_and_deployment", new=_foreign):
+        foreign = _chat_workflow(client)
+    with patch.object(openai_compat, "resolve_version_and_deployment", new=_missing):
+        missing = _chat_workflow(client)
+
+    assert foreign.status_code == 404 == missing.status_code
+    # Bodies carry a per-request id; everything else must match exactly.
+    fb, mb = foreign.json(), missing.json()
+    assert fb["error"] == mb["error"]
+    assert fb["error"]["message"] == NO_PROMOTED_DEPLOYMENT_DETAIL
+    assert fb["error"]["code"] == "workflow_not_found"
+    assert fb["error"]["type"] == missing.json()["error"]["type"]
+    assert "does not belong" not in foreign.text
+    assert "organization" not in foreign.text.lower()
+    assert set(foreign.headers) == set(missing.headers)
+
+
+@pytest.fixture
+def mock_deployment_other_org():
+    return {
+        "id": "foreign-dep",
+        "workflow_id": "foreign-wf",
+        "org_id": OTHER_ORG_ID,
+        "version": 4,
+        "endpoint_slug": "concert-reviews",
+        "graph_json": {"nodes": [], "edges": []},
+    }

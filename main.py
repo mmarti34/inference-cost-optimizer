@@ -189,11 +189,24 @@ def optimize_prompt(payload: OptimizePayload, _user: AuthenticatedUser = Depends
     """
     Optimize prompt by analyzing recent usage and budget constraints
     """
+    # CROSS-TENANT GUARD. require_org_member proves the caller belongs to the
+    # org they NAMED in the body — it does not constrain prompt_id or
+    # project_id, which are separate caller-supplied identifiers. Every query
+    # below must therefore be re-filtered by the verified org, exactly as
+    # verified_org_id's own docstring instructs.
+    #
+    # Without this, a member of any org could pass another tenant's prompt_id
+    # and have that prompt's TEXT read into the system prompt below and
+    # described back in the recommendation's `reasoning`. supabase_client uses
+    # the service-role key, so RLS does not backstop it.
+    org_id = verified_org_id(_user)
+
     try:
         # 1. Get the two most recent prompts for this prompt_id
         prompt_result = supabase.table("prompt_templates") \
             .select("id, org_id, prompt, provider, model, name, project_id, created_at") \
             .eq("id", payload.prompt_id) \
+            .eq("org_id", org_id) \
             .order("created_at", desc=True) \
             .limit(2) \
             .execute()
@@ -218,13 +231,18 @@ def optimize_prompt(payload: OptimizePayload, _user: AuthenticatedUser = Depends
         project_result = supabase.table("projects") \
             .select("monthly_budget") \
             .eq("id", payload.project_id) \
-            .single() \
+            .eq("org_id", org_id) \
+            .limit(1) \
             .execute()
-        
+
+        # Same 404 whether the project belongs to another tenant or does not
+        # exist: a foreign project's existence must not be confirmable, and
+        # .single() would have raised on a miss rather than returning cleanly.
         if not project_result.data:
             raise HTTPException(status_code=404, detail="Project not found.")
+        project_row = project_result.data[0]
         
-        monthly_budget_usd = project_result.data.get("monthly_budget", 0.0)
+        monthly_budget_usd = project_row.get("monthly_budget", 0.0)
         
         # 4. Calculate how much budget the project has used so far this month
         from datetime import datetime, timezone
@@ -234,6 +252,7 @@ def optimize_prompt(payload: OptimizePayload, _user: AuthenticatedUser = Depends
         usage_result = supabase.table("usage_logs") \
             .select("cost_usd") \
             .eq("project_id", payload.project_id) \
+            .eq("org_id", org_id) \
             .gte("created_at", start_of_month.isoformat()) \
             .execute()
         
@@ -306,7 +325,11 @@ Return your recommendation as a JSON object with the following structure:
         recommendation_record = {
             "prompt_id": payload.prompt_id,
             "project_id": payload.project_id,
-            "org_id": payload.org_id,
+            # The VERIFIED org, not the body's. `full_prompt_text` below
+            # persists the prompt, so a body-supplied org_id here would have
+            # written the row — and the prompt text — under an org the caller
+            # merely claimed.
+            "org_id": org_id,
             "user_id": payload.user_id,
             "recommended_provider": recommendation_data["recommended_provider"],
             "recommended_model": recommendation_data["recommended_model"],
@@ -326,9 +349,17 @@ Return your recommendation as a JSON object with the following structure:
             "recommendation": recommendation_data
         }
         
+    except HTTPException:
+        # Re-raise deliberate status codes. Without this the 404 above was DEAD
+        # CODE: the bare `except Exception` swallowed it and answered 500 with
+        # the detail interpolated into the message. Same dead-404 pattern as
+        # /v1/prompt. A 500 is both wrong and noisier than the 404 it replaced.
+        raise
     except Exception as e:
-        print(f"Error in optimize endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
+        # Do not echo the exception to the caller: it can carry row contents and
+        # identifiers from whatever query failed. Operator-side log keeps it.
+        logger.exception("Error in optimize endpoint: %s", e)
+        raise HTTPException(status_code=500, detail="Optimization failed.")
 
 # REMOVED: `GET /get-keys/{org_id}`.
 # It returned every provider API key for an org fully DECRYPTED to any org
@@ -712,27 +743,50 @@ def universal_prompt(request: Request, payload: dict, authorization: str = Heade
             print("Missing input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
-        # 3. Lookup prompt template
+        # 3. Lookup prompt template.
+        #
+        # TENANT OPACITY — same rule as POST /v1/outcomes and
+        # POST /api/public/{org_slug}/{endpoint_slug}. This is a server-API-key
+        # surface taking a caller-supplied prompt_id, and it used to answer
+        #   403 "You do not have access to this prompt."  -> the id EXISTS, in
+        #                                                    another org
+        #   500 "Error accessing prompt template."        -> the id exists
+        #                                                    nowhere (`.single()`
+        #                                                    raised on 0 rows and
+        #                                                    the except below
+        #                                                    swallowed the 404)
+        # which let any keyholder test whether a prompt_template id belonged to
+        # another tenant. Both now return one 404, byte-identical, echoing
+        # nothing the caller supplied. The specific reason goes to the operator
+        # log only.
+        #
+        # The lookup itself is unchanged (one query, same columns) so neither
+        # branch does more work than the other; a foreign row is read exactly as
+        # before and is now discarded unread instead of being described back to
+        # the caller.
+        _PROMPT_NOT_FOUND_DETAIL = "Prompt template not found."
         try:
-            prompt_result = supabase.table("prompt_templates").select("id, org_id, prompt, provider, model, name, project_id, created_at").eq("id", prompt_id).single().execute()
-            print("Prompt template lookup result:", prompt_result.data)
-            if not prompt_result.data:
-                print("Prompt template not found")
-                raise HTTPException(status_code=404, detail="Prompt template not found.")
-            prompt_template = prompt_result.data
+            prompt_result = supabase.table("prompt_templates").select("id, org_id, prompt, provider, model, name, project_id, created_at").eq("id", prompt_id).limit(1).execute()
+            rows = prompt_result.data or []
+            prompt_template = rows[0] if rows else None
         except Exception as e:
-            print(f"Error looking up prompt template: {e}")
+            logger.warning("Error looking up prompt template: %s", e)
             raise HTTPException(status_code=500, detail="Error accessing prompt template.")
-        
-        # Check if the API key's org_id matches the prompt's org_id
-        prompt_org_id = prompt_template.get("org_id")
-        if not prompt_org_id:
-            print("Prompt has no org_id, access denied")
-            raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
 
-        if prompt_org_id != org_id:
-            print(f"API key org_id ({org_id}) doesn't match prompt org_id ({prompt_org_id}), access denied")
-            raise HTTPException(status_code=403, detail="You do not have access to this prompt.")
+        # Uniform to the caller, specific to us.
+        prompt_org_id = (prompt_template or {}).get("org_id")
+        if prompt_template is None:
+            logger.warning("prompt_id %s: no such prompt template", prompt_id)
+            raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND_DETAIL)
+        if not prompt_org_id:
+            logger.warning("prompt_id %s: template has no org_id; refusing", prompt_id)
+            raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND_DETAIL)
+        if str(prompt_org_id) != str(org_id):
+            logger.warning(
+                "prompt_id %s belongs to org %s, not the key's org %s; refusing",
+                prompt_id, prompt_org_id, org_id,
+            )
+            raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND_DETAIL)
 
         # 4. Prepare prompt
         prompt_text = prompt_template["prompt"].replace("{input}", user_input) if prompt_template["prompt"] else user_input

@@ -82,7 +82,10 @@ from optimization_bridge import (
 )
 from plan_enforcement import check_monthly_request_limit, increment_monthly_usage
 from rate_limiting import check_and_increment_usage
-from routing.resolver import resolve_version_and_deployment
+from routing.resolver import (
+    resolve_version_and_deployment,
+    NO_PROMOTED_DEPLOYMENT_DETAIL as _WORKFLOW_NOT_FOUND_DETAIL,
+)
 from routers.public_execution import _resolve_user_selected_providers
 from supabase_client import supabase
 from workflow_runtime import execute_workflow
@@ -987,14 +990,32 @@ async def _handle_workflow(
         )
 
     # Tenant boundary: the resolver is org-scoped; assert it anyway.
+    #
+    # If this ever fires the resolver has a bug, but the ANSWER must still not
+    # be a distinct one. A 403 saying "this deployment does not belong to your
+    # organization" confirms that the slug names a real deployment in some
+    # other tenant — the same enumeration oracle this surface closed on
+    # /api/public/{org_slug}/{endpoint_slug}. Return the byte-identical 404 the
+    # missing-deployment branch above returns; keep the specific reason in the
+    # operator log, where it belongs.
     dep_org = deployment.get("org_id") if isinstance(deployment, dict) else None
     if dep_org and str(dep_org) != str(ctx.org_id):
-        logger.error("tenant boundary violation attempt on %s", endpoint_slug)
+        logger.error(
+            "tenant boundary violation attempt on %s: resolver returned a "
+            "deployment owned by org %s for a key scoped to org %s",
+            endpoint_slug,
+            dep_org,
+            ctx.org_id,
+        )
+        log_entry["http_status"] = 404
+        log_entry["error_type"] = "not_found"
+        log_entry["error_message"] = _WORKFLOW_NOT_FOUND_DETAIL
+        asyncio.create_task(log_api_request(log_entry))
         return _openai_error(
-            403,
-            "This deployment does not belong to your organization.",
-            err_type="permission_error",
+            404,
+            _WORKFLOW_NOT_FOUND_DETAIL,
             request_id=request_id,
+            code="workflow_not_found",
         )
 
     increment_monthly_usage(ctx.org_id)
