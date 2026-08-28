@@ -127,25 +127,61 @@ async def require_org_member(
     Extracts org_id from path params, query params, JSON body, or X-Org-Id header.
     Raises 403 if user is not a member of that org.
     """
-    # Try to get org_id from path params
-    org_id = request.path_params.get("org_id")
+    # ── Collect org_id from EVERY source, then require them to agree ────────
+    #
+    # CONFUSED-DEPUTY BYPASS, fixed. This used to take the FIRST source that
+    # had a value, in the order path -> query -> body -> header. Handlers,
+    # meanwhile, read `payload.org_id` — the BODY. The two could therefore
+    # disagree, and the precedence made the disagreement exploitable:
+    #
+    #     POST /api/cursor-tokens?org_id=<attacker's own org>
+    #     {"org_id": "<victim org>", ...}
+    #
+    # The guard verified membership of the ATTACKER'S org from the query string
+    # and passed; the handler then acted on the VICTIM'S org from the body.
+    # Reproduced in isolation: guard saw ATTACKER, handler received VICTIM.
+    #
+    # 21 handlers read `<payload>.org_id` under this guard. Two of them mint
+    # credentials — cursor_tokens.create_cursor_token and
+    # cursor_deploy.deploy_from_parsed — so the bypass escalated from "write
+    # into another tenant" to "issue yourself a live credential for another
+    # tenant and read everything they have".
+    #
+    # Fixing the precedence alone would not close it: any handler reading a
+    # different source than the guard chose reopens it. So the guard no longer
+    # picks a winner. It collects all supplied values and REFUSES the request if
+    # they disagree, which makes "the org the guard verified" and "the org the
+    # handler reads" the same value by construction, whichever source a handler
+    # happens to use. `verified_org_id()` remains the correct thing for a
+    # handler to read; this makes the unconverted ones safe too.
+    #
+    # A legitimate client sends one org_id, or the same one twice. Nothing in
+    # this codebase has a reason to name two different orgs in one request.
+    _sources = {
+        "path": request.path_params.get("org_id"),
+        "query": request.query_params.get("org_id"),
+        "header": x_org_id,
+    }
+    try:
+        body = await request.json()
+        _sources["body"] = body.get("org_id") if isinstance(body, dict) else None
+    except Exception:
+        _sources["body"] = None
 
-    # Try query params
-    if not org_id:
-        org_id = request.query_params.get("org_id")
+    _supplied = {k: str(v).strip() for k, v in _sources.items() if v and str(v).strip()}
+    _distinct = set(_supplied.values())
 
-    # Try to get from body (for POST/PUT requests) — already parsed by FastAPI
-    if not org_id:
-        try:
-            body = await request.json()
-            org_id = body.get("org_id") if isinstance(body, dict) else None
-        except Exception:
-            pass
+    if len(_distinct) > 1:
+        logger.warning(
+            "org_id conflict across request sources: %s",
+            {k: v for k, v in _supplied.items()},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Conflicting org_id values in request.",
+        )
 
-    # Fall back to X-Org-Id header (used by frontend for endpoints where org_id
-    # is not in the path, e.g. DELETE /workflows/{id}, GET /experiments/{id})
-    if not org_id:
-        org_id = x_org_id
+    org_id = next(iter(_distinct), None)
 
     if not org_id:
         raise HTTPException(
