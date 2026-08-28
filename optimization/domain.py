@@ -930,6 +930,52 @@ REASON_CODES: dict[str, str] = {
         "The baseline arm produced no quality measurement, so a relative "
         "quality comparison has no reference point."
     ),
+    # Candidate ELIGIBILITY PREFLIGHT — decided BEFORE any provider request.
+    #
+    # Every code here is emitted only from a check that actually ran against
+    # real data (the org's credentials, shared/providers.json, the policy in
+    # force, or the request shape the strategy would send). A candidate carrying
+    # one of these was NOT benchmarked and NOT failed — it was never dispatched,
+    # which is the point: the alternative is discovering the same fact through
+    # 140 provider errors.
+    "model_not_available": (
+        "The model is not present in the executor catalog OptiML can dispatch "
+        "to, so no request could be constructed for it."
+    ),
+    "request_shape_incompatible": (
+        "The model family explicitly refuses a request parameter this workload's "
+        "configuration sets, and no lossless adapter is declared for it. "
+        "Determined from declared capabilities before dispatch, not from a "
+        "provider error."
+    ),
+    "required_capability_missing": (
+        "The request requires a capability the model family is DECLARED not to "
+        "support. An undeclared capability is 'unknown' and never produces this "
+        "code."
+    ),
+    "context_window_insufficient": (
+        "The model's published context window is smaller than the measured "
+        "input this workload requires."
+    ),
+    "policy_blocked": (
+        "A policy constraint excludes this candidate before execution."
+    ),
+    "pricing_unknown": (
+        "No vendor list price exists for this model, so its cost could only be "
+        "computed from a fallback guess — which cannot be compared against a "
+        "known price without manufacturing a saving."
+    ),
+    "economically_dominated": (
+        "Under a cost objective, known list pricing leaves no plausible path to "
+        "the materiality threshold even after a deliberately generous allowance "
+        "for the candidate being more token-efficient than the baseline. "
+        "SCREENING evidence only: this says the candidate was not worth paying "
+        "to measure. It is never evidence that a saving exists."
+    ),
+    "request_adapted": (
+        "A declared, lossless adapter rewrote the request so this family could "
+        "execute the customer's configuration unchanged in meaning."
+    ),
     # Candidate consideration funnel
     "provider_not_configured": (
         "The organization holds no credential for this candidate's provider, so "
@@ -1006,6 +1052,7 @@ DISPOSITION_CONSIDERED = "considered"
 DISPOSITION_INCOMPATIBLE = "incompatible"
 DISPOSITION_POLICY_BLOCKED = "policy_blocked"
 DISPOSITION_PROVIDER_NOT_CONFIGURED = "provider_not_configured"
+DISPOSITION_ECONOMICALLY_DOMINATED = "economically_dominated"
 DISPOSITION_ELIMINATED_BY_HISTORY = "eliminated_by_historical_evidence"
 DISPOSITION_DUPLICATE = "duplicate"
 DISPOSITION_GENERATOR_ERROR = "generator_error"
@@ -1023,6 +1070,7 @@ FUNNEL_STAGES = (
     DISPOSITION_INCOMPATIBLE,
     DISPOSITION_POLICY_BLOCKED,
     DISPOSITION_PROVIDER_NOT_CONFIGURED,
+    DISPOSITION_ECONOMICALLY_DOMINATED,
     DISPOSITION_ELIMINATED_BY_HISTORY,
     DISPOSITION_DUPLICATE,
     DISPOSITION_GENERATOR_ERROR,

@@ -50,6 +50,7 @@ from supabase_client import supabase
 from optimization import (
     allocation,
     domain,
+    eligibility as eligibility_mod,
     executors as executors_mod,
     noninferiority,
     outcomes as outcomes_mod,
@@ -636,14 +637,51 @@ def _run(
             org_id, workload, baseline_strategy, workflow_id=workflow_id
         )
 
+    # ── ELIGIBILITY PREFLIGHT — the gate between hypothesis and spend.
+    #
+    # Generation proposes; it does not authorise. Every candidate — generated or
+    # caller-supplied — is checked against the org's credentials, the executor
+    # catalog, the policy in force, the request shape it would actually send and
+    # the objective, BEFORE any provider request exists for it.
+    #
+    # This is the o1-mini fix. That arm ran 140 cases at a 100% error rate
+    # because the incompatibility was only discoverable from provider errors; it
+    # is now discoverable from a declaration, and an ineligible candidate simply
+    # never enters the replay loop below.
+    #
+    # An exclusion is NOT a benchmark failure. Each one keeps its structured
+    # evidence and appears in the consideration funnel with a reason code.
+    preflight = eligibility_mod.preflight(
+        cand_list,
+        baseline=baseline_strategy,
+        objective=objective,
+        policy=policy,
+        materiality=materiality,
+        history=gen_meta.get("history"),
+        configured_providers=(
+            set(gen_meta.get("configured_providers") or [])
+            or candidates_mod._configured_providers(org_id)
+        ),
+    )
+    cand_list = preflight.eligible
+    gen_meta["dropped"] = (gen_meta.get("dropped") or []) + preflight.excluded
+    gen_meta["opportunities"] = (
+        (gen_meta.get("opportunities") or []) + preflight.opportunities
+    )
+    gen_meta["eligibility"] = preflight.to_dict()
+
     if not cand_list:
+        # Nothing survived to dispatch. The funnel is still emitted in full:
+        # "we considered eight and none were eligible, here is the code for
+        # each" is a genuine finding, and it is the difference between a
+        # customer being told nothing was looked at and being told what was.
         return _conclude(
             org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
             policy=policy, materiality=materiality,
             conclusion=domain.CONCLUSION_INSUFFICIENT_EVIDENCE,
             reasons=[domain.reason(
                 "no_candidates_generated",
-                detail="No applicable candidate strategy could be generated.",
+                detail="No eligible candidate strategy reached the replay stage.",
                 dropped=gen_meta.get("dropped") or [],
             )],
             confidence=None, sample_size=n, success_signal=domain.SuccessSignal(),
@@ -657,6 +695,11 @@ def _run(
             )],
             status="completed", error=None, recommendation_id=recommendation_id,
             actor=actor, service_mod=service_mod,
+            consideration=domain.build_funnel(_dispositions(
+                measured=[], safe=[], promising=[],
+                opportunities=gen_meta.get("opportunities") or [],
+                generation=gen_meta,
+            )),
         )
 
     checks = _load_eval_checks(org_id, workflow_id)
@@ -1645,7 +1688,10 @@ def _dispositions(
     safe_ids = {id(m) for m in safe}
     promising_ids = {id(m) for m in promising}
 
+    # Where each exclusion code exits the funnel. The preflight codes come from
+    # optimization.eligibility, which owns that mapping so the two cannot drift.
     drop_stage = {
+        **eligibility_mod.CODE_TO_DISPOSITION,
         "strategy_not_applicable": domain.DISPOSITION_INCOMPATIBLE,
         "provider_not_permitted": domain.DISPOSITION_POLICY_BLOCKED,
         "provider_not_configured": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
@@ -1695,6 +1741,10 @@ def _dispositions(
             "disposition": stage,
             "code": code,
             "result_id": m.get("result_id"),
+            # The preflight record for an arm that DID run. Present so the
+            # funnel answers "why was this one allowed to spend money?" with the
+            # same structure it answers "why was that one refused?".
+            "eligibility": getattr(m["candidate"], "eligibility", None),
         })
 
     return out

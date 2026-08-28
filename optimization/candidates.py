@@ -62,6 +62,11 @@ class Candidate:
     projection_basis: Optional[dict] = None
     measured_basis: Optional[dict] = None
     notes: list[dict] = field(default_factory=list)
+    #: Structured eligibility evidence, attached by optimization.eligibility's
+    #: preflight. Present on EVERY candidate that reached preflight, including
+    #: the ones that passed — "we checked fourteen dimensions and all were fine"
+    #: is as much a part of the audit trail as an exclusion is.
+    eligibility: Optional[dict] = None
 
     @property
     def fingerprint(self) -> str:
@@ -80,6 +85,7 @@ class Candidate:
             "projection_basis": self.projection_basis,
             "measured_basis": self.measured_basis,
             "notes": self.notes,
+            "eligibility": self.eligibility,
             "strategy": self.strategy.to_dict(),
         }
 

@@ -51,6 +51,8 @@ A price sheet says what a call *would* cost. Only a measurement says what it
 | `strategy.py` | Execution strategies: ordered executor steps; the runtime `graph_json` adapter and the direct-inference adapter. Dimension applicability is scoped **per execution surface**. |
 | `attempts.py` | **The only `node_results` parser in the backend.** Thin domain layer over the existing execution records, on both surfaces. |
 | `candidates.py` | Candidate generators. Stages 1–2 built; 4–6 are stubs that refuse. |
+| `capabilities.py` | **DECLARED** executor capabilities and the adapter layer: what a model family accepts, and the named transformations that can make a request executable. A declaration table plus one generic matcher — no name checks at call sites. |
+| `eligibility.py` | The **preflight gate** between hypothesis and spend. A generated candidate is not automatically a benchmark arm: provider, catalog, surface, policy, request-shape, capability, context-window, pricing and objective checks run first, and **no external provider request is made for an ineligible candidate**. Also holds the cost-objective screen — the one place a price sheet may remove an arm, and never a place it may claim a saving. |
 | `benchmark.py` | The evidence engine, and the pure `evaluate_conclusion` verdict function. |
 | `outcomes.py` | Outcome recording: delayed, plural, named, correctable, idempotent. |
 | `policies.py` | Constraints that make a strategy invalid; versioned by insert. |

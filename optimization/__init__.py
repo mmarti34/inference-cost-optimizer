@@ -20,6 +20,16 @@ EMPIRICAL EVIDENCE:
     strategy.py     Execution strategies: ordered executor steps, and the
                     Runtime adapter to/from workflow graph_json.
     candidates.py   Candidate generators (recommendation engine stages 1-2).
+    capabilities.py DECLARED executor capabilities and the ADAPTER layer: what
+                    a model family accepts, and the named transformations that
+                    can make a request executable. Declaration data, never a
+                    measurement, and never a name check at a call site.
+    eligibility.py  The PREFLIGHT gate between hypothesis and spend. A generated
+                    candidate is not automatically a benchmark arm: it must pass
+                    provider, catalog, surface, policy, request-shape,
+                    capability, context-window, pricing and objective checks
+                    first. No external provider request is made for an
+                    ineligible candidate.
     benchmark.py    The replay evidence engine.
     noninferiority.py
                     Paired non-inferiority statistics over the per-case
@@ -49,6 +59,8 @@ __all__ = [
     "evidence",
     "strategy",
     "candidates",
+    "capabilities",
+    "eligibility",
     "benchmark",
     "noninferiority",
     "staging",
