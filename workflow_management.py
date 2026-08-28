@@ -12,6 +12,7 @@ from auth_dependency import require_auth, require_org_member, AuthenticatedUser,
 from resource_access import (
     DEPLOYMENT_NOT_FOUND,
     WORKFLOW_NOT_FOUND,
+    fetch_owned_row,
     get_context_assets_for_org,
     get_deployment_for_org,
     get_workflow_for_org,
@@ -34,6 +35,21 @@ from evidence_redaction import (
 from routing.resolver import get_promoted_deployment_by_version, get_latest_promoted_deployment
 
 router = APIRouter()
+
+
+# ─── Opaque failure details for the Tier-1 resource classes ──────────────────
+# Same contract as the constants in `resource_access`: ONE string per resource
+# class, used verbatim for BOTH "belongs to another org" and "does not exist",
+# so no endpoint becomes an existence oracle for another tenant's ids. Never
+# add the id, the owning org, or a distinguishing suffix to any of these.
+# The wording matches what these handlers already returned for a genuinely
+# missing row, so the own-org 404 is unchanged.
+GOLDEN_INPUT_NOT_FOUND = "Golden input not found"
+EXPERIMENT_NOT_FOUND = "Experiment not found"
+EVAL_RUN_NOT_FOUND = "Eval run not found"
+ROUTING_POLICY_NOT_FOUND = "Routing policy not found"
+CUSTOM_METRIC_NOT_FOUND = "Custom metric not found"
+AUTO_GRADED_METRIC_NOT_FOUND = "Auto-graded metric not found"
 
 
 def _nr_has_error(nr: Any) -> bool:
@@ -1475,6 +1491,12 @@ async def create_golden_input(payload: GoldenInputCreate, _user: AuthenticatedUs
 @router.put("/golden-inputs/{golden_input_id}")
 async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update a golden input. Requires auth and org access."""
+    # `require_org_member` proves the caller belongs to the org they named; it
+    # says nothing about who owns `golden_input_id`. Establish that first — the
+    # no-op branch below RETURNS the row, so the doubly-scoped UPDATE cannot
+    # cover that path.
+    fetch_owned_row("golden_inputs", golden_input_id, _user, "id, org_id", GOLDEN_INPUT_NOT_FOUND)
+    caller_org_id = verified_org_id(_user)
     try:
         update = {k: v for k, v in payload.model_dump(exclude_unset=True).items()}
         # Same redaction boundary as creation: an update is another write of
@@ -1491,14 +1513,14 @@ async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate, 
                 update["variables"] = _u_vars
         if not update:
             # Fetch existing and return
-            result = supabase.table("golden_inputs").select(_GOLDEN_INPUT_COLS).eq("id", golden_input_id).single().execute()
+            result = supabase.table("golden_inputs").select(_GOLDEN_INPUT_COLS).eq("id", golden_input_id).eq("org_id", caller_org_id).single().execute()
             if not result.data:
-                raise HTTPException(status_code=404, detail="Golden input not found")
+                raise HTTPException(status_code=404, detail=GOLDEN_INPUT_NOT_FOUND)
             return _golden_row_to_response(result.data)
         update["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        result = supabase.table("golden_inputs").update(update).eq("id", golden_input_id).execute()
+        result = supabase.table("golden_inputs").update(update).eq("id", golden_input_id).eq("org_id", caller_org_id).execute()
         if not result.data or len(result.data) == 0:
-            raise HTTPException(status_code=404, detail="Golden input not found")
+            raise HTTPException(status_code=404, detail=GOLDEN_INPUT_NOT_FOUND)
         return _golden_row_to_response(result.data[0])
     except HTTPException:
         raise
@@ -1509,8 +1531,11 @@ async def update_golden_input(golden_input_id: str, payload: GoldenInputUpdate, 
 @router.delete("/golden-inputs/{golden_input_id}", status_code=204)
 async def delete_golden_input(golden_input_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a golden input. Requires auth and org access."""
+    # Was an unscoped DELETE on a caller-supplied id: any member of any org
+    # could erase another tenant's eval corpus.
+    fetch_owned_row("golden_inputs", golden_input_id, _user, "id, org_id", GOLDEN_INPUT_NOT_FOUND)
     try:
-        supabase.table("golden_inputs").delete().eq("id", golden_input_id).execute()
+        supabase.table("golden_inputs").delete().eq("id", golden_input_id).eq("org_id", verified_org_id(_user)).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting golden input: {str(e)}")
 
@@ -2262,17 +2287,27 @@ class EvalRunStartPayload(BaseModel):
 @router.post("/eval/run")
 async def start_eval_run(payload: EvalRunStartPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """Start an eval run for a deployment. Returns eval_run id; run executes and status can be polled via GET."""
+    # Ownership BEFORE anything else. This was the worst defect on this file:
+    # `deployment_id` is caller-supplied and used to reach `.eq("id", …)` with
+    # no org filter, the org was then read back OUT of the fetched row, and the
+    # eval was dispatched as that org. Naming a victim's deployment id made
+    # `_run_eval_sync` execute their graph (decrypting their `org_secrets` and
+    # spending their provider keys), flip their deployment to `promoted` with a
+    # fresh `promoted_at`, and cancel their running experiments. A cross-tenant
+    # secret-use and live-traffic primitive, not an information leak.
+    get_deployment_for_org(payload.deployment_id, _user)
+    org_id = verified_org_id(_user)
     try:
         dep = (
             supabase.table("workflow_deployments")
             .select("id, org_id, workflow_id")
             .eq("id", payload.deployment_id)
+            .eq("org_id", org_id)
             .single()
             .execute()
         )
         if not dep.data:
-            raise HTTPException(status_code=404, detail="Deployment not found")
-        org_id = str(dep.data["org_id"])
+            raise HTTPException(status_code=404, detail=DEPLOYMENT_NOT_FOUND)
         workflow_id = str(dep.data["workflow_id"])
 
         suite_row = (
@@ -2314,16 +2349,20 @@ async def start_eval_run(payload: EvalRunStartPayload, _user: AuthenticatedUser 
 @router.get("/eval/runs/{eval_run_id}")
 async def get_eval_run(eval_run_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get eval run status and results (for polling)."""
+    # An eval run carries the candidate AND production outputs of every golden
+    # input, so the row IS the sensitive payload. Authorize before the read.
+    fetch_owned_row("eval_runs", eval_run_id, _user, "id, org_id", EVAL_RUN_NOT_FOUND)
     try:
         run_row = (
             supabase.table("eval_runs")
             .select("id, org_id, deployment_id, eval_suite_id, status, results, summary, started_at, completed_at, created_at")
             .eq("id", eval_run_id)
+            .eq("org_id", verified_org_id(_user))
             .single()
             .execute()
         )
         if not run_row.data:
-            raise HTTPException(status_code=404, detail="Eval run not found")
+            raise HTTPException(status_code=404, detail=EVAL_RUN_NOT_FOUND)
         r = run_row.data
         results_rows = (
             supabase.table("eval_run_results")
@@ -2492,8 +2531,12 @@ async def create_or_update_routing_policy(payload: RoutingPolicyCreate, _user: A
 @router.delete("/routing-policies/{policy_id}", status_code=204)
 async def delete_routing_policy(policy_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete (deactivate) a routing policy; traffic reverts to latest promoted."""
+    # Deactivating a policy REDIRECTS LIVE TRAFFIC on the owning endpoint, so an
+    # unscoped id here let any member of any org move another tenant's traffic
+    # off its weighted split and back onto latest-promoted.
+    fetch_owned_row("routing_policies", policy_id, _user, "id, org_id", ROUTING_POLICY_NOT_FOUND)
     try:
-        supabase.table("routing_policies").update({"active": False}).eq("id", policy_id).execute()
+        supabase.table("routing_policies").update({"active": False}).eq("id", policy_id).eq("org_id", verified_org_id(_user)).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3101,23 +3144,26 @@ async def list_experiments(org_id: str, endpoint_slug: Optional[str] = None, _us
 @router.get("/experiments/{experiment_id}")
 async def get_experiment(experiment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Get experiment by id with computed results."""
+    fetch_owned_row("experiments", experiment_id, _user, "id, org_id", EXPERIMENT_NOT_FOUND)
+    caller_org_id = verified_org_id(_user)
     try:
         result = (
             supabase.table("experiments")
             .select(_EXPERIMENT_COLS)
             .eq("id", experiment_id)
+            .eq("org_id", caller_org_id)
             .single()
             .execute()
         )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Experiment not found")
+            raise HTTPException(status_code=404, detail=EXPERIMENT_NOT_FOUND)
         row = result.data
         min_sample = int(row.get("min_sample_size") or 50)
         confidence_level = float(row.get("confidence_level") or 95.0)
         variants = row.get("variants") or []
         expected_names = [v.get("name") or f"v{v.get('version', 0)}" for v in variants if isinstance(v, dict)]
         computed = _compute_experiment_results(
-            experiment_id, min_sample, expected_variant_names=expected_names, org_id=row.get("org_id"),
+            experiment_id, min_sample, expected_variant_names=expected_names, org_id=caller_org_id,
             confidence_level=confidence_level,
         )
         out = _experiment_to_response(row)
@@ -3224,8 +3270,9 @@ async def create_custom_metric(payload: CustomMetricCreate, _user: Authenticated
 @router.delete("/custom-metrics/{metric_id}")
 async def delete_custom_metric(metric_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a custom metric definition. Does not remove existing values from api_request_log."""
+    fetch_owned_row("custom_metrics", metric_id, _user, "id, org_id", CUSTOM_METRIC_NOT_FOUND)
     try:
-        supabase.table("custom_metrics").delete().eq("id", metric_id).execute()
+        supabase.table("custom_metrics").delete().eq("id", metric_id).eq("org_id", verified_org_id(_user)).execute()
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3359,6 +3406,10 @@ async def create_auto_graded_metric(payload: AutoGradedMetricCreate, _user: Auth
 @router.put("/auto-graded-metrics/{metric_id}")
 async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update an auto-graded metric definition."""
+    fetch_owned_row(
+        "auto_graded_metrics", metric_id, _user, "id, org_id", AUTO_GRADED_METRIC_NOT_FOUND
+    )
+    caller_org_id = verified_org_id(_user)
     try:
         updates = {}
         if payload.name is not None:
@@ -3376,9 +3427,10 @@ async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpd
         if payload.grading_model is not None:
             new_model = payload.grading_model.strip()
             provider = _get_provider_for_model(new_model)
-            existing = supabase.table("auto_graded_metrics").select("org_id").eq("id", metric_id).single().execute()
-            org_id = (existing.data or {}).get("org_id")
-            if org_id and not _org_has_provider_key(org_id, provider):
+            # The provider-key probe must run against the CALLER's org, never
+            # an org read back out of the fetched row — otherwise the 400/200
+            # split answers "does tenant X have a Y key configured?".
+            if not _org_has_provider_key(caller_org_id, provider):
                 raise HTTPException(
                     status_code=400,
                     detail=f"No {provider} API key configured. Add one in settings to use {new_model} for grading.",
@@ -3393,8 +3445,8 @@ async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpd
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
-        supabase.table("auto_graded_metrics").update(updates).eq("id", metric_id).execute()
-        updated = supabase.table("auto_graded_metrics").select("*").eq("id", metric_id).single().execute()
+        supabase.table("auto_graded_metrics").update(updates).eq("id", metric_id).eq("org_id", caller_org_id).execute()
+        updated = supabase.table("auto_graded_metrics").select("*").eq("id", metric_id).eq("org_id", caller_org_id).single().execute()
         return updated.data if updated.data else {}
     except HTTPException:
         raise
@@ -3405,8 +3457,11 @@ async def update_auto_graded_metric(metric_id: str, payload: AutoGradedMetricUpd
 @router.delete("/auto-graded-metrics/{metric_id}")
 async def delete_auto_graded_metric(metric_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete an auto-graded metric definition."""
+    fetch_owned_row(
+        "auto_graded_metrics", metric_id, _user, "id, org_id", AUTO_GRADED_METRIC_NOT_FOUND
+    )
     try:
-        supabase.table("auto_graded_metrics").delete().eq("id", metric_id).execute()
+        supabase.table("auto_graded_metrics").delete().eq("id", metric_id).eq("org_id", verified_org_id(_user)).execute()
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3424,16 +3479,18 @@ async def get_experiment_timeseries(
     Returns buckets with control/candidate request counts and metric values.
     """
     from datetime import datetime, timezone, timedelta
+    fetch_owned_row("experiments", experiment_id, _user, "id, org_id", EXPERIMENT_NOT_FOUND)
     try:
         exp = (
             supabase.table("experiments")
             .select("id, created_at, variants")
             .eq("id", experiment_id)
+            .eq("org_id", verified_org_id(_user))
             .single()
             .execute()
         )
         if not exp.data:
-            raise HTTPException(status_code=404, detail="Experiment not found")
+            raise HTTPException(status_code=404, detail=EXPERIMENT_NOT_FOUND)
         variants = exp.data.get("variants") or []
         if len(variants) < 2:
             raise HTTPException(status_code=400, detail="Experiment has no variants")
@@ -3515,20 +3572,25 @@ async def get_experiment_timeseries(
 @router.put("/experiments/{experiment_id}/start")
 async def start_experiment(experiment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Set experiment to running and create weighted routing policy from variants."""
+    # Starting an experiment INSERTS an active weighted routing policy, which
+    # splits live traffic on the owning endpoint. The org must be the guard's,
+    # never one read back out of the fetched experiment row.
+    fetch_owned_row("experiments", experiment_id, _user, "id, org_id", EXPERIMENT_NOT_FOUND)
+    org_id = verified_org_id(_user)
     try:
         result = (
             supabase.table("experiments")
             .select(_EXPERIMENT_COLS)
             .eq("id", experiment_id)
+            .eq("org_id", org_id)
             .single()
             .execute()
         )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Experiment not found")
+            raise HTTPException(status_code=404, detail=EXPERIMENT_NOT_FOUND)
         row = result.data
         if (row.get("status") or "") != "draft":
             raise HTTPException(status_code=400, detail="Only draft experiments can be started")
-        org_id = str(row["org_id"])
         slug = (row.get("endpoint_slug") or "").strip()
         variants = row.get("variants") or []
         existing = (
@@ -3540,7 +3602,7 @@ async def start_experiment(experiment_id: str, _user: AuthenticatedUser = Depend
             .execute()
         )
         for r in existing.data or []:
-            supabase.table("routing_policies").update({"active": False}).eq("id", r["id"]).execute()
+            supabase.table("routing_policies").update({"active": False}).eq("id", r["id"]).eq("org_id", org_id).execute()
         rules = [{"version": v.get("version"), "weight": v.get("weight", 0)} for v in variants]
         supabase.table("routing_policies").insert({
             "org_id": org_id,
@@ -3552,8 +3614,8 @@ async def start_experiment(experiment_id: str, _user: AuthenticatedUser = Depend
         supabase.table("experiments").update({
             "status": "running",
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }).eq("id", experiment_id).execute()
-        updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).single().execute()
+        }).eq("id", experiment_id).eq("org_id", org_id).execute()
+        updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).eq("org_id", org_id).single().execute()
         return _experiment_to_response(updated.data)
     except HTTPException:
         raise
@@ -3569,7 +3631,13 @@ class ConcludeBody(BaseModel):
 
 
 async def _conclude_experiment_internal(experiment_id: str, row: dict, winner_version: int, reason: str) -> None:
-    """Shared conclude logic: deactivate routing, promote winner if needed, update experiment."""
+    """Shared conclude logic: deactivate routing, promote winner if needed, update experiment.
+
+    `row` MUST already have been ownership-checked by the caller (the request
+    handlers fetch it doubly scoped, so `row["org_id"]` is the guard's org and
+    not an attacker-chosen one). Every statement below is additionally scoped
+    to that org so the check and the write are one statement.
+    """
     org_id = str(row["org_id"])
     slug = (row.get("endpoint_slug") or "").strip()
     existing = (
@@ -3581,7 +3649,7 @@ async def _conclude_experiment_internal(experiment_id: str, row: dict, winner_ve
         .execute()
     )
     for r in existing.data or []:
-        supabase.table("routing_policies").update({"active": False}).eq("id", r["id"]).execute()
+        supabase.table("routing_policies").update({"active": False}).eq("id", r["id"]).eq("org_id", org_id).execute()
     latest = await get_latest_promoted_deployment(org_id, slug)
     if latest and int(latest.get("version", 0)) != winner_version:
         winner_dep = await get_promoted_deployment_by_version(org_id, slug, winner_version)
@@ -3618,7 +3686,7 @@ async def _conclude_experiment_internal(experiment_id: str, row: dict, winner_ve
                     "status": "promoted",
                     "promoted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "override_reason": "experiment_conclusion",
-                }).eq("id", new_dep_id).execute()
+                }).eq("id", new_dep_id).eq("org_id", org_id).execute()
     update = {
         "status": "concluded",
         "winner_version": winner_version,
@@ -3626,7 +3694,7 @@ async def _conclude_experiment_internal(experiment_id: str, row: dict, winner_ve
         "concluded_reason": reason,
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    supabase.table("experiments").update(update).eq("id", experiment_id).execute()
+    supabase.table("experiments").update(update).eq("id", experiment_id).eq("org_id", org_id).execute()
 
 
 async def _maybe_auto_conclude(experiment_id: str) -> None:
@@ -3680,16 +3748,23 @@ async def conclude_experiment(experiment_id: str, body: Optional[ConcludeBody] =
     winner_version = body.winner_version if body else None
     if winner_version is None:
         raise HTTPException(status_code=400, detail="winner_version is required")
+    # The heaviest experiment mutation: it deactivates the endpoint's active
+    # routing policy AND can insert-then-promote a new deployment, so an
+    # unscoped id let any member of any org retarget another tenant's live
+    # production traffic to a version of the attacker's choosing.
+    fetch_owned_row("experiments", experiment_id, _user, "id, org_id", EXPERIMENT_NOT_FOUND)
+    caller_org_id = verified_org_id(_user)
     try:
         result = (
             supabase.table("experiments")
             .select(_EXPERIMENT_COLS)
             .eq("id", experiment_id)
+            .eq("org_id", caller_org_id)
             .single()
             .execute()
         )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Experiment not found")
+            raise HTTPException(status_code=404, detail=EXPERIMENT_NOT_FOUND)
         row = result.data
         if (row.get("status") or "") != "running":
             raise HTTPException(status_code=400, detail="Only running experiments can be concluded")
@@ -3698,7 +3773,7 @@ async def conclude_experiment(experiment_id: str, body: Optional[ConcludeBody] =
         if winner_version not in variant_versions:
             raise HTTPException(status_code=400, detail=f"Version {winner_version} is not a variant in this experiment")
         await _conclude_experiment_internal(experiment_id, row, winner_version, "manual")
-        updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).single().execute()
+        updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).eq("org_id", caller_org_id).single().execute()
         return _experiment_to_response(updated.data)
     except HTTPException:
         raise
@@ -3739,20 +3814,24 @@ def _end_experiments_on_endpoint_sync(org_id: str, endpoint_slug: str, reason: s
 @router.put("/experiments/{experiment_id}/cancel")
 async def cancel_experiment(experiment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Cancel experiment and deactivate its routing policy."""
+    # Cancelling also deactivates the endpoint's active routing policy, so it
+    # is a live-traffic mutation on whichever org owns the experiment.
+    fetch_owned_row("experiments", experiment_id, _user, "id, org_id", EXPERIMENT_NOT_FOUND)
+    org_id = verified_org_id(_user)
     try:
         result = (
             supabase.table("experiments")
             .select(_EXPERIMENT_COLS)
             .eq("id", experiment_id)
+            .eq("org_id", org_id)
             .single()
             .execute()
         )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Experiment not found")
+            raise HTTPException(status_code=404, detail=EXPERIMENT_NOT_FOUND)
         row = result.data
         if (row.get("status") or "") not in ("draft", "running"):
             raise HTTPException(status_code=400, detail="Experiment already concluded or cancelled")
-        org_id = str(row["org_id"])
         slug = (row.get("endpoint_slug") or "").strip()
         existing = (
             supabase.table("routing_policies")
@@ -3763,15 +3842,15 @@ async def cancel_experiment(experiment_id: str, _user: AuthenticatedUser = Depen
             .execute()
         )
         for r in existing.data or []:
-            supabase.table("routing_policies").update({"active": False}).eq("id", r["id"]).execute()
+            supabase.table("routing_policies").update({"active": False}).eq("id", r["id"]).eq("org_id", org_id).execute()
         now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         supabase.table("experiments").update({
             "status": "cancelled",
             "concluded_at": now_str,
             "concluded_reason": "manual",
             "updated_at": now_str,
-        }).eq("id", experiment_id).execute()
-        updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).single().execute()
+        }).eq("id", experiment_id).eq("org_id", org_id).execute()
+        updated = supabase.table("experiments").select(_EXPERIMENT_COLS).eq("id", experiment_id).eq("org_id", org_id).single().execute()
         return _experiment_to_response(updated.data)
     except HTTPException:
         raise
