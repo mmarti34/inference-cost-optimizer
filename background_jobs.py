@@ -114,12 +114,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+async def run_benchmark_job_reaper(org_id: Optional[str] = None) -> dict:
+    """
+    Declare orphaned benchmark jobs failed. Never raises.
+
+    A benchmark job renews `heartbeat_at` while it is alive. A process that dies
+    renews nothing, so a job still in an ACTIVE status whose lease has expired
+    is one whose worker is gone — and the only thing that must never happen is
+    for it to sit at `running` forever, because that is a state nothing in the
+    system can ever resolve. This is the thing that resolves it.
+
+    Runs blocking Supabase calls, so it goes to a thread rather than stalling
+    the loop that also drives rollback monitoring.
+    """
+    from optimization import jobs as jobs_mod
+
+    return await asyncio.to_thread(jobs_mod.reap_stale_jobs, org_id)
+
+
 async def run_control_loop_cycle(org_id: Optional[str] = None) -> dict:
     """
-    Run one control-loop cycle: rollback rules, then experiment auto-conclude.
+    Run one control-loop cycle: rollback rules, experiment auto-conclude, then
+    orphaned benchmark jobs.
 
     org_id scopes the cycle to a single organization. Never raises — a failure
-    in one stage is reported in the result and the other stage still runs.
+    in one stage is reported in the result and the other stages still run.
     """
     # Imported lazily so this module can be imported before the app's routers.
     from workflow_management import (
@@ -138,6 +157,11 @@ async def run_control_loop_cycle(org_id: Optional[str] = None) -> dict:
     except Exception as e:
         logger.exception("Experiment auto-conclude cycle failed")
         result["experiments"] = {"error": str(e)[:300]}
+    try:
+        result["benchmark_jobs"] = await run_benchmark_job_reaper(org_id=org_id)
+    except Exception as e:
+        logger.exception("Benchmark job reaper failed")
+        result["benchmark_jobs"] = {"error": str(e)[:300]}
     result["finished_at"] = _now()
     return result
 
@@ -293,9 +317,22 @@ async def control_loop_status(
         "last_finished_at": _state["last_finished_at"],
         "last_cycle_failed": _state["last_error"] is not None,
     }
+    from optimization import jobs as jobs_mod
+    # Liveness of the async-benchmark machinery. Never org data: a count of
+    # tasks in THIS process and whether the v9 columns exist. `degraded_reason`
+    # is a raw exception string and stays operator-only, like `last_error`.
+    schema = jobs_mod.schema_status()
+    payload["benchmark_jobs"] = {
+        "in_process_tasks": jobs_mod.active_task_count(),
+        "job_columns_available": schema["job_columns_available"],
+        "heartbeat_seconds": schema["heartbeat_seconds"],
+        "lease_seconds": schema["lease_seconds"],
+    }
     if _is_operator(x_optiml_cron_secret):
         payload["last_result"] = _state["last_result"]
         payload["last_error"] = _state["last_error"]
+        payload["benchmark_jobs"]["degraded_reason"] = schema["degraded_reason"]
+        payload["benchmark_jobs"]["worker_id"] = schema["worker_id"]
     return payload
 
 
@@ -336,6 +373,29 @@ def register_background_jobs(app, prefix: str = "/api") -> None:
     _state["interval_seconds"] = interval
 
     @app.on_event("startup")
+    async def _reap_orphaned_benchmarks_on_boot() -> None:
+        """
+        Resolve jobs orphaned by the process that just died, immediately.
+
+        On a single-worker deployment the process that lost a benchmark IS the
+        one coming back, and nothing else is watching. Waiting for the first
+        control-loop tick would leave the dashboard showing a run that has been
+        dead since before the restart. This runs once, costs one query, and
+        cannot mark a live job failed: a job started by THIS process has not
+        been created yet, and any job whose lease has not expired is left alone.
+        """
+        try:
+            result = await run_benchmark_job_reaper()
+            if result.get("failed"):
+                logger.warning(
+                    "Startup reap: %d benchmark job(s) orphaned by a previous "
+                    "process were marked failed (worker_lost): %s",
+                    result["failed"], result.get("benchmark_ids"),
+                )
+        except Exception:
+            logger.exception("Startup benchmark-job reap failed; the loop will retry.")
+
+    @app.on_event("startup")
     async def _start_control_loop() -> None:
         global _task
         if not enabled:
@@ -350,6 +410,31 @@ def register_background_jobs(app, prefix: str = "/api") -> None:
         _get_stop_event().clear()
         _task = asyncio.create_task(_loop(interval, start_delay))
         _task.add_done_callback(_on_loop_done)
+
+    @app.on_event("shutdown")
+    async def _note_abandoned_benchmark_jobs() -> None:
+        """
+        Say what this process is walking away from.
+
+        In-flight benchmark jobs are NOT marked failed here. This handler runs
+        while the run may still be finishing in a worker thread, and a process
+        that is going away must not guess how much of a 28-minute run it
+        completed — killing a job that then writes a real conclusion a second
+        later would destroy evidence that was already paid for. The heartbeat
+        stops with the loop, so the job falls out of its lease and is reaped by
+        whichever process is alive next, including this one on restart.
+        """
+        from optimization import jobs as jobs_mod
+
+        outstanding = jobs_mod.active_task_count()
+        if outstanding:
+            logger.warning(
+                "Shutting down with %d benchmark job(s) still in flight. They are "
+                "left ACTIVE deliberately; their lease will expire and the "
+                "startup/interval reaper will mark them worker_lost. Measured "
+                "arms are already durable in benchmark_candidate_results.",
+                outstanding,
+            )
 
     @app.on_event("shutdown")
     async def _stop_control_loop() -> None:

@@ -401,6 +401,33 @@ def require_evidence(org_id: str, rec_id: str) -> list[dict]:
         return []
 
 
+def recommendations_citing(org_id: str, benchmark_id: str) -> list[str]:
+    """
+    The recommendation ids that CITE this benchmark, newest first.
+
+    The inverse of require_evidence, and the reason a completed job can tell the
+    caller what its run produced without the caller already knowing. Reads the
+    same join table; the direction of the relationship is unchanged (a benchmark
+    produces evidence, a recommendation cites it) and no column is added to
+    either side to shortcut it.
+    """
+    try:
+        resp = (
+            supabase.table("recommendation_evidence")
+            .select(EVIDENCE_COLS)
+            .eq("org_id", org_id)
+            .eq("benchmark_id", benchmark_id)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        return [str(r["recommendation_id"]) for r in rows if r.get("recommendation_id")]
+    except Exception as exc:  # pragma: no cover
+        logger.warning("recommendations_citing failed: %s", type(exc).__name__)
+        return []
+
+
 def cite_evidence(
     org_id: str, rec_id: str, benchmark_id: str, *, evidence_role: str = "primary"
 ) -> Optional[dict]:

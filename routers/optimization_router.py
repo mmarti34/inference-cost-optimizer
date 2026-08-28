@@ -20,12 +20,19 @@ A conclusion is a stable `conclusion` code plus a `reasons` array whose entries
 carry the underlying facts (observed, required, constraint, unit). All wording
 is derived by the frontend, so rephrasing a sentence is never an API change.
 
+BENCHMARK EXECUTION IS ASYNCHRONOUS. /optimize and /benchmark return 202 with a
+benchmark id and a phase, and the run continues in a worker. See
+optimization/jobs.py for the job lifecycle, the idempotency key and how an
+orphaned run is detected. Poll
+GET /api/optimization/{org_id}/benchmarks/{benchmark_id}/status.
+
 Routes:
   GET  /api/optimization/{org_id}/summary
   GET  /api/optimization/{org_id}/workloads
   POST /api/optimization/{org_id}/workloads/discover
   GET  /api/optimization/{org_id}/optimization-targets
-  POST /api/optimization/{org_id}/workloads/{workload_id}/optimize
+  POST /api/optimization/{org_id}/workloads/{workload_id}/optimize      -> 202
+  GET  /api/optimization/{org_id}/jobs
   GET  /api/optimization/{org_id}/recommendations
   GET  /api/optimization/{org_id}/recommendations/{rec_id}
   POST /api/optimization/{org_id}/recommendations/{rec_id}/benchmark
@@ -33,9 +40,10 @@ Routes:
   POST /api/optimization/{org_id}/recommendations/{rec_id}/accept
   GET  /api/optimization/{org_id}/benchmarks
   GET  /api/optimization/{org_id}/benchmarks/{benchmark_id}
+  GET  /api/optimization/{org_id}/benchmarks/{benchmark_id}/status
   POST /api/optimization/{org_id}/benchmarks/{benchmark_id}/reevaluate
   GET  /api/optimization/{org_id}/candidate-results
-  POST /api/optimization/{org_id}/workloads/{workload_id}/benchmark
+  POST /api/optimization/{org_id}/workloads/{workload_id}/benchmark      -> 202
   GET  /api/optimization/{org_id}/policies
   POST /api/optimization/{org_id}/policies
   PUT  /api/optimization/{org_id}/policies/{policy_id}
@@ -65,6 +73,7 @@ from optimization import (
     domain,
     evidence as evidence_mod,
     executors as executors_mod,
+    jobs as jobs_mod,
     outcomes as outcomes_mod,
     policies as policies_mod,
     service,
@@ -311,19 +320,25 @@ async def get_recommendation(
     return service.recommendation_row_to_response(row, evidence=evidence)
 
 
-@router.post("/{org_id}/recommendations/{rec_id}/benchmark")
+@router.post("/{org_id}/recommendations/{rec_id}/benchmark", status_code=202)
 async def benchmark_recommendation(
     org_id: str,
     rec_id: str,
     payload: Optional[BenchmarkPayload] = None,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     user: AuthenticatedUser = Depends(require_org_member),
 ):
     """
-    Run a replay benchmark and cite it from this recommendation.
+    Start a replay benchmark JOB whose evidence this recommendation will cite.
 
-    Moves the recommendation to 'benchmarking' immediately and runs the replay
-    in a worker thread — the same kickoff pattern the existing eval flow uses.
-    The conclusion, when it lands, drives the next transition.
+    Moves the recommendation to 'benchmarking' and returns 202 with the
+    benchmark id. The conclusion, when it lands, drives the next transition.
+
+    Unlike the two workload routes this one has a precondition with a side
+    effect: the lifecycle transition. It is taken FIRST, so an illegal
+    transition is a 409 and no job is created; if the job then turns out to be a
+    duplicate the recommendation is already 'benchmarking', which is what the
+    in-flight job it is being handed will make true anyway.
     """
     org_id = _verified_org(user, org_id)
     rec = service.get_recommendation(org_id, rec_id)
@@ -344,28 +359,26 @@ async def benchmark_recommendation(
     except service.RecommendationError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    objective = (payload.objective if payload else None) or rec.get("objective")
-    min_sample = payload.min_sample_size if payload else None
-
-    asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: benchmark_mod.run_benchmark(
-            org_id,
-            workload_id=str(rec["workload_id"]),
-            recommendation_id=rec_id,
-            objective=objective,
-            min_sample_size=min_sample,
-            actor=user.user_id,
-        ),
+    row, created = await _start_benchmark_job(
+        org_id,
+        workload_id=str(rec["workload_id"]),
+        job_kind=jobs_mod.JOB_KIND_RECOMMENDATION_BENCHMARK,
+        actor=user.user_id,
+        objective=(payload.objective if payload else None) or rec.get("objective"),
+        min_sample_size=(payload.min_sample_size if payload else None),
+        create_recommendation=False,
+        recommendation_id=rec_id,
+        client_key=idempotency_key,
     )
-
-    return {
-        "recommendation_id": rec_id,
-        "status": domain.STATUS_BENCHMARKING,
-        "workload_id": str(rec["workload_id"]),
-        "objective": objective,
-        "note": "Benchmark started. Poll the recommendation or /benchmarks for the conclusion.",
-    }
+    return _job_envelope(
+        row,
+        created,
+        extra={
+            "recommendation_id": rec_id,
+            "recommendation_status": domain.STATUS_BENCHMARKING,
+            "creates_recommendation": False,
+        },
+    )
 
 
 @router.post("/{org_id}/recommendations/{rec_id}/reject")
@@ -560,59 +573,197 @@ def _create_candidate_deployment(org_id: str, rec: dict) -> Optional[dict]:
 # Benchmarks — evidence, addressable on its own
 # ---------------------------------------------------------------------------
 
-@router.post("/{org_id}/workloads/{workload_id}/benchmark")
+# ---------------------------------------------------------------------------
+# Starting a benchmark job
+# ---------------------------------------------------------------------------
+#
+# THREE ENTRY POINTS, ONE MECHANISM.
+#
+# Before this change there were three ways to run the same function and three
+# different contracts:
+#
+#   POST /workloads/{id}/optimize   ran it synchronously and awaited the verdict
+#   POST /workloads/{id}/benchmark  fired and forgot, returned {"status":"pending"}
+#   POST /recommendations/{id}/benchmark  fired and forgot, moved the rec
+#
+# The first could not survive an edge timeout. The other two returned no id, so
+# a caller had no way to ask what happened; a benchmark that died with its
+# worker left a row saying `running` that nothing would ever correct.
+#
+# All three now create a JOB and return the SAME 202 envelope with the benchmark
+# id. They are not merged into one route, because they express three genuinely
+# different intents — and that intent is recorded on the row as `job_kind`, not
+# inferred later from which fields happen to be populated:
+#
+#   optimize                  may create a recommendation on safe_improvement_found
+#   benchmark (workload)      may NEVER create one, whatever it concludes
+#   benchmark (recommendation) gathers evidence FOR an existing recommendation
+#                             and drives its lifecycle transition
+#
+# The first two differ in exactly one boolean, which /optimize already exposes
+# as `create_recommendation`. /benchmark is therefore kept as the NAMED,
+# non-negotiable form of that boolean rather than deleted: a route that cannot
+# produce a proposal is a stronger guarantee than a flag a caller must remember
+# to send, the existing frontend already calls it, and the difference is
+# recorded in the idempotency key so an exploratory run can never be handed back
+# to a caller that asked for the full loop.
+
+
+def _job_envelope(row: dict, created: bool, *, extra: Optional[dict] = None) -> dict:
+    out = jobs_mod.job_response(row, created=created)
+    if extra:
+        out.update(extra)
+    return out
+
+
+async def _start_benchmark_job(
+    org_id: str,
+    *,
+    workload_id: str,
+    job_kind: str,
+    actor: Optional[str],
+    objective: Optional[str] = None,
+    min_sample_size: Optional[int] = None,
+    create_recommendation: bool = False,
+    recommendation_id: Optional[str] = None,
+    client_key: Optional[str] = None,
+) -> tuple[dict, bool]:
+    """
+    Persist the job, then hand the run to a worker. Returns (row, created).
+
+    `created=False` means an equivalent job was already in flight and THIS
+    REQUEST STARTED NOTHING. That is the double-spend guarantee: the decision
+    not to execute is taken here, before a single provider call, on the basis of
+    a row the database already holds.
+    """
+    try:
+        prepared = benchmark_mod.prepare_benchmark(
+            org_id,
+            workload_id=workload_id,
+            objective=objective,
+            min_sample_size=min_sample_size,
+        )
+    except benchmark_mod.BenchmarkError as exc:
+        # Resolvable failures are answered NOW, while the caller is still on the
+        # line. Accepting a request with 202 and failing it a second later would
+        # be a worse contract than the synchronous one it replaces.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    row, created, _key = jobs_mod.create_job(
+        org_id,
+        workload_id=workload_id,
+        job_kind=job_kind,
+        insert_row=lambda cols: benchmark_mod.create_benchmark_row(
+            org_id, prepared, extra_columns=cols
+        ),
+        objective=prepared["objective"],
+        min_sample_size=min_sample_size,
+        create_recommendation=create_recommendation,
+        recommendation_id=recommendation_id,
+        client_key=client_key,
+        requested_by=actor,
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="Failed to create the benchmark job.")
+    if not created:
+        return row, False
+
+    benchmark_id = str(row["id"])
+    try:
+        jobs_mod.start_job(
+            org_id,
+            benchmark_id,
+            lambda reporter: benchmark_mod.run_benchmark(
+                org_id,
+                workload_id=workload_id,
+                objective=prepared["objective"],
+                min_sample_size=min_sample_size,
+                create_recommendation=create_recommendation,
+                recommendation_id=recommendation_id,
+                actor=actor,
+                benchmark_id=benchmark_id,
+                prepared=prepared,
+                progress=reporter,
+            ),
+        )
+    except Exception as exc:
+        # The row exists and the worker never got it. Say so on the row rather
+        # than leaving a job that is queued forever.
+        logger.exception("Could not start benchmark job %s", benchmark_id)
+        jobs_mod.fail_job(
+            org_id, benchmark_id, code="start_failed", detail=str(exc)[:300]
+        )
+        raise HTTPException(
+            status_code=503, detail="Benchmark job could not be started."
+        ) from exc
+
+    refreshed = jobs_mod.get_job(org_id, benchmark_id) or row
+    return refreshed, True
+
+
+@router.post("/{org_id}/workloads/{workload_id}/benchmark", status_code=202)
 async def benchmark_workload(
     org_id: str,
     workload_id: str,
     payload: Optional[BenchmarkPayload] = None,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     user: AuthenticatedUser = Depends(require_org_member),
 ):
     """
-    Run an EXPLORATORY benchmark against a workload, with no recommendation.
+    Start an EXPLORATORY benchmark job against a workload. 202 + benchmark id.
 
     Benchmarks discover facts; recommendations propose actions. Completing this
     never creates a recommendation — only a 'safe_improvement_found' conclusion
-    justifies one, and creating it stays an explicit act.
+    justifies one, and creating it stays an explicit act. This is /optimize with
+    create_recommendation permanently false; the job is identical in every other
+    respect, including progress reporting and orphan recovery.
     """
     org_id = _verified_org(user, org_id)
     if workloads_mod.get_workload(org_id, workload_id) is None:
         raise HTTPException(status_code=404, detail="Workload not found.")
 
-    asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: benchmark_mod.run_benchmark(
-            org_id,
-            workload_id=workload_id,
-            objective=(payload.objective if payload else None),
-            min_sample_size=(payload.min_sample_size if payload else None),
-            actor=user.user_id,
-        ),
+    row, created = await _start_benchmark_job(
+        org_id,
+        workload_id=workload_id,
+        job_kind=jobs_mod.JOB_KIND_EXPLORE,
+        actor=user.user_id,
+        objective=(payload.objective if payload else None),
+        min_sample_size=(payload.min_sample_size if payload else None),
+        create_recommendation=False,
+        client_key=idempotency_key,
     )
-    return {
-        "workload_id": workload_id,
-        "status": "pending",
-        "note": "Exploratory benchmark started. No recommendation will be created automatically.",
-    }
+    return _job_envelope(row, created, extra={"creates_recommendation": False})
 
 
-@router.post("/{org_id}/workloads/{workload_id}/optimize")
+@router.post("/{org_id}/workloads/{workload_id}/optimize", status_code=202)
 async def optimize_workload(
     org_id: str,
     workload_id: str,
     payload: Optional[OptimizePayload] = None,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     user: AuthenticatedUser = Depends(require_org_member),
 ):
     """
-    The full loop, run to completion: generate model-substitution candidates,
-    replay them and the baseline over the SAME golden inputs, judge the result
-    against the workload's policy, persist every measured arm and one immutable
-    conclusion, and — only on `safe_improvement_found` — create a recommendation
-    that cites the benchmark.
+    Start the full loop as a JOB, and return 202 with the benchmark id.
 
-    Unlike /benchmark this AWAITS the verdict, because the verdict is the point.
-    A conclusion of `insufficient_evidence` is a successful response, not an
-    error: it is what OptiML knows, and it is never rendered as "your current
+    The loop itself is unchanged: generate model-substitution candidates, replay
+    them and the baseline over the SAME golden inputs, judge the result against
+    the workload's policy, persist every measured arm and one immutable
+    conclusion, and — only on `safe_improvement_found` — create a recommendation
+    that cites the benchmark. A conclusion of `insufficient_evidence` remains a
+    successful outcome, not an error, and is never rendered as "your current
     configuration is optimal".
+
+    WHAT CHANGED, AND WHY. This used to await the verdict inside the request.
+    The first real production run took ~28 minutes against a 300-second edge
+    timeout: the caller got a connection error, the benchmark finished, and the
+    API told nobody. The verdict is still the point — it is now fetched by
+    polling .../benchmarks/{benchmark_id}/status, which works whether the run
+    takes 40 seconds or 40 minutes and whether or not the caller was still
+    connected when it landed.
+
+    A duplicate request while an equivalent job is in flight returns THAT job
+    with `created: false` and starts nothing.
 
     The recommendation, if one is created, is `approval_required` per policy and
     defaults to requiring a human. Nothing here changes production.
@@ -621,32 +772,45 @@ async def optimize_workload(
     if workloads_mod.get_workload(org_id, workload_id) is None:
         raise HTTPException(status_code=404, detail="Workload not found.")
 
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: benchmark_mod.run_benchmark(
-                org_id,
-                workload_id=workload_id,
-                objective=(payload.objective if payload else None),
-                min_sample_size=(payload.min_sample_size if payload else None),
-                create_recommendation=(payload.create_recommendation if payload else True),
-                actor=user.user_id,
-            ),
-        )
-    except benchmark_mod.BenchmarkError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    wants_recommendation = payload.create_recommendation if payload else True
+    row, created = await _start_benchmark_job(
+        org_id,
+        workload_id=workload_id,
+        job_kind=jobs_mod.JOB_KIND_OPTIMIZE,
+        actor=user.user_id,
+        objective=(payload.objective if payload else None),
+        min_sample_size=(payload.min_sample_size if payload else None),
+        create_recommendation=wants_recommendation,
+        client_key=idempotency_key,
+    )
+    return _job_envelope(
+        row, created, extra={"creates_recommendation": bool(wants_recommendation)}
+    )
 
-    rec_id = result.get("recommendation_id")
-    rec_row = service.get_recommendation(org_id, rec_id) if rec_id else None
+
+@router.get("/{org_id}/jobs")
+async def list_jobs(
+    org_id: str,
+    workload_id: Optional[str] = None,
+    limit: int = 100,
+    user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Every benchmark job for THIS org that has not reached a verdict.
+
+    Exists so a frontend that lost its benchmark id — a reload, a new tab, a
+    different device — can find the run that is still going instead of starting
+    a second one.
+    """
+    org_id = _verified_org(user, org_id)
+    rows = jobs_mod.list_active_jobs(org_id, workload_id=workload_id, limit=limit)
     return {
-        **result,
-        "recommendation": (
-            service.recommendation_row_to_response(
-                rec_row, evidence=service.require_evidence(org_id, rec_id)
-            )
-            if rec_row
-            else None
-        ),
+        "jobs": [jobs_mod.job_response(r) for r in rows],
+        "progress_states": {
+            **{k: v for k, v in jobs_mod.PROGRESS_STATES.items()},
+        },
+        "job_kinds": jobs_mod.JOB_KINDS,
+        "lease_seconds": jobs_mod.lease_seconds(),
     }
 
 
@@ -684,6 +848,56 @@ async def get_benchmark(
         # Every evaluation of this evidence, each bound to its policy version.
         # An older verdict is not wrong; it was correct under the policy then.
         "conclusion_history": benchmark_mod.conclusion_history(org_id, benchmark_id),
+    }
+
+
+@router.get("/{org_id}/benchmarks/{benchmark_id}/status")
+async def benchmark_status(
+    org_id: str, benchmark_id: str, user: AuthenticatedUser = Depends(require_org_member)
+):
+    """
+    The poll target. Cheap, org-scoped, safe to call every few seconds.
+
+    Returns the job envelope — status, progress_state, the resolved phase plan
+    and the counts behind it — plus, once the job is terminal, the conclusion
+    and the recommendation it created. Before that the conclusion fields are
+    absent rather than provisional: a run that has measured three of seven arms
+    has no verdict, and reporting a partial one would be the thing this codebase
+    calls fabrication.
+
+    404 is returned both for a benchmark that does not exist and for one
+    belonging to another organization. Distinguishing them would make this
+    endpoint an oracle for another tenant's benchmark ids.
+    """
+    org_id = _verified_org(user, org_id)
+    row = jobs_mod.get_job(org_id, benchmark_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Benchmark not found.")
+
+    envelope = jobs_mod.job_response(row)
+    if row.get("status") not in jobs_mod.TERMINAL_STATUSES:
+        return envelope
+
+    full = benchmark_mod.get_benchmark(org_id, benchmark_id)
+    if full is None:
+        return envelope
+    conclusion_row = benchmark_mod.current_conclusion(org_id, benchmark_id)
+    cited_by = service.recommendations_citing(org_id, benchmark_id)
+    rec_id = cited_by[0] if cited_by else None
+    rec_row = service.get_recommendation(org_id, rec_id) if rec_id else None
+    return {
+        **envelope,
+        "result": benchmark_mod.benchmark_row_to_response(
+            full, conclusion_row=conclusion_row
+        ),
+        "recommendation_id": rec_id,
+        "recommendation": (
+            service.recommendation_row_to_response(
+                rec_row, evidence=service.require_evidence(org_id, rec_id)
+            )
+            if rec_row
+            else None
+        ),
     }
 
 

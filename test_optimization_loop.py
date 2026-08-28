@@ -414,6 +414,7 @@ def _patched(db, runtime):
         "optimization.allocation",
         "optimization.outcomes",
         "optimization.evidence",
+        "optimization.jobs",
     ]
     patches = [patch(f"{t}.supabase", db) for t in targets]
     patches.append(patch("workflow_runtime.execute_workflow", runtime))
@@ -1171,12 +1172,43 @@ def _client(db, runtime):
     return TestClient(app)
 
 
-def test_optimize_endpoint_returns_the_verdict_and_the_recommendation(db):
+def wait_for_job(client, org_id, benchmark_id, timeout=30.0):
+    """
+    Poll the status endpoint until the job is terminal.
+
+    This IS the new contract: the verdict is fetched by polling an id, not by
+    holding a connection open for the length of the run. Shared with
+    test_async_jobs.py.
+    """
+    import time
+
+    deadline = time.time() + timeout
+    body = None
+    while time.time() < deadline:
+        resp = client.get(
+            f"/api/optimization/{org_id}/benchmarks/{benchmark_id}/status"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        if body.get("terminal"):
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"job {benchmark_id} did not finish within {timeout}s: {body}")
+
+
+def test_optimize_endpoint_returns_a_job_then_the_verdict_and_the_recommendation(db):
     # The margin is pinned to 0.05 EXPLICITLY rather than inherited from the
     # default. This test asserts what a 60-case tie establishes at a 5pp margin;
     # a test that silently tracked the default would stop testing that. The 2pp
     # default's behaviour on the same evidence is asserted separately, in
     # test_quality_non_inferiority.py.
+    #
+    # WHAT CHANGED HERE. /optimize used to run the whole benchmark inside the
+    # request and answer 200 with the verdict. In production that meant a
+    # 28-minute HTTP connection against a 300-second edge timeout, so the same
+    # evidence is now reached by accepting a job (202) and polling its id. The
+    # assertions about the VERDICT are unchanged: it is the delivery that moved,
+    # not the conclusion.
     _seed(
         db, golden_inputs=60, production_runs=120,
         constraints={"min_quality": 0.95, "max_quality_regression": 0.05},
@@ -1186,26 +1218,38 @@ def test_optimize_endpoint_returns_the_verdict_and_the_recommendation(db):
     for p in patches:
         p.start()
     try:
-        client = _client(db, runtime)
-        resp = client.post(
-            f"/api/optimization/{ORG_ID}/workloads/{WORKLOAD_ID}/optimize", json={}
-        )
+        with _client(db, runtime) as client:
+            resp = client.post(
+                f"/api/optimization/{ORG_ID}/workloads/{WORKLOAD_ID}/optimize", json={}
+            )
+            assert resp.status_code == 202, resp.text
+            accepted = resp.json()
+            assert accepted["created"] is True
+            assert accepted["status"] in ("queued", "running")
+            assert accepted["job_kind"] == "optimize"
+            benchmark_id = accepted["benchmark_id"]
+
+            status = wait_for_job(client, ORG_ID, benchmark_id)
     finally:
         for p in reversed(patches):
             p.stop()
 
-    assert resp.status_code == 200
-    body = resp.json()
+    assert status["status"] == "completed"
+    assert status["progress_state"] == "completed"
+    # `result` is the same benchmark payload GET /benchmarks/{id} returns, so a
+    # caller that polls to terminal has the evidence without a second shape to
+    # learn.
+    body = status["result"]
+    assert body["id"] == benchmark_id
     assert body["conclusion"] == domain.CONCLUSION_SAFE_IMPROVEMENT
     # Codes and facts, never prose the frontend would have to parse.
     assert all(r["code"] in domain.REASON_CODES for r in body["reasons"])
-    assert body["recommendation"]["governance"]["approval_required"] is True
-    assert body["recommendation"]["status"] == domain.STATUS_VERIFIED
-    assert body["recommendation"]["evidence"]["source"] == "replay"
-    assert body["recommendation"]["evidence"]["benchmarks"][0]["benchmark_id"] == (
-        body["benchmark_id"]
-    )
-    savings = body["recommendation"]["savings"]
+    rec = status["recommendation"]
+    assert rec["governance"]["approval_required"] is True
+    assert rec["status"] == domain.STATUS_VERIFIED
+    assert rec["evidence"]["source"] == "replay"
+    assert rec["evidence"]["benchmarks"][0]["benchmark_id"] == benchmark_id
+    savings = rec["savings"]
     assert savings["verified_usd"] is not None
     assert savings["realized_usd"] is None  # never written before promotion
 
@@ -1217,10 +1261,10 @@ def test_optimize_endpoint_404s_on_a_workload_belonging_to_another_org(db):
     for p in patches:
         p.start()
     try:
-        client = _client(db, runtime)
-        resp = client.post(
-            f"/api/optimization/{ORG_ID}/workloads/{WORKLOAD_ID}/optimize", json={}
-        )
+        with _client(db, runtime) as client:
+            resp = client.post(
+                f"/api/optimization/{ORG_ID}/workloads/{WORKLOAD_ID}/optimize", json={}
+            )
     finally:
         for p in reversed(patches):
             p.stop()

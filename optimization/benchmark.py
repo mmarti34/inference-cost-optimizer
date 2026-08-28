@@ -51,6 +51,11 @@ from optimization import (
     allocation,
     domain,
     executors as executors_mod,
+    # The phase vocabulary an async job reports. Imported for the CONSTANTS, so
+    # a phase name written from here is the same datum the database CHECK
+    # constrains and the API documents — never a string literal typed twice.
+    # jobs.py depends on nothing in this package, so there is no cycle.
+    jobs as jobs_mod,
     noninferiority,
     outcomes as outcomes_mod,
     policies,
@@ -429,6 +434,95 @@ def _arm_over_prefix(arm: dict, cases_run: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Preparation — everything resolvable BEFORE a row is written
+# ---------------------------------------------------------------------------
+#
+# Split out of run_benchmark so an ASYNCHRONOUS caller can validate the request
+# and persist the job row while it still holds the HTTP connection, then hand
+# the run itself to a worker. An unknown objective must be a 400 on the POST,
+# not a job that is accepted with 202 and fails a second later — the caller is
+# still there to be told, and telling it is free.
+#
+# It resolves only: the workload, the objective, the effective policy, its
+# materiality and the sample-size floor. All are cheap reads. Nothing here
+# executes an arm, prices a call or reaches a provider.
+
+def prepare_benchmark(
+    org_id: str,
+    *,
+    workload_id: str,
+    objective: Optional[str] = None,
+    min_sample_size: Optional[int] = None,
+) -> dict:
+    """Resolve a benchmark's inputs, or raise BenchmarkError. Writes nothing."""
+    workload = workloads_mod.get_workload(org_id, workload_id)
+    if workload is None:
+        raise BenchmarkError("Workload not found for this organization.")
+
+    objective = objective or workload.get("default_objective") or domain.DEFAULT_OBJECTIVE
+    if not domain.is_valid_objective(objective):
+        raise BenchmarkError(f"Unknown objective '{objective}'.")
+
+    policy = policies.get_effective_policy(org_id, workload_id)
+    materiality = policies.materiality_of(policy, objective)
+    floor = int(
+        min_sample_size
+        if min_sample_size is not None
+        else (policies.constraints_of(policy).get("min_sample_size") or DEFAULT_MIN_SAMPLE_SIZE)
+    )
+    return {
+        "workload": workload,
+        "objective": objective,
+        "policy": policy,
+        "materiality": materiality,
+        "floor": floor,
+    }
+
+
+def create_benchmark_row(
+    org_id: str,
+    prepared: dict,
+    *,
+    method: str = "golden_replay",
+    extra_columns: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Persist the benchmark row that IS the job. `extra_columns` carries the
+    async-job fields (optimization/jobs.py owns their meaning; this module owns
+    the row).
+    """
+    return _insert_benchmark(
+        org_id,
+        workload_id=str(prepared["workload"]["id"]),
+        method=method,
+        objective=prepared["objective"],
+        policy=prepared["policy"],
+        materiality=prepared["materiality"],
+        extra=extra_columns,
+    )
+
+
+def _progress_emitter(progress):
+    """
+    Wrap a progress callback so it can never fail the run.
+
+    The measurement is the product; the progress bar is not. A benchmark that
+    has spent twenty minutes of real provider budget must not be lost because a
+    JSONB status write timed out.
+    """
+    if progress is None:
+        return lambda *_a, **_k: None
+
+    def _emit(state: str, **facts) -> None:
+        try:
+            progress(state, **facts)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("Progress callback raised; the benchmark continues.")
+
+    return _emit
+
+
+# ---------------------------------------------------------------------------
 # The public entry point
 # ---------------------------------------------------------------------------
 
@@ -443,6 +537,9 @@ def run_benchmark(
     min_sample_size: Optional[int] = None,
     actor: Optional[str] = None,
     create_recommendation: bool = False,
+    benchmark_id: Optional[str] = None,
+    prepared: Optional[dict] = None,
+    progress: Optional[Any] = None,
 ) -> dict:
     """
     Run a replay benchmark for a workload and record explicit evidence.
@@ -460,39 +557,40 @@ def run_benchmark(
     Every other conclusion creates nothing: there is no path by which
     `insufficient_evidence` or a policy failure produces a proposal.
 
+    `benchmark_id`/`prepared` let an ASYNCHRONOUS caller persist the row first
+    (so it can hand the id back on a 202 before the run starts) and then execute
+    against it. Omitted, the behaviour is exactly what it was: resolve, insert,
+    run, synchronously.
+
+    `progress` is an optional callback invoked at real phase boundaries. It is
+    reporting only — it observes work already done and can neither change what
+    is measured nor fail the run.
+
     Returns the benchmark row plus its conclusion payload. Never raises for an
     evidence shortfall — that is a conclusion, not an error.
     """
     from optimization import candidates as candidates_mod
     from optimization import service as service_mod
 
-    workload = workloads_mod.get_workload(org_id, workload_id)
-    if workload is None:
-        raise BenchmarkError("Workload not found for this organization.")
-
-    objective = objective or workload.get("default_objective") or domain.DEFAULT_OBJECTIVE
-    if not domain.is_valid_objective(objective):
-        raise BenchmarkError(f"Unknown objective '{objective}'.")
-
-    policy = policies.get_effective_policy(org_id, workload_id)
-    materiality = policies.materiality_of(policy, objective)
-    floor = int(
-        min_sample_size
-        if min_sample_size is not None
-        else (policies.constraints_of(policy).get("min_sample_size") or DEFAULT_MIN_SAMPLE_SIZE)
-    )
-
-    benchmark = _insert_benchmark(
+    prepared = prepared or prepare_benchmark(
         org_id,
         workload_id=workload_id,
-        method=method,
         objective=objective,
-        policy=policy,
-        materiality=materiality,
+        min_sample_size=min_sample_size,
     )
-    if benchmark is None:
-        raise BenchmarkError("Failed to create the benchmark record.")
-    benchmark_id = str(benchmark["id"])
+    workload = prepared["workload"]
+    objective = prepared["objective"]
+    policy = prepared["policy"]
+    materiality = prepared["materiality"]
+    floor = prepared["floor"]
+
+    if benchmark_id is None:
+        benchmark = create_benchmark_row(org_id, prepared, method=method)
+        if benchmark is None:
+            raise BenchmarkError("Failed to create the benchmark record.")
+        benchmark_id = str(benchmark["id"])
+    else:
+        benchmark_id = str(benchmark_id)
 
     try:
         return _run(
@@ -510,6 +608,7 @@ def run_benchmark(
             create_recommendation=create_recommendation,
             candidates_mod=candidates_mod,
             service_mod=service_mod,
+            progress=progress,
         )
     except Exception as exc:
         logger.exception("Benchmark %s failed", benchmark_id)
@@ -551,13 +650,23 @@ def _run(
     candidates_mod,
     service_mod,
     create_recommendation: bool = False,
+    progress: Optional[Any] = None,
 ) -> dict:
+    # Phase reporting only. Every emit() call below observes work that has
+    # ALREADY happened — cases loaded, arms finished, stages run. None of them
+    # estimates remaining time or predicts a verdict, and none can alter what is
+    # measured. `emit` is a no-op when no callback was supplied, which is the
+    # case for every synchronous caller and every existing test.
+    emit = _progress_emitter(progress)
+
     workload_id = str(workload["id"])
+    emit(jobs_mod.PROGRESS_PREPARING)
     workflow_id = workloads_mod.resolve_workflow_id(org_id, workload)
 
     # A runtime replay needs a workflow graph. Direct-inference workloads have
     # none: say so explicitly rather than failing obscurely.
     if not workflow_id:
+        emit(jobs_mod.PROGRESS_CONCLUDING)
         return _conclude(
             org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
             policy=policy, materiality=materiality,
@@ -583,6 +692,7 @@ def _run(
 
     baseline_graph, endpoint_slug = _load_baseline_graph(org_id, workload, workflow_id)
     if baseline_graph is None:
+        emit(jobs_mod.PROGRESS_CONCLUDING)
         return _conclude(
             org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
             policy=policy, materiality=materiality,
@@ -606,6 +716,7 @@ def _run(
     # ── Sample-size floor. A refusal, recorded as a CONCLUSION, not an error
     # and not silence.
     if n < floor:
+        emit(jobs_mod.PROGRESS_CONCLUDING, cases_planned=n)
         return _conclude(
             org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
             policy=policy, materiality=materiality,
@@ -628,6 +739,7 @@ def _run(
         )
 
     # ── Candidates
+    emit(jobs_mod.PROGRESS_CANDIDATE_SCREENING, cases_planned=n)
     if explicit_candidates:
         cand_list = list(explicit_candidates)
         gen_meta = {"source": "caller_supplied", "dropped": []}
@@ -637,6 +749,7 @@ def _run(
         )
 
     if not cand_list:
+        emit(jobs_mod.PROGRESS_CONCLUDING, cases_planned=n, arms_total=0)
         return _conclude(
             org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
             policy=policy, materiality=materiality,
@@ -683,6 +796,10 @@ def _run(
     # the baseline's verdicts on the cases a candidate has NOT yet reached are
     # already MEASURED, so the early-stop bound can use real counts instead of
     # assuming the worst about every unrun case. See optimization/staging.py.
+    emit(
+        jobs_mod.PROGRESS_BASELINE_MEASUREMENT,
+        cases_planned=n, arms_total=len(cand_list) + 1, arms_completed=0,
+    )
     baseline_metrics = _execute_arm(
         baseline_graph, cases, org_id=org_id, workflow_id=workflow_id,
         endpoint_slug=endpoint_slug, checks=checks, label="baseline",
@@ -716,6 +833,13 @@ def _run(
 
     measured: list[dict] = []
     staging_records: list[dict] = []
+    # The stage count is now KNOWN, so the phase plan the caller polls stops
+    # being open-ended: `stages_planned` fixes how many stage_k phases exist.
+    emit(
+        jobs_mod.PROGRESS_BASELINE_MEASUREMENT,
+        stages_planned=len(stage_plan), cases_planned=n,
+        arms_total=len(cand_list) + 1, arms_completed=1,
+    )
     for cand in cand_list:
         try:
             cand_graph = strategy_mod.apply_to_graph(baseline_graph, cand.strategy)
@@ -733,6 +857,12 @@ def _run(
         stop_decision: Optional[dict] = None
 
         for stage in stage_plan:
+            emit(
+                jobs_mod.stage_state(stage["stage_index"]),
+                stage_index=stage["stage_index"],
+                arms_completed=len(measured) + 1,
+                cases_completed=stage["start"],
+            )
             part = _execute_arm(
                 cand_graph, cases[stage["start"]:stage["end"]],
                 org_id=org_id, workflow_id=workflow_id, endpoint_slug=endpoint_slug,
@@ -822,6 +952,14 @@ def _run(
 
     staging_summary = staging_mod.rollup(staging_records)
 
+    # Every arm is measured. What follows runs no model calls: it compares what
+    # was measured against the policy.
+    emit(
+        jobs_mod.PROGRESS_VERIFICATION,
+        arms_total=len(cand_list) + 1, arms_completed=len(measured) + 1,
+        cases_planned=n,
+    )
+
     # ── Success signal: the POLICY decides, not a global constant
     observed_outcomes = outcomes_mod.list_outcomes(org_id, workload_id=workload_id, limit=500)
     signal = domain.resolve_success_signal(
@@ -858,6 +996,7 @@ def _run(
         verdict["winner"]["baseline_mean_cost_usd"] = baseline_metrics.get("mean_cost_usd")
         verdict["winner"]["baseline_metrics"] = _public_metrics(baseline_metrics)
 
+    emit(jobs_mod.PROGRESS_CONCLUDING)
     concluded = _conclude(
         org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
         policy=policy, materiality=verdict["materiality_applied"],
@@ -1928,7 +2067,21 @@ def _metrics_from_result_row(row: dict) -> dict:
 # Persistence
 # ---------------------------------------------------------------------------
 
-def _insert_benchmark(org_id, *, workload_id, method, objective, policy, materiality):
+def _insert_benchmark(
+    org_id, *, workload_id, method, objective, policy, materiality, extra=None
+):
+    """
+    Create the benchmark row.
+
+    `extra` carries the async-job columns (status/progress_state/heartbeat_at/
+    idempotency_key/...) when this row is being created as a JOB. It overlays
+    the defaults, so a job row starts life 'queued' rather than 'pending' while
+    a synchronous run keeps the 'pending' it has always had. Exceptions
+    propagate when `extra` is present: a job creation that hits the partial
+    unique index on the idempotency key is a DUPLICATE, and swallowing it here
+    would turn "someone else is already running this" into "the record could
+    not be created", which is the opposite instruction to the caller.
+    """
     row = {
         "org_id": org_id,
         "workload_id": workload_id,
@@ -1939,10 +2092,14 @@ def _insert_benchmark(org_id, *, workload_id, method, objective, policy, materia
         "policy_id": (str(policy["id"]) if policy and policy.get("id") else None),
         "policy_evaluation": {},
     }
+    if extra:
+        row.update(extra)
     try:
         result = supabase.table("optimization_benchmarks").insert(row).execute()
         return (result.data or [None])[0]
     except Exception as exc:  # pragma: no cover
+        if extra:
+            raise
         logger.warning("_insert_benchmark failed: %s", type(exc).__name__)
         return None
 
