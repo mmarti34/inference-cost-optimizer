@@ -63,6 +63,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 
+import audit
 from api_key_validation import validate_api_key
 from auth_dependency import AuthenticatedUser, require_org_member
 from supabase_client import supabase
@@ -383,6 +384,7 @@ async def benchmark_recommendation(
 
 @router.post("/{org_id}/recommendations/{rec_id}/reject")
 async def reject_recommendation(
+    request: Request,
     org_id: str,
     rec_id: str,
     payload: RejectPayload,
@@ -400,12 +402,25 @@ async def reject_recommendation(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except service.RecommendationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # `payload.reason` is operator free text and stays in the recommendation's
+    # own audit column; it is not copied here.
+    audit.record(
+        audit.RECOMMENDATION_REJECTED,
+        principal=user,
+        resource_type=audit.RESOURCE_RECOMMENDATION,
+        resource_id=rec_id,
+        metadata={"new_status": domain.STATUS_REJECTED},
+        request=request,
+    )
     return service.recommendation_row_to_response(row)
 
 
 @router.post("/{org_id}/recommendations/{rec_id}/accept")
 async def accept_recommendation(
-    org_id: str, rec_id: str, user: AuthenticatedUser = Depends(require_org_member)
+    request: Request,
+    org_id: str,
+    rec_id: str,
+    user: AuthenticatedUser = Depends(require_org_member),
 ):
     """
     HUMAN APPROVAL. Creates a candidate deployment from the candidate strategy
@@ -484,6 +499,22 @@ async def accept_recommendation(
         expected_latency_p95_ms=rec.get("candidate_latency_p95_ms"),
         evidence_maturity=rec.get("confidence"),
         reason="human approved; candidate deployment created",
+    )
+
+    # HUMAN APPROVAL of a change that now has a candidate deployment behind it.
+    # `prior_status` is the state the human actually approved from, which is the
+    # fact that matters if the decision is ever questioned.
+    audit.record(
+        audit.RECOMMENDATION_ACCEPTED,
+        principal=user,
+        resource_type=audit.RESOURCE_RECOMMENDATION,
+        resource_id=rec_id,
+        metadata={
+            "prior_status": status,
+            "new_status": domain.STATUS_CANARY,
+            "deployment_id": str(deployment["id"]),
+        },
+        request=request,
     )
 
     return {

@@ -1,7 +1,8 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
+import audit
 from supabase_client import supabase
 from auth_dependency import require_auth, require_org_member, require_org_admin, AuthenticatedUser
 from plan_enforcement import get_monthly_usage, get_org_plan_tier, _get_plan_limit
@@ -216,6 +217,7 @@ async def get_org_monthly_usage(
 
 @router.patch("/organizations/{org_id}")
 async def update_organization(
+    request: Request,
     org_id: str,
     payload: OrganizationUpdate,
     auth_user: AuthenticatedUser = Depends(require_org_admin),
@@ -241,6 +243,17 @@ async def update_organization(
         result = supabase.table("organizations").update(update_data).eq("id", org_id).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Organization not found")
+        # The only org-settings mutation a client can reach. `name` and `logo`
+        # are the only writable columns (see _ORG_CLIENT_WRITABLE_FIELDS) and
+        # both are customer free text, so the VALUES are not recorded — the row
+        # id and the actor are what an incident timeline needs.
+        audit.record(
+            audit.ORGANIZATION_UPDATED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORGANIZATION,
+            resource_id=org_id,
+            request=request,
+        )
         return {"message": "Organization updated successfully"}
     except HTTPException:
         raise

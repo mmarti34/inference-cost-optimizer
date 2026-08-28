@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Header, Request, Body, Response, Dep
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+import audit
 from supabase_client import supabase
 from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
 from resource_access import get_provider_credential_for_org
@@ -370,7 +371,7 @@ Return your recommendation as a JSON object with the following structure:
 # list from `GET /api/api-keys/{org_id}` (api_key_management.get_api_keys).
 
 @app.post("/store-key")
-def store_api_key(payload: APIKeyPayload, _user: AuthenticatedUser = Depends(require_org_member)):
+def store_api_key(request: Request, payload: APIKeyPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     # Every write here is keyed on the org. Take it from the guard, not the
     # body: `verified_org_id` is the org membership was actually proven
     # against, so the row that gets overwritten — another tenant's provider
@@ -400,10 +401,31 @@ def store_api_key(payload: APIKeyPayload, _user: AuthenticatedUser = Depends(req
             # Invalidate cached decrypted key so next request picks up the new one
             from api_key_cache import invalidate_provider_key
             invalidate_provider_key(org_id, payload.provider)
+            # OVERWRITE, not create: the org's previous credential for this
+            # provider is gone. Distinguished from a create because "the key
+            # stopped working on the 4th" is answered by different rows.
+            # `provider` is a slug; the credential itself is never passed.
+            audit.record(
+                audit.PROVIDER_CREDENTIAL_OVERWRITTEN,
+                principal=_user,
+                resource_type=audit.RESOURCE_PROVIDER_CREDENTIAL,
+                resource_id=(existing.data[0].get("id") if existing.data else None),
+                metadata={"provider": payload.provider},
+                request=request,
+            )
             return {"status": "success", "updated": result.data}
         else:
             # Insert new key
             result = supabase.table("api_keys").insert(data).execute()
+            _inserted = result.data or []
+            audit.record(
+                audit.PROVIDER_CREDENTIAL_CREATED,
+                principal=_user,
+                resource_type=audit.RESOURCE_PROVIDER_CREDENTIAL,
+                resource_id=(_inserted[0].get("id") if _inserted else None),
+                metadata={"provider": payload.provider},
+                request=request,
+            )
             return {"status": "success", "inserted": result.data}
 
     except HTTPException:
@@ -949,7 +971,7 @@ def get_service_api_key(org_id: str, _user: AuthenticatedUser = Depends(require_
     return {"api_key": None}
 
 @app.post("/generate-service-api-key/{org_id}")
-def generate_service_api_key(org_id: str, body: Optional[dict] = Body(None), _user: AuthenticatedUser = Depends(require_org_member)):
+def generate_service_api_key(request: Request, org_id: str, body: Optional[dict] = Body(None), _user: AuthenticatedUser = Depends(require_org_member)):
     """Create a new server API key. Multiple keys per org allowed. Body: { \"name\": \"Production\" }. Returns plaintext once."""
     name = "Server Key"
     if body and isinstance(body.get("name"), str) and body["name"].strip():
@@ -957,18 +979,30 @@ def generate_service_api_key(org_id: str, body: Optional[dict] = Body(None), _us
     plaintext_key = secrets.token_urlsafe(32)
     hashed = hash_service_api_key(plaintext_key)
     insert_payload = {"org_id": org_id, "hashed_key": hashed, "name": name, "status": "active"}
+    _created = None
     try:
-        supabase.table("service_api_keys").insert(insert_payload).execute()
+        _created = supabase.table("service_api_keys").insert(insert_payload).execute()
     except Exception as e:
         if "null value" in str(e).lower() and "api_key" in str(e).lower():
             insert_payload["api_key"] = ""
-            supabase.table("service_api_keys").insert(insert_payload).execute()
+            _created = supabase.table("service_api_keys").insert(insert_payload).execute()
         elif "column" in str(e).lower() and "name" in str(e).lower():
             insert_payload.pop("name", None)
             insert_payload.pop("status", None)
-            supabase.table("service_api_keys").insert(insert_payload).execute()
+            _created = supabase.table("service_api_keys").insert(insert_payload).execute()
         else:
             raise
+    # A new production credential exists. Neither the plaintext (returned once)
+    # nor the hash is recorded — only the row id, which is what a later
+    # revocation or an incident timeline needs to join on.
+    _rows = (getattr(_created, "data", None) or []) if _created is not None else []
+    audit.record(
+        audit.SERVER_KEY_CREATED,
+        principal=_user,
+        resource_type=audit.RESOURCE_SERVER_API_KEY,
+        resource_id=(_rows[0].get("id") if _rows else None),
+        request=request,
+    )
     return {"api_key": plaintext_key}
 
 @app.get("/list-service-api-keys/{org_id}")
@@ -981,7 +1015,7 @@ def list_service_api_keys(org_id: str, _user: AuthenticatedUser = Depends(requir
     return {"keys": keys}
 
 @app.delete("/delete-service-api-key/{key_id}")
-def delete_service_api_key(key_id: str, _user: AuthenticatedUser = Depends(require_auth)):
+def delete_service_api_key(request: Request, key_id: str, _user: AuthenticatedUser = Depends(require_auth)):
     """
     Revoke one server API key belonging to an org the caller is a member of.
 
@@ -1030,6 +1064,21 @@ def delete_service_api_key(key_id: str, _user: AuthenticatedUser = Depends(requi
             logger.warning(
                 "cross-tenant service-key revoke refused: cursor token org mismatch"
             )
+            # THE INCIDENT QUESTION. Filed under the org that OWNS the key, not
+            # the attacker's, so "did anyone try to revoke my production key?"
+            # is answerable from the victim's own audit trail. The org is read
+            # off the service_api_keys row the server fetched — the caller
+            # supplied only a key id.
+            audit.record_server_derived(
+                audit.SERVER_KEY_REVOKE_REFUSED,
+                org_id=key_org_id,
+                derived_from="service_api_keys.org_id",
+                actor_id=_user.user_id,
+                resource_type=audit.RESOURCE_SERVER_API_KEY,
+                resource_id=key_id,
+                metadata={"reason_code": audit.REASON_CROSS_TENANT},
+                request=request,
+            )
             raise _NOT_FOUND
     else:
         try:
@@ -1051,6 +1100,16 @@ def delete_service_api_key(key_id: str, _user: AuthenticatedUser = Depends(requi
                 "cross-tenant service-key revoke refused: user=%s key_org=%s",
                 _user.user_id, key_org_id,
             )
+            audit.record_server_derived(
+                audit.SERVER_KEY_REVOKE_REFUSED,
+                org_id=key_org_id,
+                derived_from="service_api_keys.org_id",
+                actor_id=_user.user_id,
+                resource_type=audit.RESOURCE_SERVER_API_KEY,
+                resource_id=key_id,
+                metadata={"reason_code": audit.REASON_CROSS_TENANT},
+                request=request,
+            )
             raise _NOT_FOUND
 
     # Belt and braces: scope the DELETE itself, so even a logic slip above
@@ -1059,10 +1118,19 @@ def delete_service_api_key(key_id: str, _user: AuthenticatedUser = Depends(requi
         .eq("id", key_id) \
         .eq("org_id", key_org_id) \
         .execute()
+    audit.record_server_derived(
+        audit.SERVER_KEY_REVOKED,
+        org_id=key_org_id,
+        derived_from="service_api_keys.org_id",
+        actor_id=_user.user_id,
+        resource_type=audit.RESOURCE_SERVER_API_KEY,
+        resource_id=key_id,
+        request=request,
+    )
     return {"status": "deleted", "id": key_id}
 
 @app.delete("/delete-key")
-def delete_api_key(payload: DeleteKeyPayload, _user: AuthenticatedUser = Depends(require_org_member)):
+def delete_api_key(request: Request, payload: DeleteKeyPayload, _user: AuthenticatedUser = Depends(require_org_member)):
     try:
         # Delete the API key for the org and provider
         result = supabase.table("api_keys") \
@@ -1072,10 +1140,28 @@ def delete_api_key(payload: DeleteKeyPayload, _user: AuthenticatedUser = Depends
             .execute()
         # result.data will be a list of deleted rows (or empty if nothing deleted)
         if not result.data:
+            audit.record(
+                audit.PROVIDER_CREDENTIAL_DELETE_REFUSED,
+                principal=_user,
+                resource_type=audit.RESOURCE_PROVIDER_CREDENTIAL,
+                metadata={
+                    "provider": payload.provider,
+                    "reason_code": audit.REASON_NOT_FOUND,
+                },
+                request=request,
+            )
             raise HTTPException(status_code=404, detail="No API key found to delete.")
         # Invalidate cached decrypted key immediately
         from api_key_cache import invalidate_provider_key
         invalidate_provider_key(payload.org_id, payload.provider)
+        audit.record(
+            audit.PROVIDER_CREDENTIAL_DELETED,
+            principal=_user,
+            resource_type=audit.RESOURCE_PROVIDER_CREDENTIAL,
+            resource_id=(result.data[0].get("id") if result.data else None),
+            metadata={"provider": payload.provider},
+            request=request,
+        )
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting API key: {str(e)}")

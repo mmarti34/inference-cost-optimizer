@@ -2,9 +2,10 @@
 import logging
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+import audit
 from auth_dependency import require_auth, require_org_member, AuthenticatedUser
 from supabase_client import supabase
 from utils.encryption import hash_service_api_key
@@ -23,6 +24,7 @@ class CreateCursorTokenBody(BaseModel):
 
 @router.post("/api/cursor-tokens")
 async def create_cursor_token(
+    request: Request,
     body: CreateCursorTokenBody,
     _user: AuthenticatedUser = Depends(require_org_member),
 ):
@@ -56,13 +58,25 @@ async def create_cursor_token(
     plaintext = f"{CURSOR_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
     token_hash = hash_service_api_key(plaintext)
 
-    supabase.table("cursor_tokens").insert({
+    created = supabase.table("cursor_tokens").insert({
         "user_id": _user.user_id,
         "org_id": org_id,
         "token_hash": token_hash,
         "name": name,
         "status": "active",
     }).execute()
+
+    # A live, org-scoped credential now exists. The plaintext is returned to the
+    # caller once and never recorded here; the row id is what makes the token
+    # identifiable later without the audit trail holding the bearer value.
+    _created_rows = created.data or []
+    audit.record(
+        audit.CURSOR_TOKEN_CREATED,
+        principal=_user,
+        resource_type=audit.RESOURCE_CURSOR_TOKEN,
+        resource_id=(_created_rows[0].get("id") if _created_rows else None),
+        request=request,
+    )
 
     # Get org slug for response
     org_row = supabase.table("organizations").select("id, slug").eq("id", org_id).single().execute()
@@ -108,6 +122,7 @@ async def list_cursor_tokens(
 
 @router.delete("/api/cursor-tokens/{org_id}/{token_id}")
 async def revoke_cursor_token(
+    request: Request,
     org_id: str,
     token_id: str,
     _user: AuthenticatedUser = Depends(require_org_member),
@@ -129,8 +144,27 @@ async def revoke_cursor_token(
         .execute()
     )
     if not result.data:
+        # The update matched nothing: either no such token, or it belongs to a
+        # DIFFERENT MEMBER of the same org. The two are deliberately
+        # indistinguishable to the caller, so they are indistinguishable here
+        # too — recording a guess would be worse than recording the attempt.
+        audit.record(
+            audit.CURSOR_TOKEN_REVOKE_REFUSED,
+            principal=_user,
+            resource_type=audit.RESOURCE_CURSOR_TOKEN,
+            resource_id=token_id,
+            metadata={"reason_code": audit.REASON_NOT_FOUND},
+            request=request,
+        )
         raise HTTPException(status_code=404, detail="Cursor token not found")
     logger.info("Cursor token revoked: token_id=%s org=%s", token_id, org_id)
+    audit.record(
+        audit.CURSOR_TOKEN_REVOKED,
+        principal=_user,
+        resource_type=audit.RESOURCE_CURSOR_TOKEN,
+        resource_id=token_id,
+        request=request,
+    )
     return {"status": "revoked", "id": token_id}
 
 

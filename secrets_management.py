@@ -6,9 +6,10 @@ At runtime, the workflow executor resolves these references with decrypted value
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+import audit
 from supabase_client import supabase
 from auth_dependency import require_org_member, AuthenticatedUser
 from utils.encryption import encrypt_api_key, decrypt_api_key
@@ -65,6 +66,7 @@ async def list_secrets(
 
 @router.post("/secrets")
 async def create_secret(
+    request: Request,
     body: SecretCreate,
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
@@ -97,6 +99,15 @@ async def create_secret(
             .execute()
         )
         row = result.data[0] if result.data else {}
+        # The NAME is not recorded: it is customer-chosen free text on a secret,
+        # and the row id resolves it. The VALUE never reaches this module.
+        audit.record(
+            audit.ORG_SECRET_CREATED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORG_SECRET,
+            resource_id=row.get("id"),
+            request=request,
+        )
         return {
             "id": row.get("id"),
             "org_id": row.get("org_id"),
@@ -116,6 +127,7 @@ async def create_secret(
 
 @router.put("/secrets/{org_id}/{secret_id}")
 async def update_secret(
+    request: Request,
     org_id: str,
     secret_id: str,
     body: SecretUpdate,
@@ -143,8 +155,25 @@ async def update_secret(
             .execute()
         )
         if not result.data:
+            # Scoped by org, so this is "no such secret in YOUR org" — which is
+            # also what a cross-tenant attempt looks like from in here.
+            audit.record(
+                audit.ORG_SECRET_UPDATE_REFUSED,
+                principal=auth_user,
+                resource_type=audit.RESOURCE_ORG_SECRET,
+                resource_id=secret_id,
+                metadata={"reason_code": audit.REASON_NOT_FOUND},
+                request=request,
+            )
             raise HTTPException(status_code=404, detail="Secret not found")
         row = result.data[0]
+        audit.record(
+            audit.ORG_SECRET_UPDATED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORG_SECRET,
+            resource_id=secret_id,
+            request=request,
+        )
         return {
             "id": row.get("id"),
             "org_id": row.get("org_id"),
@@ -163,6 +192,7 @@ async def update_secret(
 
 @router.delete("/secrets/{org_id}/{secret_id}")
 async def delete_secret(
+    request: Request,
     org_id: str,
     secret_id: str,
     auth_user: AuthenticatedUser = Depends(require_org_member),
@@ -177,7 +207,22 @@ async def delete_secret(
             .execute()
         )
         if not result.data:
+            audit.record(
+                audit.ORG_SECRET_DELETE_REFUSED,
+                principal=auth_user,
+                resource_type=audit.RESOURCE_ORG_SECRET,
+                resource_id=secret_id,
+                metadata={"reason_code": audit.REASON_NOT_FOUND},
+                request=request,
+            )
             raise HTTPException(status_code=404, detail="Secret not found")
+        audit.record(
+            audit.ORG_SECRET_DELETED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORG_SECRET,
+            resource_id=secret_id,
+            request=request,
+        )
         return {"status": "deleted"}
     except HTTPException:
         raise

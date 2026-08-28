@@ -3,7 +3,8 @@ import uuid
 import logging
 from typing import Optional
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
+import audit
 from supabase_client import supabase
 from auth_dependency import require_auth, require_org_member, require_org_admin, AuthenticatedUser
 from email_service import send_invite_email
@@ -59,6 +60,7 @@ def test_connection():
 
 @router.post("/api/organizations/create")
 def create_organization(
+    request: Request,
     org_name: str = Body(...),
     user_id: Optional[str] = Body(None),
     plan: str = Body("free"),
@@ -167,6 +169,19 @@ def create_organization(
             raise HTTPException(status_code=500, detail="Failed to add user as admin member")
         
         logger.info(f"Organization created successfully: {new_org_result.data}")
+        # The org did not exist until the insert above, so there is no verified
+        # org to derive from — the id comes from the row the SERVER just wrote.
+        # `org_name` is customer free text and is deliberately not recorded.
+        audit.record_server_derived(
+            audit.ORGANIZATION_CREATED,
+            org_id=org_id,
+            derived_from="organizations.id (row inserted by this handler)",
+            actor_id=user_id,
+            resource_type=audit.RESOURCE_ORGANIZATION,
+            resource_id=org_id,
+            metadata={"role": "admin"},
+            request=request,
+        )
         return new_org_result.data
         
     except HTTPException:
@@ -178,6 +193,7 @@ def create_organization(
 
 @router.post("/api/organizations/invite")
 def invite_member(
+    request: Request,
     org_id: str = Body(...),
     email: str = Body(...),
     user_id: Optional[str] = Body(None),
@@ -273,6 +289,17 @@ def invite_member(
         )
 
         logger.info("Invite created for %s (email_sent=%s)", email, email_sent)
+        # The invitee's EMAIL is not recorded. It is PII, and the
+        # organization_members row named by resource_id resolves it — an audit
+        # table is the wrong place to keep a second copy of a contact address.
+        audit.record(
+            audit.MEMBER_INVITED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORG_MEMBER,
+            resource_id=member_row.get("id"),
+            metadata={"role": "member"},
+            request=request,
+        )
         return {
             "member": member_row,
             "email_sent": email_sent,
@@ -287,6 +314,7 @@ def invite_member(
 
 @router.post("/api/organizations/accept-invite")
 def accept_invite(
+    request: Request,
     token: str = Body(...),
     user_id: Optional[str] = Body(None),
     auth_user: AuthenticatedUser = Depends(require_auth),
@@ -394,6 +422,20 @@ def accept_invite(
             pass
 
         logger.info("Invite accepted: user=%s org=%s", user_id, invite["org_id"])
+        # Guarded by require_auth only: the caller is not yet a member, so there
+        # is no verified org. The org is the one named on the invite_tokens row
+        # the presented token matched — read by the server, not sent by the
+        # client. The token itself is never recorded.
+        audit.record_server_derived(
+            audit.MEMBER_INVITE_ACCEPTED,
+            org_id=invite["org_id"],
+            derived_from="invite_tokens.org_id",
+            actor_id=user_id,
+            resource_type=audit.RESOURCE_ORG_MEMBER,
+            resource_id=invite.get("member_id"),
+            metadata={"role": "member", "target_user_id": user_id},
+            request=request,
+        )
         return {
             "message": "Invitation accepted successfully.",
             "org_id": invite["org_id"],
@@ -409,6 +451,7 @@ def accept_invite(
 
 @router.post("/api/organizations/revoke-invite")
 def revoke_invite(
+    request: Request,
     org_id: str = Body(...),
     member_id: str = Body(...),
     user_id: Optional[str] = Body(None),
@@ -437,6 +480,13 @@ def revoke_invite(
             .execute()
 
         logger.info("Invite revoked: member_id=%s org=%s by user=%s", member_id, org_id, user_id)
+        audit.record(
+            audit.MEMBER_INVITE_REVOKED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORG_MEMBER,
+            resource_id=member_id,
+            request=request,
+        )
         return {"message": "Invitation revoked successfully."}
 
     except HTTPException:
@@ -622,6 +672,7 @@ def join_organization(
 
 @router.delete("/api/organizations/members/{org_id}/{user_id}")
 async def remove_member(
+    request: Request,
     org_id: str,
     user_id: str,
     auth_user: AuthenticatedUser = Depends(require_org_member),
@@ -637,6 +688,18 @@ async def remove_member(
             .limit(1) \
             .execute()
         if not admin_check.data or admin_check.data[0].get("role") != "admin":
+            # A non-admin member trying to evict someone is a privilege-boundary
+            # probe worth keeping, not just a 403 in an access log.
+            audit.record(
+                audit.MEMBER_REMOVE_REFUSED,
+                principal=auth_user,
+                resource_type=audit.RESOURCE_ORG_MEMBER,
+                metadata={
+                    "target_user_id": user_id,
+                    "reason_code": audit.REASON_NOT_ADMIN,
+                },
+                request=request,
+            )
             raise HTTPException(status_code=403, detail="Only admins can remove members.")
 
         # 2. Prevent removing yourself (admins should use leave instead)
@@ -650,6 +713,14 @@ async def remove_member(
         supabase.table("join_requests").delete().eq("org_id", org_id).eq("user_id", user_id).execute()
 
         logger.info("Member removed: user=%s org=%s by=%s", user_id, org_id, auth_user.user_id)
+        audit.record(
+            audit.MEMBER_REMOVED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_ORG_MEMBER,
+            resource_id=((member_result.data or [{}])[0].get("id") if member_result.data else None),
+            metadata={"target_user_id": user_id},
+            request=request,
+        )
         return {"message": "Member removed successfully"}
 
     except HTTPException:

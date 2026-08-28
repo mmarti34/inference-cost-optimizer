@@ -6,9 +6,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+import audit
 from auth_dependency import require_org_member, AuthenticatedUser
 from plan_enforcement import check_workflow_limit, check_server_key_limit
 from supabase_client import supabase
@@ -181,6 +182,7 @@ class DeployFromParsedBody(BaseModel):
 
 @router.post("/api/cursor/deploy-from-parsed")
 async def deploy_from_parsed(
+    request: Request,
     body: DeployFromParsedBody,
     _user: AuthenticatedUser = Depends(require_org_member),
 ):
@@ -243,22 +245,48 @@ async def deploy_from_parsed(
     if not dep_result.data:
         raise HTTPException(status_code=500, detail="Failed to create deployment.")
 
+    # Inserted with status='promoted': this endpoint is LIVE from here on, so
+    # it is a production change and not merely a draft save.
+    _dep_id = str(dep_result.data[0].get("id") or "")
+    audit.record(
+        audit.DEPLOYMENT_PROMOTED,
+        principal=_user,
+        resource_type=audit.RESOURCE_DEPLOYMENT,
+        resource_id=_dep_id,
+        metadata={"workflow_id": workflow_id, "version": 1},
+        request=request,
+    )
+
     # Create a new server key so we can return plaintext (user adds to .env). Existing keys are hashed only.
     check_server_key_limit(org_id)
     import secrets as sec
     plaintext_key = sec.token_urlsafe(32)
     hashed = hash_service_api_key(plaintext_key)
     insert_payload = {"org_id": org_id, "hashed_key": hashed, "name": "Cursor deploy", "status": "active"}
+    _key_rows = []
     try:
-        supabase.table("service_api_keys").insert(insert_payload).execute()
+        _created = supabase.table("service_api_keys").insert(insert_payload).execute()
+        _key_rows = _created.data or []
         server_key = plaintext_key
     except Exception as e:
         if "null value" in str(e).lower() and "api_key" in str(e).lower():
             insert_payload["api_key"] = ""
-            supabase.table("service_api_keys").insert(insert_payload).execute()
+            _created = supabase.table("service_api_keys").insert(insert_payload).execute()
+            _key_rows = _created.data or []
             server_key = plaintext_key
         else:
             server_key = None
+    if server_key is not None:
+        # This route mints a production credential as a side effect of a deploy,
+        # which is exactly why it needs its own row rather than being implied by
+        # the deployment one.
+        audit.record(
+            audit.SERVER_KEY_CREATED,
+            principal=_user,
+            resource_type=audit.RESOURCE_SERVER_API_KEY,
+            resource_id=(_key_rows[0].get("id") if _key_rows else None),
+            request=request,
+        )
 
     org_row = supabase.table("organizations").select("slug").eq("id", org_id).single().execute()
     org_slug = (org_row.data or {}).get("slug") or org_id
