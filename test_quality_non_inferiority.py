@@ -637,14 +637,154 @@ def test_the_consideration_funnel_accounts_for_every_candidate(db):
     )
 
     funnel = result["consideration"]
+    outcomes = {s["stage"]: s for s in funnel["outcomes"]}
     stages = {s["stage"]: s for s in funnel["stages"]}
     assert funnel["considered"] == 2
-    assert stages[domain.DISPOSITION_QUALITY_SAFE]["count"] == 1
-    assert stages[domain.DISPOSITION_FAILED_POLICY]["count"] == 1
+    # Disjoint terminal buckets — where each candidate STOPPED. Unchanged.
+    assert outcomes[domain.DISPOSITION_QUALITY_SAFE]["count"] == 1
+    assert outcomes[domain.DISPOSITION_FAILED_POLICY]["count"] == 1
     # A stage nothing populates yet is marked as such, so a zero is never read
     # as "we checked and found none".
-    assert stages[domain.DISPOSITION_ELIMINATED_BY_HISTORY]["emitted"] is False
+    assert outcomes[domain.DISPOSITION_ELIMINATED_BY_HISTORY]["emitted"] is False
     assert funnel["by_tier"][domain.TIER_EXECUTABLE] == 2
+
+    # Cumulative stages — how far the search GOT. The arm that failed policy
+    # still ran, so it counts as executable and as having entered replay. Under
+    # the old disjoint counting it appeared only under `failed_policy` and the
+    # funnel reported that nothing had been benchmarked.
+    assert stages[domain.STAGE_CONSIDERED]["count"] == 2
+    assert stages[domain.STAGE_EXECUTABLE]["count"] == 2
+    assert stages[domain.STAGE_ENTERED_REPLAY]["count"] == 2
+    assert stages[domain.STAGE_REPLAY_VERIFIED_IMPROVEMENT]["count"] == 1
+    counts = [s["count"] for s in funnel["stages"] if s["cumulative"]]
+    assert counts == sorted(counts, reverse=True), counts
+
+
+def test_the_cumulative_funnel_counts_arms_that_ran_and_were_then_stopped(db):
+    """
+    The reported defect, on real-shaped data: three arms executed, all three
+    were stopped on an unrecoverable quality regression, and the funnel said
+    `benchmarked: 0`.
+
+    A candidate that entered replay and was then stopped must count at
+    `entered_replay`. It must NOT count at `completed_verification` — the
+    remaining cases were deliberately not run, and claiming otherwise would
+    claim evidence that was never gathered.
+    """
+    _seed(db, golden_inputs=60, production_runs=90, constraints={"min_quality": 0.90})
+    runtime = FakeRuntime(
+        quality_for={"gpt-4o-mini": 0.30, "gpt-4.1-nano": 0.30}, n_cases=60
+    )
+
+    result = _run_loop(
+        db, runtime,
+        candidates=[
+            _candidate("gpt-4o-mini"),
+            _candidate("gpt-4.1-nano"),
+            _candidate("gpt-4.1-mini"),
+        ],
+    )
+
+    funnel = result["consideration"]
+    stages = {s["stage"]: s for s in funnel["stages"]}
+    outcomes = {s["stage"]: s for s in funnel["outcomes"]}
+
+    assert stages[domain.STAGE_CONSIDERED]["count"] == 3
+    assert stages[domain.STAGE_EXECUTABLE]["count"] == 3
+    # THE fix: every arm that ran is counted as having run, whatever bucket it
+    # ended in.
+    assert stages[domain.STAGE_ENTERED_REPLAY]["count"] == 3
+    assert outcomes[domain.DISPOSITION_FAILED_POLICY]["count"] == 2
+
+    entered = stages[domain.STAGE_ENTERED_REPLAY]["count"]
+    stopped = stages[domain.STAGE_STOPPED_EARLY]["count"]
+    completed = stages[domain.STAGE_COMPLETED_VERIFICATION]["count"]
+    assert stopped == 2 and completed == 1
+    # stopped_early and completed_verification PARTITION entered_replay.
+    assert stopped + completed == entered
+
+    counts = [s["count"] for s in funnel["stages"] if s["cumulative"]]
+    assert counts == sorted(counts, reverse=True), counts
+
+    # Each per-candidate record still carries exactly one disposition code, and
+    # the codes are the unchanged vocabulary.
+    for d in funnel["dispositions"]:
+        assert d["disposition"] in domain.DISPOSITIONS_ORDERED
+
+
+def test_the_reported_production_run_now_reports_what_it_measured():
+    """
+    The exact shape of the run that motivated this change, replayed through
+    build_funnel: 7 considered, 3 of them at unconfigured providers, 4 arms
+    dispatched, 3 of those stopped early, 1 completed and was quality-safe.
+
+    Before: `benchmarked: 0` — the three stopped arms were counted only under
+    `failed_policy`, so nothing said that anything had run.
+    After:  4 entered replay, and the exclusions stay individually named.
+    """
+    dispositions = [
+        # TIER 2 — no credential for the provider, never dispatched.
+        *[{
+            "label": f"opportunity-{i}", "tier": domain.TIER_OPPORTUNITY,
+            "disposition": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
+            "code": "provider_not_configured",
+            "entered_replay": False, "stopped_early": None,
+            "objective_improved": None,
+        } for i in range(3)],
+        # Three arms that RAN and were then stopped on an unrecoverable
+        # regression.
+        *[{
+            "label": f"stopped-{i}", "tier": domain.TIER_EXECUTABLE,
+            "disposition": domain.DISPOSITION_FAILED_POLICY, "code": None,
+            "entered_replay": True, "stopped_early": True,
+            "objective_improved": True,
+        } for i in range(3)],
+        # One arm that ran the full case set and cleared non-inferiority.
+        {
+            "label": "winner", "tier": domain.TIER_EXECUTABLE,
+            "disposition": domain.DISPOSITION_QUALITY_SAFE,
+            "code": "quality_non_inferiority_established",
+            "entered_replay": True, "stopped_early": False,
+            "objective_improved": True,
+        },
+    ]
+
+    funnel = domain.build_funnel(dispositions)
+    assert [(s["stage"], s["count"]) for s in funnel["stages"]] == [
+        (domain.STAGE_CONSIDERED, 7),
+        (domain.STAGE_EXECUTABLE, 4),
+        (domain.STAGE_ENTERED_REPLAY, 4),
+        (domain.STAGE_STOPPED_EARLY, 3),
+        (domain.STAGE_COMPLETED_VERIFICATION, 1),
+        (domain.STAGE_REPLAY_VERIFIED_IMPROVEMENT, 1),
+    ]
+    counts = [s["count"] for s in funnel["stages"] if s["cumulative"]]
+    assert counts == sorted(counts, reverse=True)
+
+    # The disjoint dispositions are untouched — the UI reads these per
+    # candidate and they were never the defect.
+    outcomes = {o["stage"]: o["count"] for o in funnel["outcomes"]}
+    assert outcomes[domain.DISPOSITION_FAILED_POLICY] == 3
+    assert outcomes[domain.DISPOSITION_QUALITY_SAFE] == 1
+    assert outcomes[domain.DISPOSITION_PROVIDER_NOT_CONFIGURED] == 3
+
+    exclusions = {e["code"]: e["count"] for e in funnel["exclusions"]}
+    assert exclusions["provider_not_configured"] == 3
+    assert sum(exclusions.values()) == 3
+
+
+def test_an_unmeasured_objective_is_never_counted_as_a_verified_improvement():
+    """Unmeasurable is None, not False, and None never reaches the last stage."""
+    funnel = domain.build_funnel([{
+        "label": "cost never measured", "tier": domain.TIER_EXECUTABLE,
+        "disposition": domain.DISPOSITION_QUALITY_SAFE,
+        "code": "quality_non_inferiority_established",
+        "entered_replay": True, "stopped_early": False,
+        "objective_improved": None,
+    }])
+    stages = {s["stage"]: s["count"] for s in funnel["stages"]}
+    assert stages[domain.STAGE_COMPLETED_VERIFICATION] == 1
+    assert stages[domain.STAGE_REPLAY_VERIFIED_IMPROVEMENT] == 0
 
 
 # ===========================================================================
@@ -730,9 +870,17 @@ def test_a_tier_two_opportunity_can_never_be_verified_or_win(db):
 
     # It appears in the frontier and in the funnel...
     assert len(verdict["frontier"]["unverified_opportunities"]) == 1
-    stages = {s["stage"]: s for s in verdict["consideration"]["stages"]}
-    assert stages[domain.DISPOSITION_PROVIDER_NOT_CONFIGURED]["count"] == 1
+    outcomes = {s["stage"]: s for s in verdict["consideration"]["outcomes"]}
+    assert outcomes[domain.DISPOSITION_PROVIDER_NOT_CONFIGURED]["count"] == 1
+    exclusions = {e["code"]: e for e in verdict["consideration"]["exclusions"]}
+    assert exclusions["provider_not_configured"]["count"] == 1
     assert verdict["consideration"]["by_tier"][domain.TIER_OPPORTUNITY] == 1
+    # It was never dispatched, so it never enters the cumulative funnel past
+    # `considered`. A TIER 2 item can never be counted as something we tested.
+    stages = {s["stage"]: s for s in verdict["consideration"]["stages"]}
+    assert stages[domain.STAGE_CONSIDERED]["count"] == 1
+    assert stages[domain.STAGE_EXECUTABLE]["count"] == 0
+    assert stages[domain.STAGE_ENTERED_REPLAY]["count"] == 0
 
     # ...and nowhere near the verdict. It was never measured, so there is
     # nothing for it to win with.

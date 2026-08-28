@@ -147,7 +147,8 @@ def aggregate_model_stats(history: list[dict]) -> dict[str, dict]:
                      cost_variation}}.
 
     `cost_variation` is the coefficient of variation of observed per-call cost;
-    it feeds confidence so a wildly variable model is not treated as a reliable
+    it feeds evidence maturity so a wildly variable model is not treated as a
+    reliable
     saving. All values are measured; a model with no observations simply does
     not appear.
     """

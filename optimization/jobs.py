@@ -32,7 +32,7 @@ Separating them means every existing query — `.eq("status", "completed")`,
 the org/status index, the RLS policies — keeps working unchanged.
 
 NOTHING HERE MEASURES ANYTHING. This module starts, tracks, and reaps runs. It
-never touches an arm, a metric, a conclusion or a confidence value. Every number
+never touches an arm, a metric, a conclusion or an evidence-maturity value. Every number
 it writes is a count of work already done (cases run, arms finished), never an
 estimate of work remaining and never a prediction of a verdict.
 """

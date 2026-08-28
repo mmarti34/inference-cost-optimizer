@@ -11,7 +11,8 @@ Module layout enforces one hard boundary — VENDOR METADATA is never mixed with
 EMPIRICAL EVIDENCE:
 
     domain.py       Shared vocabulary: objectives, lifecycle state machine,
-                    evidence strength, outcome provenance ranking, confidence.
+                    evidence strength, outcome provenance ranking, evidence
+                    maturity.
                     Pure functions, no I/O.
     executors.py    VENDOR side. Published prices, advertised capabilities,
                     declared regions. Vendor claims are NEVER evidence.

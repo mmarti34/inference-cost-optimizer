@@ -8,8 +8,8 @@ Everything here exists to stop two specific failure modes:
   2. Treating weak evidence as strong.  "We watched A happen" is not "we ran A
      and B on the same inputs", which is not "B served real traffic".
      EVIDENCE_STRENGTH and OUTCOME_PROVENANCE_RANK encode that ordering, and
-     compute_confidence() refuses to produce a confident-looking number from a
-     thin sample or a weak signal.
+     compute_evidence_maturity() refuses to produce a strong-looking number
+     from a thin sample or a weak signal.
 
 Nothing in this module ever invents a value. Every function that cannot compute
 its result returns None.
@@ -471,15 +471,48 @@ def coefficient_of_variation(values: list[float]) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Confidence — first class, and deliberately hard to inflate
+# Evidence maturity — first class, INTERNAL, and deliberately hard to inflate
 # ---------------------------------------------------------------------------
+#
+# This index used to be called `confidence`, and the name was wrong in a way
+# that misled the product. It is NOT a statistical confidence, NOT a p-value,
+# and NOT the probability that a verdict is correct. It is a blended maturity
+# index over five unrelated things — sample size, counterfactual evidence
+# class, quality-signal provenance, observed variance, historical consistency —
+# and no probabilistic statement can be recovered from it.
+#
+# The concrete harm: a run reported `confidence 0.188 (band: low)` immediately
+# beside a quality-safety verdict that was ESTABLISHED — 140 paired
+# evaluations, non-inferiority within 2pp at 95%, discordant_b=1,
+# discordant_c=2. Read together, 0.188 says "an 18% chance the verdict holds".
+# It says nothing of the kind. The two numbers are not on the same axis and
+# nothing in the payload said so.
+#
+# So this index is now INTERNAL ONLY. It is genuinely useful for ranking and
+# prioritising candidates and for deciding whether more data would change a
+# conclusion, and it keeps doing that. It does not appear in any
+# customer-facing payload. The three things a customer needs are already
+# reported, separately and unmixed, and must never be collapsed into one score:
+#
+#   1. SAFETY VERDICT   quality_safety: established, allowed_regression,
+#                       confidence_level, n_pairs, discordant_b/discordant_c.
+#                       A real statistical statement with its assumptions.
+#   2. EVIDENCE STAGE   evidence_source: observational -> replay -> shadow ->
+#                       ab_test -> canary -> production. How the claim was
+#                       obtained.
+#   3. PRODUCTION STATUS the recommendation status and rollout block. Whether
+#                       it is actually serving traffic.
+#
+# The STORED value is unchanged and the formula below is unchanged, so a
+# historical row's number still means exactly what it meant when written. See
+# migration_optimization_v10_evidence_maturity_semantics.sql.
 
 #: Sample size at which the sample-size term saturates. 14 replay examples and
 #: 180,000 production outcomes must not look alike.
 _SAMPLE_SATURATION = 1000
 
 
-def compute_confidence(
+def compute_evidence_maturity(
     *,
     sample_size: Optional[int],
     evidence_source: Optional[str],
@@ -489,8 +522,12 @@ def compute_confidence(
     production_confirmed: bool = False,
 ) -> Optional[float]:
     """
-    Confidence in the measured claim, on 0..1. Returns None when there is
-    nothing to be confident about.
+    How MATURE the evidence behind a measured claim is, on 0..1. Returns None
+    when there is nothing to score.
+
+    NOT a probability and not a confidence level — see the module section
+    above. Internal use only: ranking, prioritisation, and deciding whether
+    more data could change a conclusion.
 
     Terms, all multiplicative so a weakness anywhere caps the whole:
 
@@ -501,7 +538,7 @@ def compute_confidence(
                  EVIDENCE_STRENGTH). Observational evidence is capped hard.
       signal     strength of the quality signal, from outcome provenance rank.
                  'unknown' provenance means we measured cost but not quality,
-                 which caps confidence rather than zeroing it.
+                 which caps the score rather than zeroing it.
       stability  1 - coefficient of variation, clamped. Noisy samples score low.
       history    optional 0..1 agreement with previous measurements.
 
@@ -994,6 +1031,16 @@ REASON_CODES: dict[str, str] = {
     "no_candidates_generated": "No candidate strategy could be generated for this workload.",
     "strategy_not_applicable": "A candidate changes a dimension this runtime cannot apply.",
     "baseline_unavailable": "The current configuration could not be resolved to measure against.",
+    # Evidence semantics
+    "evidence_maturity_internal_only": (
+        "The evidence-maturity index is computed and stored but is not part of "
+        "any customer-facing payload. It blends sample size, counterfactual "
+        "evidence class, signal provenance, variance and historical "
+        "consistency into one 0..1 number; it is NOT a probability and NOT a "
+        "confidence level, and printing it beside a non-inferiority verdict "
+        "invited exactly that misreading. Safety verdict, evidence stage and "
+        "production status are reported separately instead."
+    ),
 }
 
 
@@ -1062,10 +1109,12 @@ DISPOSITION_FAILED_POLICY = "failed_policy"
 DISPOSITION_PROMISING = "promising"
 DISPOSITION_QUALITY_SAFE = "quality_safe"
 
-#: The funnel stages, in the order a UI should render them. Each stage is a
-#: COUNT of candidates that exited there (or, for the terminal stages, that
-#: reached there).
-FUNNEL_STAGES = (
+#: The per-candidate dispositions, in a stable render order. Each is DISJOINT:
+#: a candidate carries exactly one, and it names where that candidate STOPPED.
+#: These codes are the contract the UI reads off each candidate and they are
+#: NOT changing. What changed is the funnel COUNTS built from them — see
+#: FUNNEL_STAGES below.
+DISPOSITIONS_ORDERED = (
     DISPOSITION_CONSIDERED,
     DISPOSITION_INCOMPATIBLE,
     DISPOSITION_POLICY_BLOCKED,
@@ -1081,31 +1130,189 @@ FUNNEL_STAGES = (
     DISPOSITION_QUALITY_SAFE,
 )
 
-#: Dispositions NOTHING emits today. Kept in the vocabulary so the funnel shape
-#: is stable as discovery grows, and listed here so a zero is never mistaken for
+#: Dispositions NOTHING emits today. Kept in the vocabulary so the shape is
+#: stable as discovery grows, and listed here so a zero is never mistaken for
 #: "we checked and found none". Same convention as UNBUILT_EXECUTOR_TYPES.
 UNBUILT_DISPOSITIONS = (DISPOSITION_ELIMINATED_BY_HISTORY,)
+
+#: Dispositions that mean the candidate was NEVER DISPATCHED — it left the
+#: funnel before any provider request was made. Everything else means at least
+#: one arm ran.
+EXCLUSION_DISPOSITIONS = (
+    DISPOSITION_INCOMPATIBLE,
+    DISPOSITION_POLICY_BLOCKED,
+    DISPOSITION_PROVIDER_NOT_CONFIGURED,
+    DISPOSITION_ECONOMICALLY_DOMINATED,
+    DISPOSITION_ELIMINATED_BY_HISTORY,
+    DISPOSITION_DUPLICATE,
+    DISPOSITION_GENERATOR_ERROR,
+)
+
+#: Every reason code that can exclude a candidate before dispatch, paired with
+#: the disposition it exits at, in render order.
+#:
+#: Reported at CODE grain and not at DISPOSITION grain on purpose. Four
+#: genuinely different pre-dispatch findings — request_shape_incompatible,
+#: required_capability_missing, context_window_insufficient, pricing_unknown —
+#: all exit at DISPOSITION_INCOMPATIBLE, and collapsing them into one number
+#: erases exactly the evidence that the search was thorough. Each of these is a
+#: check that RAN against real data; it is a finding, not an error.
+EXCLUSION_CODE_TO_DISPOSITION = {
+    "provider_not_configured": DISPOSITION_PROVIDER_NOT_CONFIGURED,
+    "model_not_available": DISPOSITION_INCOMPATIBLE,
+    "request_shape_incompatible": DISPOSITION_INCOMPATIBLE,
+    "required_capability_missing": DISPOSITION_INCOMPATIBLE,
+    "context_window_insufficient": DISPOSITION_INCOMPATIBLE,
+    "policy_blocked": DISPOSITION_POLICY_BLOCKED,
+    "provider_not_permitted": DISPOSITION_POLICY_BLOCKED,
+    "pricing_unknown": DISPOSITION_INCOMPATIBLE,
+    "economically_dominated": DISPOSITION_ECONOMICALLY_DOMINATED,
+    "eliminated_by_historical_evidence": DISPOSITION_ELIMINATED_BY_HISTORY,
+    "duplicate_strategy": DISPOSITION_DUPLICATE,
+    "strategy_not_applicable": DISPOSITION_INCOMPATIBLE,
+    "generator_error": DISPOSITION_GENERATOR_ERROR,
+}
+EXCLUSION_CODES = tuple(EXCLUSION_CODE_TO_DISPOSITION)
+
+#: Exclusion codes nothing emits today. Same `emitted: false` convention as
+#: UNBUILT_DISPOSITIONS: a zero here is "not built", not "we checked".
+UNBUILT_EXCLUSION_CODES = ("eliminated_by_historical_evidence",)
+
+
+# --- The funnel proper -----------------------------------------------------
+#
+# A disposition says where a candidate STOPPED. Counting only that answers
+# "where did each one end up?" and cannot answer "how many did we actually
+# test?", because a candidate that entered replay and was then stopped on a
+# quality regression increments `failed_policy` and nothing else. A real run
+# reported `benchmarked: 0` while three arms had demonstrably executed.
+#
+# The funnel below counts STAGES REACHED instead: a candidate is counted at
+# every stage it got to, not only at the one it stopped in. Each stage is
+# derived from the one above it (see stages_reached), so the counts are
+# monotonically non-increasing BY CONSTRUCTION rather than by coincidence of
+# the data.
+
+STAGE_CONSIDERED = "considered"
+STAGE_EXECUTABLE = "executable"
+STAGE_ENTERED_REPLAY = "entered_replay"
+STAGE_STOPPED_EARLY = "stopped_early"
+STAGE_COMPLETED_VERIFICATION = "completed_verification"
+STAGE_REPLAY_VERIFIED_IMPROVEMENT = "replay_verified_improvement"
+
+#: Render order. `stopped_early` sits where it happened in the pipeline.
+FUNNEL_STAGES = (
+    STAGE_CONSIDERED,
+    STAGE_EXECUTABLE,
+    STAGE_ENTERED_REPLAY,
+    STAGE_STOPPED_EARLY,
+    STAGE_COMPLETED_VERIFICATION,
+    STAGE_REPLAY_VERIFIED_IMPROVEMENT,
+)
+
+#: The cumulative SPINE: every one of these is "reached at least this far", so
+#: each is a subset of the one before it and the counts never increase going
+#: down. This is the invariant the API guarantees.
+#:
+#: `stopped_early` is deliberately NOT in it. It is a DISJOINT exit count
+#: (`entered_replay` minus `completed_verification`), reported inline because
+#: the product needs it visible, and flagged `cumulative: false` so nobody
+#: reads it as a subset of the stage below. Asserting monotonicity across it
+#: would be asserting something untrue: a run where one candidate is stopped
+#: early and three finish gives 4, 1, 3, which is not non-increasing and is
+#: also not wrong.
+CUMULATIVE_STAGES = (
+    STAGE_CONSIDERED,
+    STAGE_EXECUTABLE,
+    STAGE_ENTERED_REPLAY,
+    STAGE_COMPLETED_VERIFICATION,
+    STAGE_REPLAY_VERIFIED_IMPROVEMENT,
+)
+
+
+def stages_reached(disposition: dict) -> set:
+    """
+    Which cumulative stages ONE candidate reached.
+
+    Each membership test is gated on the previous stage, so the returned set is
+    always a prefix of CUMULATIVE_STAGES. That is what makes the funnel's
+    monotonicity structural: a candidate cannot appear at a later stage without
+    appearing at every earlier one, whatever the caller passes in.
+    """
+    d = disposition or {}
+    reached = {STAGE_CONSIDERED}
+
+    if d.get("disposition") in EXCLUSION_DISPOSITIONS:
+        return reached
+    reached.add(STAGE_EXECUTABLE)
+
+    if not d.get("entered_replay"):
+        return reached
+    reached.add(STAGE_ENTERED_REPLAY)
+
+    if d.get("stopped_early"):
+        # A SETTLED verdict, but not a completed verification: the remaining
+        # cases were deliberately not run because no outcome on them could
+        # change the answer. Counting it as verification completed would claim
+        # evidence that was never gathered.
+        return reached
+    reached.add(STAGE_COMPLETED_VERIFICATION)
+
+    if (
+        d.get("disposition") == DISPOSITION_QUALITY_SAFE
+        and d.get("objective_improved") is True
+    ):
+        reached.add(STAGE_REPLAY_VERIFIED_IMPROVEMENT)
+    return reached
 
 
 def build_funnel(dispositions: Iterable[dict]) -> dict:
     """
     Turn per-candidate dispositions into the auditable consideration funnel.
 
-    Each disposition: {"label", "disposition", "code", "tier", ...facts}.
-    Returns ordered stage counts plus the un-narrated list, so the frontend can
-    render "47 considered / 31 blocked / 7 benchmarked / 2 promising / 1
-    verified" without the backend ever writing that sentence.
+    Each disposition: {"label", "disposition", "code", "tier", "entered_replay",
+    "stopped_early", "objective_improved", ...facts}.
 
-    Stages nothing populates yet are reported with `emitted: false` rather than
-    a bare zero, so an unbuilt stage is not read as a measured finding.
+    Returns three ordered, self-describing lists plus the un-narrated
+    per-candidate records:
+
+      stages       CUMULATIVE stage counts — how far the search actually got.
+                   Entries carry `cumulative`, and the `cumulative: true` ones
+                   are monotonically non-increasing in list order.
+      exclusions   why candidates never reached dispatch, at REASON CODE grain.
+      outcomes     the disjoint per-disposition counts (where each candidate
+                   stopped). Unchanged in meaning; they are evidence of a
+                   thorough search, not a list of errors.
+
+    Every entry carries `emitted`. `emitted: false` means nothing in the system
+    can populate that row yet, so its zero must not be read as "we checked and
+    found none". No prose anywhere: the frontend owns the wording.
     """
     items = [d for d in (dispositions or []) if isinstance(d, dict)]
+    reached = [stages_reached(d) for d in items]
+
     counts = {stage: 0 for stage in FUNNEL_STAGES}
+    for stage in CUMULATIVE_STAGES:
+        counts[stage] = sum(1 for r in reached if stage in r)
+    counts[STAGE_STOPPED_EARLY] = sum(
+        1 for d, r in zip(items, reached)
+        if STAGE_ENTERED_REPLAY in r and d.get("stopped_early")
+    )
+
+    outcome_counts = {stage: 0 for stage in DISPOSITIONS_ORDERED}
     for d in items:
         stage = d.get("disposition")
-        if stage in counts:
-            counts[stage] += 1
-    counts[DISPOSITION_CONSIDERED] = len(items)
+        if stage in outcome_counts:
+            outcome_counts[stage] += 1
+    outcome_counts[DISPOSITION_CONSIDERED] = len(items)
+
+    code_counts = {code: 0 for code in EXCLUSION_CODES}
+    for d in items:
+        if d.get("disposition") not in EXCLUSION_DISPOSITIONS:
+            continue
+        code = d.get("code")
+        if code in code_counts:
+            code_counts[code] += 1
 
     return {
         "considered": len(items),
@@ -1113,9 +1320,27 @@ def build_funnel(dispositions: Iterable[dict]) -> dict:
             {
                 "stage": stage,
                 "count": counts[stage],
-                "emitted": stage not in UNBUILT_DISPOSITIONS,
+                "emitted": True,
+                "cumulative": stage in CUMULATIVE_STAGES,
             }
             for stage in FUNNEL_STAGES
+        ],
+        "exclusions": [
+            {
+                "code": code,
+                "count": code_counts[code],
+                "emitted": code not in UNBUILT_EXCLUSION_CODES,
+                "disposition": EXCLUSION_CODE_TO_DISPOSITION[code],
+            }
+            for code in EXCLUSION_CODES
+        ],
+        "outcomes": [
+            {
+                "stage": stage,
+                "count": outcome_counts[stage],
+                "emitted": stage not in UNBUILT_DISPOSITIONS,
+            }
+            for stage in DISPOSITIONS_ORDERED
         ],
         "by_tier": {
             TIER_EXECUTABLE: sum(
@@ -1129,14 +1354,21 @@ def build_funnel(dispositions: Iterable[dict]) -> dict:
     }
 
 
-CONFIDENCE_BANDS = ("low", "medium", "high")
+#: Band values are ('low', 'medium', 'high') and STAY that way: they are what
+#: the `confidence_band` CHECK constraint accepts and what the preserved
+#: historical rows contain. Renaming the values would either break the
+#: constraint or require rewriting rows that must stay as written.
+EVIDENCE_MATURITY_BANDS = ("low", "medium", "high")
 
 
-def confidence_band(confidence: Optional[float]) -> Optional[str]:
-    """Coarse band for callers needing a stable categorical. None stays None."""
-    if confidence is None:
+def evidence_maturity_band(score: Optional[float]) -> Optional[str]:
+    """
+    Coarse band over compute_evidence_maturity(). Internal, like the score:
+    "low" means the evidence is EARLY, never that a verdict is unlikely.
+    """
+    if score is None:
         return None
-    c = float(confidence)
+    c = float(score)
     if c < 0.34:
         return "low"
     if c < 0.67:
@@ -1144,23 +1376,26 @@ def confidence_band(confidence: Optional[float]) -> Optional[str]:
     return "high"
 
 
-def conclusion_payload(
-    conclusion: Optional[str],
-    *,
-    reasons: Optional[list[dict]] = None,
-    confidence: Optional[float] = None,
-) -> dict:
+def conclusion_payload(conclusion: Optional[str], *, reasons: Optional[list[dict]] = None) -> dict:
     """
     The API shape for a conclusion: a stable code, structured facts, and the
     conclusion's epistemic class. NO customer-facing sentence is included, by
     design — see REASON_CODES.
+
+    The evidence-maturity index is deliberately ABSENT. It is not a
+    probability, and printing a 0..1 number here put it on the same visual axis
+    as the quality-safety verdict's confidence level, where readers merged the
+    two. The three axes a caller needs are carried separately and unmixed:
+    `quality_safety` (safety verdict), `evidence_source` (evidence stage) and
+    the recommendation status (production status). The absence is named rather
+    than silent so a client that used to read the field can tell this was a
+    decision, not a regression.
     """
     c = conclusion or None
     return {
         "conclusion": c,
         "reasons": reasons or [],
-        "confidence": confidence,
-        "confidence_band": confidence_band(confidence),
+        "evidence_maturity_absent_reason": "evidence_maturity_internal_only",
         "is_efficiency_finding": is_efficiency_finding(c),
         "is_assessable": is_assessable(c),
         "coverage_class": coverage_class(c),

@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 #:
 #: 20 is a floor, not a target: it is roughly where a single anomalous case
 #: stops being able to swing a mean cost delta past a 5% materiality threshold.
-#: It does not make a result statistically strong; `confidence` reports that.
+#: It does not make a result statistically strong; evidence maturity reports that.
 DEFAULT_MIN_SAMPLE_SIZE = 20
 
 BENCHMARK_COLS = (
@@ -622,7 +622,7 @@ def run_benchmark(
             materiality=materiality,
             conclusion=domain.CONCLUSION_BENCHMARK_FAILED,
             reasons=[domain.reason("execution_error", detail=str(exc)[:300])],
-            confidence=None,
+            evidence_maturity=None,
             sample_size=None,
             success_signal=domain.SuccessSignal(),
             more_data=domain.MORE_DATA_UNKNOWN,
@@ -681,7 +681,7 @@ def _run(
                 ),
                 surface=workload.get("surface"),
             )],
-            confidence=None, sample_size=0, success_signal=domain.SuccessSignal(),
+            evidence_maturity=None, sample_size=0, success_signal=domain.SuccessSignal(),
             more_data=domain.MORE_DATA_UNKNOWN,
             more_data_reasons=[domain.reason(
                 "baseline_unavailable",
@@ -703,7 +703,7 @@ def _run(
                 detail="No promoted deployment or workflow graph could be resolved.",
                 workflow_id=workflow_id,
             )],
-            confidence=None, sample_size=0, success_signal=domain.SuccessSignal(),
+            evidence_maturity=None, sample_size=0, success_signal=domain.SuccessSignal(),
             more_data=domain.MORE_DATA_UNKNOWN, more_data_reasons=[],
             status="completed", error=None, recommendation_id=recommendation_id,
             actor=actor, service_mod=service_mod,
@@ -726,7 +726,7 @@ def _run(
                 "sample_size_below_threshold", observed=n, required=floor,
                 unit="cases", dataset="golden_inputs",
             )],
-            confidence=None, sample_size=n, success_signal=domain.SuccessSignal(),
+            evidence_maturity=None, sample_size=n, success_signal=domain.SuccessSignal(),
             more_data=domain.MORE_DATA_YES,
             more_data_reasons=[domain.reason(
                 "sample_size_below_threshold", observed=n, required=floor,
@@ -799,7 +799,7 @@ def _run(
                 detail="No eligible candidate strategy reached the replay stage.",
                 dropped=gen_meta.get("dropped") or [],
             )],
-            confidence=None, sample_size=n, success_signal=domain.SuccessSignal(),
+            evidence_maturity=None, sample_size=n, success_signal=domain.SuccessSignal(),
             more_data=domain.MORE_DATA_UNKNOWN,
             more_data_reasons=[domain.reason(
                 "no_candidates_generated",
@@ -814,6 +814,7 @@ def _run(
                 measured=[], safe=[], promising=[],
                 opportunities=gen_meta.get("opportunities") or [],
                 generation=gen_meta,
+                baseline={}, objective=objective,
             )),
         )
 
@@ -1046,7 +1047,7 @@ def _run(
         org_id, benchmark_id=benchmark_id, workload=workload, objective=objective,
         policy=policy, materiality=verdict["materiality_applied"],
         conclusion=verdict["conclusion"], reasons=verdict["reasons"],
-        confidence=verdict["confidence"], sample_size=n, success_signal=signal,
+        evidence_maturity=verdict["evidence_maturity"], sample_size=n, success_signal=signal,
         more_data=verdict["more_data_changes_conclusion"],
         more_data_reasons=verdict["more_data_reasons"],
         status="completed", error=None,
@@ -1131,6 +1132,8 @@ def evaluate_conclusion(
             promising=ctx.get("promising") or [],
             opportunities=opportunities or [],
             generation=generation or {},
+            baseline=baseline,
+            objective=objective,
         )
     )
     return verdict
@@ -1158,7 +1161,7 @@ def _decide(
     wrong — it was correct under the policy in force at the time, and both are
     retained.
 
-    Returns {conclusion, reasons, confidence, more_data_changes_conclusion,
+    Returns {conclusion, reasons, evidence_maturity, more_data_changes_conclusion,
              more_data_reasons, materiality_applied, winner, selected_result_id}.
     """
     reasons: list[dict] = []
@@ -1351,7 +1354,7 @@ def _decide(
                     ),
                 ))
 
-        confidence = domain.compute_confidence(
+        evidence_maturity = domain.compute_evidence_maturity(
             sample_size=sample_size, evidence_source="replay",
             quality_provenance=quality_provenance,
             variation=baseline.get("cost_variation"),
@@ -1359,7 +1362,7 @@ def _decide(
         return {
             "conclusion": conclusion,
             "reasons": reasons,
-            "confidence": confidence,
+            "evidence_maturity": evidence_maturity,
             "more_data_changes_conclusion": more_data,
             "more_data_reasons": more_data_reasons,
             "materiality_applied": materiality,
@@ -1450,7 +1453,7 @@ def _decide(
                 "coverage_gap",
                 detail=f"The metric for objective '{objective}' was not measured in any arm.",
             )],
-            "confidence": None,
+            "evidence_maturity": None,
             "more_data_changes_conclusion": domain.MORE_DATA_YES,
             "more_data_reasons": more_data_reasons,
             "materiality_applied": materiality,
@@ -1465,7 +1468,7 @@ def _decide(
     winner["improvement"] = improvement
     material, materiality_detail = domain.evaluate_materiality(improvement, materiality)
 
-    confidence = domain.compute_confidence(
+    evidence_maturity = domain.compute_evidence_maturity(
         sample_size=sample_size,
         evidence_source="replay",
         quality_provenance=winner["metrics"].get("quality_provenance") or quality_provenance,
@@ -1531,7 +1534,7 @@ def _decide(
         return {
             "conclusion": domain.CONCLUSION_PROMISING_UNVERIFIED,
             "reasons": reasons,
-            "confidence": confidence,
+            "evidence_maturity": evidence_maturity,
             "more_data_changes_conclusion": (
                 domain.MORE_DATA_YES if extra is not None else domain.MORE_DATA_UNKNOWN
             ),
@@ -1547,9 +1550,9 @@ def _decide(
         return {
             "conclusion": domain.CONCLUSION_SAFE_IMPROVEMENT,
             "reasons": reasons,
-            "confidence": confidence,
+            "evidence_maturity": evidence_maturity,
             "more_data_changes_conclusion": (
-                domain.MORE_DATA_YES if (confidence or 0) < 0.34 else domain.MORE_DATA_NO
+                domain.MORE_DATA_YES if (evidence_maturity or 0) < 0.34 else domain.MORE_DATA_NO
             ),
             "more_data_reasons": more_data_reasons + ([domain.reason(
                 "sample_size_below_threshold", observed=sample_size, required=sample_size * 4,
@@ -1557,7 +1560,7 @@ def _decide(
                     "The improvement clears the materiality threshold but confidence "
                     "is low; more cases would firm up the estimate."
                 ),
-            )] if (confidence or 0) < 0.34 else []),
+            )] if (evidence_maturity or 0) < 0.34 else []),
             "materiality_applied": {**materiality, "evaluation": materiality_detail},
             "winner": winner,
             "selected_result_id": winner.get("result_id"),
@@ -1584,7 +1587,7 @@ def _decide(
                 ),
                 thresholds=[t.get("metric") for t in thresholds_evaluated] or None,
             )],
-            "confidence": confidence,
+            "evidence_maturity": evidence_maturity,
             "more_data_changes_conclusion": domain.MORE_DATA_YES,
             "more_data_reasons": more_data_reasons,
             "materiality_applied": {**materiality, "evaluation": materiality_detail},
@@ -1606,9 +1609,9 @@ def _decide(
     return {
         "conclusion": domain.CONCLUSION_NO_MATERIAL_IMPROVEMENT,
         "reasons": reasons,
-        "confidence": confidence,
+        "evidence_maturity": evidence_maturity,
         "more_data_changes_conclusion": (
-            domain.MORE_DATA_YES if (unmeasurable or (confidence or 0) < 0.34)
+            domain.MORE_DATA_YES if (unmeasurable or (evidence_maturity or 0) < 0.34)
             else domain.MORE_DATA_NO
         ),
         "more_data_reasons": more_data_reasons + ([domain.reason(
@@ -1808,6 +1811,34 @@ def _build_frontier(
     }
 
 
+def _objective_improved(
+    m: dict, baseline: dict, objective: str
+) -> Optional[bool]:
+    """
+    Did this arm beat the MEASURED baseline on the objective's own metric?
+
+    None when the metric was not measured on both sides — never False, because
+    "not measured" is not "did not improve". Deltas are taken against the
+    baseline over the cases THIS arm ran, matching _frontier_entry.
+    """
+    metrics = m.get("metrics") or {}
+    arm_baseline = m.get("paired_baseline") or baseline or {}
+    if objective in ("cost", "balanced"):
+        key, lower_is_better = "mean_cost_usd", True
+    elif objective == "latency":
+        key, lower_is_better = "latency_p95_ms", True
+    elif objective == "quality":
+        key, lower_is_better = "quality", False
+    else:
+        # 'custom': no built-in ranking (see _best_by_objective). Refusing to
+        # rank means refusing to claim an improvement.
+        return None
+    b, c = arm_baseline.get(key), metrics.get(key)
+    if b is None or c is None:
+        return None
+    return float(c) < float(b) if lower_is_better else float(c) > float(b)
+
+
 def _dispositions(
     *,
     measured: list[dict],
@@ -1815,15 +1846,19 @@ def _dispositions(
     promising: list[dict],
     opportunities: list[dict],
     generation: dict,
+    baseline: Optional[dict] = None,
+    objective: str = "cost",
 ) -> list[dict]:
     """
     One disposition per candidate that entered consideration, including the ones
     that never reached a benchmark.
 
-    Candidate discovery is a funnel and the funnel counts ARE the product: "47
-    considered / 31 incompatible or policy-blocked / 7 benchmarked / 2 promising
-    / 1 verified" is both more useful and more truthful than a four-row results
-    table. Every model that entered leaves with a code saying where it exited.
+    Candidate discovery is a funnel and the funnel counts ARE the product. Each
+    record carries BOTH the disjoint disposition (where this candidate stopped —
+    unchanged, the UI reads it) and the facts domain.stages_reached needs to
+    count how far it GOT: `entered_replay`, `stopped_early`,
+    `objective_improved`. Counting only the stop point is what let a run report
+    `benchmarked: 0` while three arms had executed.
     """
     out: list[dict] = []
     safe_ids = {id(m) for m in safe}
@@ -1850,6 +1885,10 @@ def _dispositions(
             "tier": domain.TIER_EXECUTABLE,
             "disposition": drop_stage.get(code, domain.DISPOSITION_INCOMPATIBLE),
             "code": code,
+            # Excluded before dispatch: no provider request was made for it.
+            "entered_replay": False,
+            "stopped_early": None,
+            "objective_improved": None,
             "facts": {k: v for k, v in d.items() if k not in ("title", "generator", "code")},
         })
 
@@ -1860,6 +1899,9 @@ def _dispositions(
             "tier": domain.TIER_OPPORTUNITY,
             "disposition": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
             "code": "provider_not_configured",
+            "entered_replay": False,
+            "stopped_early": None,
+            "objective_improved": None,
             "facts": {"providers": opp.get("providers")},
         })
 
@@ -1875,12 +1917,19 @@ def _dispositions(
             stage, code = domain.DISPOSITION_NOT_MEASURED, "coverage_gap"
         else:
             stage, code = domain.DISPOSITION_BENCHMARKED, None
+        staged = m.get("staged_evaluation") or {}
         out.append({
             "label": m["candidate"].title,
             "generator": getattr(m["candidate"], "generator", None),
             "tier": domain.TIER_EXECUTABLE,
             "disposition": stage,
             "code": code,
+            # This arm was dispatched and produced a measurement — that is what
+            # "entered replay" means, and it is true regardless of which
+            # terminal bucket the arm ended in.
+            "entered_replay": True,
+            "stopped_early": bool(staged.get("stopped_early")),
+            "objective_improved": _objective_improved(m, baseline or {}, objective),
             "result_id": m.get("result_id"),
             # The preflight record for an arm that DID run. Present so the
             # funnel answers "why was this one allowed to spend money?" with the
@@ -2049,7 +2098,7 @@ def reevaluate(org_id: str, benchmark_id: str, *, objective: Optional[str] = Non
         objective=objective,
         conclusion=verdict["conclusion"],
         reasons=verdict["reasons"],
-        confidence=verdict["confidence"],
+        evidence_maturity=verdict["evidence_maturity"],
         materiality=verdict["materiality_applied"],
         signal=signal,
         more_data=verdict["more_data_changes_conclusion"],
@@ -2262,7 +2311,7 @@ def _write_candidate_result(
 
 def _write_conclusion(
     org_id, *, benchmark_id, workload_id, policy, objective, conclusion, reasons,
-    confidence, materiality, signal, more_data, more_data_reasons,
+    evidence_maturity, materiality, signal, more_data, more_data_reasons,
     selected_result_id: Optional[str] = None,
     quality_safety: Optional[dict] = None,
     quality_safety_policy: Optional[dict] = None,
@@ -2286,19 +2335,28 @@ def _write_conclusion(
         "objective": objective,
         "conclusion": conclusion,
         "reasons": reasons,
-        "confidence": confidence,
-        "confidence_band": domain.confidence_band(confidence),
+        # STORAGE KEY, not a name for what this is. The physical columns stay
+        # `confidence`/`confidence_band` so the preserved historical rows are
+        # not orphaned and no data is rewritten; the value and the formula are
+        # unchanged, so an old row still means what it meant. What it MEANS is
+        # evidence maturity, and it is internal — see
+        # migration_optimization_v10_evidence_maturity_semantics.sql and
+        # optimization.domain.compute_evidence_maturity.
+        "confidence": evidence_maturity,
+        "confidence_band": domain.evidence_maturity_band(evidence_maturity),
         "materiality_applied": materiality,
         "success_signal": signal.to_dict() if signal else {},
         "more_data_changes_conclusion": more_data,
         "more_data_reasons": more_data_reasons,
         "selected_candidate_result_id": selected_result_id,
         # STRUCTURED, EXPLAINABLE quality evidence — deliberately NOT folded
-        # into the generic `confidence` field. `confidence` answers "how much do
-        # we trust this measurement overall"; this answers "can we rule out a
-        # material quality regression". The live failure that motivated this
-        # split shipped a -10pp regression with confidence 0.171 attached, and
-        # no field anywhere said the regression had never been ruled out.
+        # into the generic evidence-maturity index. That index answers "how
+        # mature is the evidence behind this measurement"; this answers "can we
+        # rule out a material quality regression", which is a real statistical
+        # statement. The live failure that motivated the split shipped a -10pp
+        # regression with maturity 0.171 attached, and no field anywhere said
+        # the regression had never been ruled out. The two are never merged and
+        # only this one is customer-facing.
         "quality_safety": quality_safety,
         "quality_safety_policy": quality_safety_policy,
         "frontier": frontier,
@@ -2323,7 +2381,7 @@ def _write_conclusion(
 
 def _conclude(
     org_id, *, benchmark_id, workload, objective, policy, materiality, conclusion,
-    reasons, confidence, sample_size, success_signal, more_data, more_data_reasons,
+    reasons, evidence_maturity, sample_size, success_signal, more_data, more_data_reasons,
     status, error, recommendation_id, actor, service_mod,
     selected_result_id: Optional[str] = None, winner: Optional[dict] = None,
     create_recommendation: bool = False,
@@ -2340,7 +2398,7 @@ def _conclude(
     conclusion_row = _write_conclusion(
         org_id, benchmark_id=benchmark_id, workload_id=workload_id, policy=policy,
         objective=objective, conclusion=conclusion, reasons=reasons,
-        confidence=confidence, materiality=materiality, signal=success_signal,
+        evidence_maturity=evidence_maturity, materiality=materiality, signal=success_signal,
         more_data=more_data, more_data_reasons=more_data_reasons,
         selected_result_id=selected_result_id,
         quality_safety=quality_safety, quality_safety_policy=quality_safety_policy,
@@ -2354,7 +2412,8 @@ def _conclude(
         "more_data_changes_conclusion": more_data,
         "more_data_reason": (more_data_reasons[0]["code"] if more_data_reasons else None),
         "materiality_threshold": materiality,
-        "confidence": confidence,
+        # Storage key; the value is the internal evidence-maturity index.
+        "confidence": evidence_maturity,
         "sample_size": sample_size,
         "error": error,
         "completed_at": _iso(_utc_now()),
@@ -2379,7 +2438,7 @@ def _conclude(
             }
             for r in list_candidate_results(org_id, benchmark_id=benchmark_id)
         ],
-        confidence=confidence,
+        evidence_maturity=evidence_maturity,
         reason=f"benchmark conclusion: {conclusion}",
     )
 
@@ -2394,7 +2453,7 @@ def _conclude(
                     org_id, recommendation_id, target,
                     actor=actor, reason=f"benchmark:{conclusion}",
                     extra_fields=_recommendation_fields(
-                        conclusion=conclusion, confidence=confidence,
+                        conclusion=conclusion, evidence_maturity=evidence_maturity,
                         sample_size=sample_size, winner=winner,
                         success_signal=success_signal,
                         quality_safety=quality_safety,
@@ -2427,7 +2486,7 @@ def _conclude(
             objective=objective,
             winner=winner,
             baseline_strategy=baseline_strategy,
-            confidence=confidence,
+            evidence_maturity=evidence_maturity,
             sample_size=sample_size,
             success_signal=success_signal,
             conclusion=conclusion,
@@ -2453,7 +2512,7 @@ def _conclude(
         "quality_safety_policy": quality_safety_policy,
         "frontier": frontier,
         "consideration": consideration,
-        **domain.conclusion_payload(conclusion, reasons=reasons, confidence=confidence),
+        **domain.conclusion_payload(conclusion, reasons=reasons),
     }
 
 
@@ -2465,7 +2524,7 @@ def _create_recommendation_from_evidence(
     objective: str,
     winner: dict,
     baseline_strategy: Optional[strategy_mod.Strategy],
-    confidence: Optional[float],
+    evidence_maturity: Optional[float],
     sample_size: Optional[int],
     success_signal,
     conclusion: str,
@@ -2561,7 +2620,7 @@ def _create_recommendation_from_evidence(
 
     rec_id = str(rec["id"])
     fields = _recommendation_fields(
-        conclusion=conclusion, confidence=confidence, sample_size=sample_size,
+        conclusion=conclusion, evidence_maturity=evidence_maturity, sample_size=sample_size,
         winner=winner, success_signal=success_signal,
         quality_safety=quality_safety,
     )
@@ -2589,7 +2648,7 @@ def _create_recommendation_from_evidence(
 
 
 def _recommendation_fields(
-    *, conclusion, confidence, sample_size, winner, success_signal,
+    *, conclusion, evidence_maturity, sample_size, winner, success_signal,
     quality_safety: Optional[dict] = None,
 ) -> dict:
     """
@@ -2603,7 +2662,9 @@ def _recommendation_fields(
     fields: dict[str, Any] = {
         "evidence_source": "replay",
         "evidence_strength": domain.evidence_strength("replay"),
-        "confidence": confidence,
+        # Storage key; the value is the internal evidence-maturity index. It is
+        # NOT returned by recommendation_row_to_response.
+        "confidence": evidence_maturity,
         "sample_size": sample_size,
         "success_signal": success_signal.to_dict() if success_signal else {},
         # The non-inferiority evidence travels WITH the recommendation. Without
@@ -2874,7 +2935,9 @@ def benchmark_row_to_response(row: dict, *, conclusion_row: Optional[dict] = Non
         or ((row.get("conclusion_detail") or {}).get("reasons"))
         or []
     )
-    confidence = (conclusion_row or row).get("confidence")
+    # Read from the `confidence` column, which stores the evidence-maturity
+    # index. Loaded for internal use only; conclusion_payload does not emit it.
+    evidence_maturity = (conclusion_row or row).get("confidence")
     return {
         "id": str(row["id"]),
         "org_id": str(row["org_id"]),
@@ -2904,5 +2967,5 @@ def benchmark_row_to_response(row: dict, *, conclusion_row: Optional[dict] = Non
         "started_at": row.get("started_at"),
         "completed_at": row.get("completed_at"),
         "created_at": row.get("created_at"),
-        **domain.conclusion_payload(conclusion, reasons=reasons, confidence=confidence),
+        **domain.conclusion_payload(conclusion, reasons=reasons),
     }

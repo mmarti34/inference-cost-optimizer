@@ -45,7 +45,7 @@ A price sheet says what a call *would* cost. Only a measurement says what it
 
 | Module | Role |
 |---|---|
-| `domain.py` | Vocabulary and pure functions: objectives, lifecycle machine, evidence strength, provenance defaults, confidence, materiality, coverage, reason codes. No I/O. |
+| `domain.py` | Vocabulary and pure functions: objectives, lifecycle machine, evidence strength, provenance defaults, evidence maturity, the consideration funnel, materiality, coverage, reason codes. No I/O. |
 | `executors.py` | **VENDOR side.** Published prices, advertised capabilities, declared regions. Contains no query against any measurement table. |
 | `evidence.py` | **EMPIRICAL side.** What was measured on this org's own workloads. Contains no vendor lookup. |
 | `strategy.py` | Execution strategies: ordered executor steps; the runtime `graph_json` adapter and the direct-inference adapter. Dimension applicability is scoped **per execution surface**. |
@@ -375,9 +375,11 @@ satisfying a hard quality floor.
 **9. Can an optimization progress replay → canary → production?**
 Yes. `evidence_source` encodes **counterfactual strength**, not mere presence:
 `none 0 < observational 10 < replay 30 < shadow 40 < ab_test 60 < canary 70 <
-production 80`. That number feeds `compute_confidence` alongside sample size,
-signal strength and variance — so 14 replay cases score **0.136** and 180,000
-confirmed production outcomes score **0.99**. The lifecycle is
+production 80`. That number feeds `compute_evidence_maturity` alongside sample
+size, signal strength and variance — so 14 replay cases score **0.136** and
+180,000 confirmed production outcomes score **0.99**. That index is EVIDENCE
+MATURITY, not a probability, and it is internal: it appears in no
+customer-facing payload (see v10). The lifecycle is
 `discovered → benchmarking → verified → awaiting_approval → shadowing → canary →
 promoted`, with `rejected / inconclusive / failed / superseded / rolled_back`.
 There is deliberately **no edge** from `verified` straight to `canary`: human
@@ -412,7 +414,8 @@ adapter for that surface, not a schema change.
 **12. Could a future allocation engine select among agents without replacing the schema?**
 Yes. `allocation_decisions` already stores `considered_strategies` (including
 rejects and *why* each was rejected), `selected_strategy_id`, the objective and
-`objective_config`, the policy, the expected metrics, the confidence, and an
+`objective_config`, the policy, the expected metrics, the evidence-maturity
+index, and an
 `actual_result` backfilled later for expected-vs-actual calibration. It is
 written today for benchmark and recommendation decisions and is not surfaced
 prominently. An allocation engine reads and writes exactly this table.
@@ -465,8 +468,18 @@ The API returns **codes and facts, never prose**:
   "reasons": [{ "code": "quality_below_threshold", "constraint": "min_quality",
                 "observed": 0.933, "required": 0.94, "unit": "score",
                 "shortfall": 0.007, "candidate": "Switch to claude-3-haiku" }],
-  "confidence": 0.41, "confidence_band": "medium" }
+  "evidence_maturity_absent_reason": "evidence_maturity_internal_only" }
 ```
+
+No generic 0..1 score is returned. The evidence-maturity index blends sample
+size, evidence class, signal provenance, variance and historical consistency;
+printed beside a non-inferiority verdict it read as "the chance this verdict is
+wrong", which it is not. The three axes a caller needs stay separate and are
+never collapsed into one number: the **safety verdict** (`quality_safety`:
+`established`, `allowed_regression`, `confidence_level`, `n_pairs`,
+`discordant_b`/`discordant_c`), the **evidence stage** (`evidence_source`:
+`observational → replay → shadow → ab_test → canary → production`) and the
+**production status** (the recommendation's `status` and `rollout`).
 
 The vocabulary is `domain.REASON_CODES`; `domain.reason()` raises on an
 undocumented code so one cannot slip into the contract unannounced. All wording

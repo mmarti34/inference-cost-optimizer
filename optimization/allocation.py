@@ -49,7 +49,7 @@ def record_decision(
     expected_cost_usd: Optional[float] = None,
     expected_quality: Optional[float] = None,
     expected_latency_p95_ms: Optional[int] = None,
-    confidence: Optional[float] = None,
+    evidence_maturity: Optional[float] = None,
     reason: Optional[str] = None,
     objective_config: Optional[dict] = None,
 ) -> Optional[dict]:
@@ -73,7 +73,11 @@ def record_decision(
         "expected_cost_usd": expected_cost_usd,
         "expected_quality": expected_quality,
         "expected_latency_p95_ms": expected_latency_p95_ms,
-        "confidence": confidence,
+        # Storage key. The value is the INTERNAL evidence-maturity index from
+        # optimization.domain.compute_evidence_maturity — not a probability and
+        # not a confidence level. The decision log is internal, so the column
+        # name is left alone rather than migrated.
+        "confidence": evidence_maturity,
         "reason": reason,
         "decided_at": _iso_now(),
     }

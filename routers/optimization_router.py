@@ -482,7 +482,7 @@ async def accept_recommendation(
         expected_cost_usd=rec.get("candidate_cost"),
         expected_quality=rec.get("candidate_quality"),
         expected_latency_p95_ms=rec.get("candidate_latency_p95_ms"),
-        confidence=rec.get("confidence"),
+        evidence_maturity=rec.get("confidence"),
         reason="human approved; candidate deployment created",
     )
 
@@ -1260,7 +1260,10 @@ def _build_summary(org_id: str, lookback_days: int) -> dict:
     try:
         resp = (
             supabase.table("benchmark_conclusions")
-            .select("workload_id, conclusion, confidence, created_at, is_current")
+            # `confidence` is NOT selected: coverage is a count of conclusions
+            # by class, and the evidence-maturity index it stores is internal
+            # and has no place in a customer-facing summary.
+            .select("workload_id, conclusion, created_at, is_current")
             .eq("org_id", org_id)
             .eq("is_current", True)
             .order("created_at", desc=True)

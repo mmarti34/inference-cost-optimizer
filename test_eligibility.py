@@ -82,9 +82,23 @@ def _models_called(runtime):
     return {c["model"] for c in runtime.calls}
 
 
+def _outcome(result, disposition):
+    """Count in the DISJOINT terminal bucket — where a candidate stopped."""
+    return next(
+        s for s in result["consideration"]["outcomes"] if s["stage"] == disposition
+    )["count"]
+
+
 def _stage(result, stage):
+    """Count in the CUMULATIVE funnel — how far candidates got."""
     return next(
         s for s in result["consideration"]["stages"] if s["stage"] == stage
+    )["count"]
+
+
+def _exclusion(result, code):
+    return next(
+        e for e in result["consideration"]["exclusions"] if e["code"] == code
     )["count"]
 
 
@@ -158,7 +172,7 @@ def test_an_unconfigured_provider_incurs_zero_provider_executions(db):
     assert opp["verified"] is False
     assert opp["measured_cost_usd"] is None
     assert opp["measured_quality"] is None
-    assert _stage(result, domain.DISPOSITION_PROVIDER_NOT_CONFIGURED) == 1
+    assert _outcome(result, domain.DISPOSITION_PROVIDER_NOT_CONFIGURED) == 1
 
 
 # ===========================================================================
@@ -336,7 +350,7 @@ def test_a_more_expensive_candidate_under_a_cost_objective_is_screened(db):
     )
 
     assert EXPENSIVE_MODEL not in _models_called(runtime)
-    assert _stage(result, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 1
+    assert _outcome(result, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 1
 
     d = _disposition_for(result, EXPENSIVE_MODEL)
     assert d["code"] == "economically_dominated"
@@ -363,7 +377,7 @@ def test_screening_never_removes_a_candidate_that_could_win_on_measured_cost(db)
     result = _run(db, runtime, candidates=[_candidate(LIVE_WINNER_MODEL)])
 
     assert LIVE_WINNER_MODEL in _models_called(runtime)
-    assert _stage(result, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 0
+    assert _outcome(result, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 0
 
 
 def test_the_screen_does_not_fire_on_a_marginal_price_difference():
@@ -464,7 +478,7 @@ def test_a_policy_blocked_vendor_is_refused_before_dispatch(db):
     result = _run(db, runtime, candidates=[_candidate(CHEAP_MODEL)])
 
     assert CHEAP_MODEL not in _models_called(runtime)
-    assert _stage(result, domain.DISPOSITION_POLICY_BLOCKED) == 1
+    assert _outcome(result, domain.DISPOSITION_POLICY_BLOCKED) == 1
     d = _disposition_for(result, CHEAP_MODEL)
     assert d["code"] == "provider_not_permitted"
     assert d["facts"]["facts"]["constraint"] == "allowed_vendors"
@@ -567,8 +581,8 @@ def test_the_funnel_counts_every_candidate_and_exclusions_do_not_reduce_coverage
     # The funnel is WIDER, and every exit is accounted for exactly once.
     funnel = mixed["consideration"]
     assert funnel["considered"] == 3
-    assert _stage(mixed, domain.DISPOSITION_INCOMPATIBLE) == 1
-    assert _stage(mixed, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 1
+    assert _outcome(mixed, domain.DISPOSITION_INCOMPATIBLE) == 1
+    assert _outcome(mixed, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 1
     # The surviving candidate exits exactly where it did on its own: the
     # exclusions changed the funnel's width, not the verdict on the arm that ran.
     survivor_alone = _disposition_for(alone, CHEAP_MODEL)
@@ -597,18 +611,80 @@ def test_every_funnel_stage_is_either_populated_or_declared_unbuilt(db):
         candidates=[_candidate(CHEAP_MODEL), _candidate(INCOMPATIBLE_MODEL)],
     )
 
-    stages = {s["stage"]: s for s in result["consideration"]["stages"]}
+    outcomes = {s["stage"]: s for s in result["consideration"]["outcomes"]}
     # Newly real: something now actually populates these.
-    assert stages[domain.DISPOSITION_INCOMPATIBLE]["emitted"] is True
-    assert stages[domain.DISPOSITION_ECONOMICALLY_DOMINATED]["emitted"] is True
-    assert stages[domain.DISPOSITION_POLICY_BLOCKED]["emitted"] is True
+    assert outcomes[domain.DISPOSITION_INCOMPATIBLE]["emitted"] is True
+    assert outcomes[domain.DISPOSITION_ECONOMICALLY_DOMINATED]["emitted"] is True
+    assert outcomes[domain.DISPOSITION_POLICY_BLOCKED]["emitted"] is True
     # Still nothing populates historical elimination, and it says so.
-    assert stages[domain.DISPOSITION_ELIMINATED_BY_HISTORY]["emitted"] is False
+    assert outcomes[domain.DISPOSITION_ELIMINATED_BY_HISTORY]["emitted"] is False
 
-    # Every exclusion code the preflight can emit maps to a real stage.
+    # Same convention at reason-code grain, which is the grain the exclusion
+    # evidence is rendered at.
+    exclusions = {e["code"]: e for e in result["consideration"]["exclusions"]}
+    assert exclusions["eliminated_by_historical_evidence"]["emitted"] is False
+    for code in (
+        "provider_not_configured", "request_shape_incompatible",
+        "required_capability_missing", "context_window_insufficient",
+        "policy_blocked", "pricing_unknown", "economically_dominated",
+    ):
+        # The exclusion codes the UI renders as evidence of a thorough search
+        # must stay individually distinguishable, not collapsed into
+        # `incompatible`.
+        assert exclusions[code]["emitted"] is True
+        assert exclusions[code]["disposition"] in domain.DISPOSITIONS_ORDERED
+
+    # Every exclusion code the preflight can emit maps to a real disposition.
     for code, stage in el.CODE_TO_DISPOSITION.items():
         assert code in domain.REASON_CODES
-        assert stage in domain.FUNNEL_STAGES
+        assert stage in domain.DISPOSITIONS_ORDERED
+        assert code in domain.EXCLUSION_CODES
+
+
+def test_the_funnel_stages_are_cumulative_and_never_increase(db):
+    """
+    THE invariant. A candidate counts at every stage it REACHED, not only at
+    the one it stopped in, so the cumulative spine can only narrow going down.
+
+    The bug this replaces: counting each candidate solely in its terminal
+    bucket reported `benchmarked: 0` on a run where arms had demonstrably
+    executed and then been stopped, because they incremented `failed_policy`
+    instead. "How many did we actually test?" was unanswerable.
+    """
+    _seed(db, golden_inputs=60, production_runs=90)
+    runtime = FakeRuntime(n_cases=60)
+    result = _run(
+        db, runtime,
+        candidates=[
+            _candidate(CHEAP_MODEL),
+            _candidate(INCOMPATIBLE_MODEL),
+            _candidate(EXPENSIVE_MODEL),
+        ],
+    )
+
+    stages = result["consideration"]["stages"]
+    assert [s["stage"] for s in stages] == list(domain.FUNNEL_STAGES)
+
+    spine = [s for s in stages if s["cumulative"]]
+    counts = [s["count"] for s in spine]
+    assert counts == sorted(counts, reverse=True), counts
+    assert counts[0] == result["consideration"]["considered"] == 3
+
+    # Two were excluded before dispatch; one was executable and did run.
+    assert _stage(result, domain.STAGE_EXECUTABLE) == 1
+    assert _stage(result, domain.STAGE_ENTERED_REPLAY) == 1
+
+    # The disjoint outcomes still account for every candidate exactly once.
+    assert sum(
+        o["count"] for o in result["consideration"]["outcomes"]
+        if o["stage"] != domain.DISPOSITION_CONSIDERED
+    ) == 3
+
+    # `stopped_early` is reported inline but is an EXIT count, not part of the
+    # cumulative spine — it is never asserted to nest inside the stage below it.
+    stopped = next(s for s in stages if s["stage"] == domain.STAGE_STOPPED_EARLY)
+    assert stopped["cumulative"] is False
+    assert stopped["count"] <= _stage(result, domain.STAGE_ENTERED_REPLAY)
 
 
 def test_a_fully_screened_run_still_emits_the_funnel(db):
@@ -627,8 +703,8 @@ def test_a_fully_screened_run_still_emits_the_funnel(db):
     assert _models_called(runtime) == set()  # not even the baseline arm ran
     assert result["conclusion"] == domain.CONCLUSION_INSUFFICIENT_EVIDENCE
     assert result["consideration"]["considered"] == 2
-    assert _stage(result, domain.DISPOSITION_INCOMPATIBLE) == 1
-    assert _stage(result, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 1
+    assert _outcome(result, domain.DISPOSITION_INCOMPATIBLE) == 1
+    assert _outcome(result, domain.DISPOSITION_ECONOMICALLY_DOMINATED) == 1
     # Nothing was measured, so nothing is covered. That is the honest reading,
     # and it is not what "the candidates failed policy" would mean.
     assert domain.coverage_class(result["conclusion"]) == domain.COVERAGE_NOT_COVERED

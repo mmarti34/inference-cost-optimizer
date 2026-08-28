@@ -512,10 +512,13 @@ def test_cheaper_and_passing_candidate_yields_safe_improvement_and_a_recommendat
     # First optimization of this workload: no ancestor to double-count against.
     assert rec["baseline_reference"]["derived_from_recommendation_id"] is None
 
-    # 60 replay cases must not look like a production-scale result.
+    # 60 replay cases must not look like a production-scale result. `confidence`
+    # is the STORAGE column for the internal evidence-maturity index; it is not
+    # returned by recommendation_row_to_response.
     assert rec["confidence"] < 0.5
 
-    # The safety claim is EXPLICIT and structured — not folded into `confidence`.
+    # The safety claim is EXPLICIT and structured — never folded into the
+    # evidence-maturity index.
     qs = result["quality_safety"]
     assert qs["established"] is True
     assert qs["method"] == "tango_score_paired_noninferiority"
@@ -525,15 +528,93 @@ def test_cheaper_and_passing_candidate_yields_safe_improvement_and_a_recommendat
     assert qs["observed_regression"] == pytest.approx(0.0)
     assert qs["lower_confidence_bound"] > -0.05
     assert rec["quality_safety"]["established"] is True
-    assert domain.confidence_band(rec["confidence"]) in ("low", "medium")
+    assert domain.evidence_maturity_band(rec["confidence"]) in ("low", "medium")
 
 
-def test_confidence_from_a_replay_never_reaches_production_strength():
+def test_the_recommendation_payload_exposes_no_probability_looking_score():
+    """
+    The customer-facing payload must not carry a bare 0..1 number that reads as
+    "the chance this verdict is right".
+
+    The concrete misreading this prevents: `confidence 0.188 (band low)` printed
+    beside a quality-safety verdict that WAS established — 140 paired
+    evaluations, non-inferiority within 2pp at 95%, discordant_b=1,
+    discordant_c=2 — invites "18% chance the verdict is wrong". The stored
+    number is an evidence-MATURITY index and supports no such statement.
+    """
+    row = {
+        "id": "rec-1", "org_id": ORG_ID, "status": domain.STATUS_VERIFIED,
+        "evidence_source": "replay",
+        "evidence_strength": domain.evidence_strength("replay"),
+        "sample_size": 140,
+        # Stored, and deliberately NOT surfaced.
+        "confidence": 0.188,
+        "quality_safety": {
+            "established": True, "n_pairs": 140, "discordant_b": 1,
+            "discordant_c": 2, "allowed_regression": 0.02,
+            "confidence_level": 0.95,
+        },
+    }
+    payload = service_mod.recommendation_row_to_response(row)
+
+    assert "confidence" not in payload["evidence"]
+    assert "confidence_band" not in payload["evidence"]
+    assert payload["evidence"]["evidence_maturity_absent_reason"] == (
+        "evidence_maturity_internal_only"
+    )
+    assert 0.188 not in payload["evidence"].values()
+
+    # THE THREE AXES, still present and still separate.
+    #   1. safety verdict — a real statistical statement, with its inputs.
+    assert payload["quality"]["safety"]["established"] is True
+    assert payload["quality"]["safety"]["n_pairs"] == 140
+    assert payload["quality"]["safety"]["discordant_b"] == 1
+    assert payload["quality"]["safety"]["discordant_c"] == 2
+    assert payload["quality"]["safety"]["confidence_level"] == 0.95
+    assert payload["quality"]["regression_ruled_out"] is True
+    #   2. evidence stage.
+    assert payload["evidence"]["source"] == "replay"
+    assert payload["evidence"]["strength"] == domain.evidence_strength("replay")
+    #   3. production status.
+    assert payload["status"] == domain.STATUS_VERIFIED
+    # Never collapsed into one score.
+    assert isinstance(payload["quality"]["safety"], dict)
+
+
+def test_a_conclusion_payload_names_the_absence_rather_than_hiding_it():
+    payload = domain.conclusion_payload(
+        domain.CONCLUSION_SAFE_IMPROVEMENT, reasons=[],
+    )
+    assert "confidence" not in payload
+    assert "confidence_band" not in payload
+    assert payload["evidence_maturity_absent_reason"] in domain.REASON_CODES
+
+
+def test_a_historical_rows_stored_number_still_means_what_it_meant():
+    """
+    The semantics change renamed and unexposed the index. It did NOT change the
+    formula, so a preserved historical row is not silently reinterpreted: the
+    same inputs still produce the same number, and no stored row is rewritten.
+    """
+    same = domain.compute_evidence_maturity(
+        sample_size=60, evidence_source="replay",
+        quality_provenance="deterministic",
+    )
+    assert same == pytest.approx(0.207, abs=1e-3)
+    assert domain.evidence_maturity_band(same) == "low"
+    # And "low" here means the evidence is EARLY — 60 replay cases, not 180,000
+    # production outcomes. It is not a 20% chance of anything.
+    # Band vocabulary is unchanged, because the confidence_band CHECK
+    # constraint and the preserved rows both depend on these exact values.
+    assert domain.EVIDENCE_MATURITY_BANDS == ("low", "medium", "high")
+
+
+def test_evidence_maturity_from_a_replay_never_reaches_production_strength():
     """14 replay cases and 180k confirmed production outcomes are not the same claim."""
-    replay = domain.compute_confidence(
+    replay = domain.compute_evidence_maturity(
         sample_size=14, evidence_source="replay", quality_provenance="deterministic"
     )
-    production = domain.compute_confidence(
+    production = domain.compute_evidence_maturity(
         sample_size=180_000, evidence_source="production",
         quality_provenance="business_outcome",
     )
@@ -1111,7 +1192,7 @@ def test_a_recommendation_cannot_be_created_without_a_measured_strategy(db):
         objective="cost",
         winner={"candidate": benchmark_mod._StoredCandidate({"label": "x"}), "metrics": {}},
         baseline_strategy=None,
-        confidence=0.2,
+        evidence_maturity=0.2,
         sample_size=20,
         success_signal=domain.SuccessSignal(),
         conclusion=domain.CONCLUSION_SAFE_IMPROVEMENT,

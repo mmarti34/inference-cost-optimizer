@@ -471,6 +471,24 @@ def recommendation_row_to_response(row: dict, *, evidence: Optional[list[dict]] 
     Every measured field may be null, and null always means NOT MEASURED. The
     three savings figures are returned under separate keys with their meanings
     attached, so a client cannot read a projection as a realized result.
+
+    NO generic 0..1 score is returned. The `confidence` column stores an
+    evidence-MATURITY index (sample size x evidence class x signal provenance x
+    variance x historical consistency) and it is internal. Printed here it read
+    as a probability: a recommendation carrying 0.188 / band "low" sat beside a
+    quality-safety verdict that was established at 95% over 140 paired
+    evaluations, and the pairing suggested an 18% chance the verdict was wrong.
+    It means nothing of the kind.
+
+    The three axes a client actually needs are carried separately and are never
+    collapsed into one number:
+
+      quality.safety      the SAFETY VERDICT — established, allowed_regression,
+                          confidence_level, n_pairs, discordant_b/discordant_c.
+      evidence.source     the EVIDENCE STAGE — observational -> replay ->
+                          shadow -> ab_test -> canary -> production, with its
+                          rank in evidence.strength.
+      status / rollout    the PRODUCTION STATUS.
     """
     return {
         "id": str(row["id"]),
@@ -486,11 +504,16 @@ def recommendation_row_to_response(row: dict, *, evidence: Optional[list[dict]] 
         # Prose written to explain the proposal. NOT evidence.
         "rationale": row.get("rationale"),
         "evidence": {
+            # The EVIDENCE STAGE axis, on its own. `source` is the stage code
+            # and `strength` is its rank in that ordering — neither is a
+            # probability and neither is mixed with the safety verdict.
             "source": row.get("evidence_source"),
             "strength": row.get("evidence_strength"),
             "sample_size": row.get("sample_size"),
-            "confidence": row.get("confidence"),
-            "confidence_band": domain.confidence_band(row.get("confidence")),
+            # The evidence-maturity index is stored but not exposed. Named
+            # rather than silently dropped so a client that used to read
+            # `confidence` can tell this was a decision, not a regression.
+            "evidence_maturity_absent_reason": "evidence_maturity_internal_only",
             "benchmarks": [
                 {
                     "benchmark_id": str(e["benchmark_id"]),

@@ -470,8 +470,8 @@ def _project_ids_for_workflows(org_id: str, workflow_ids: set[str]) -> dict[str,
 #: Below this many measured production runs in the window, a workload's own
 #: averages are dominated by individual-case noise, and a benchmark's verdict
 #: would be extrapolated from traffic that may not recur. A floor on being
-#: worth measuring, not a claim about statistical power — `confidence` reports
-#: that separately.
+#: worth measuring, not a claim about statistical power — the benchmark's own
+#: sample floor and the quality-safety verdict cover that separately.
 MIN_RUNS_TO_OPTIMIZE = 20
 
 #: Below this measured spend over the window, no achievable percentage saving
@@ -540,7 +540,8 @@ def select_optimization_targets(
         "rationale": (
             "Floors on being worth measuring, applied to MEASURED volume and "
             "spend in the window. They are not statistical-power thresholds; "
-            "the benchmark's own sample floor and the confidence score cover that."
+            "the benchmark's own sample floor and the quality-safety verdict "
+            "cover that."
         ),
     }
     if coverage.get("error"):

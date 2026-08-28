@@ -802,19 +802,28 @@ def _check_objective(candidate, baseline, objective: str, materiality, history) 
 # The funnel-facing entry point
 # ---------------------------------------------------------------------------
 
-#: Which funnel stage each exclusion code exits at. Every code here is emitted
-#: by a check that ran against real data.
+#: Which disposition each PREFLIGHT exclusion code exits at. Every code here is
+#: emitted by a check that ran against real data.
+#:
+#: Derived from domain.EXCLUSION_CODE_TO_DISPOSITION rather than restated, so
+#: the preflight and the funnel cannot drift apart. The subset is the codes
+#: THIS module can emit; the domain map also covers the ones candidates.py
+#: emits (duplicate_strategy, generator_error).
+_PREFLIGHT_EXCLUSION_CODES = (
+    "provider_not_configured",
+    "provider_not_permitted",
+    "policy_blocked",
+    "economically_dominated",
+    "model_not_available",
+    "strategy_not_applicable",
+    "request_shape_incompatible",
+    "required_capability_missing",
+    "context_window_insufficient",
+    "pricing_unknown",
+)
 CODE_TO_DISPOSITION = {
-    "provider_not_configured": domain.DISPOSITION_PROVIDER_NOT_CONFIGURED,
-    "provider_not_permitted": domain.DISPOSITION_POLICY_BLOCKED,
-    "policy_blocked": domain.DISPOSITION_POLICY_BLOCKED,
-    "economically_dominated": domain.DISPOSITION_ECONOMICALLY_DOMINATED,
-    "model_not_available": domain.DISPOSITION_INCOMPATIBLE,
-    "strategy_not_applicable": domain.DISPOSITION_INCOMPATIBLE,
-    "request_shape_incompatible": domain.DISPOSITION_INCOMPATIBLE,
-    "required_capability_missing": domain.DISPOSITION_INCOMPATIBLE,
-    "context_window_insufficient": domain.DISPOSITION_INCOMPATIBLE,
-    "pricing_unknown": domain.DISPOSITION_INCOMPATIBLE,
+    code: domain.EXCLUSION_CODE_TO_DISPOSITION[code]
+    for code in _PREFLIGHT_EXCLUSION_CODES
 }
 
 
