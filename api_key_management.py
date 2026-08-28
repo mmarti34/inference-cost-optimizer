@@ -7,7 +7,7 @@ from typing import List, Optional
 from supabase_client import supabase
 from utils.encryption import encrypt_api_key
 from plan_enforcement import check_server_key_limit
-from auth_dependency import require_auth, require_org_member, AuthenticatedUser
+from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +194,13 @@ async def create_service_api_key(
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
     """Create a new service API key"""
+    # A service API key authenticates the public execution surface for an org.
+    # Minting one into an org must depend on the org membership was proven
+    # against, not on the org named in the body — otherwise the body picks
+    # which tenant's endpoints the new credential can call.
+    org_id = verified_org_id(auth_user)
     try:
-        check_server_key_limit(api_key_data.org_id)
+        check_server_key_limit(org_id)
 
         key_id = str(uuid.uuid4())
         encrypted_key = encrypt_api_key(api_key_data.api_key)
@@ -203,7 +208,7 @@ async def create_service_api_key(
         result = supabase.table("service_api_keys").insert({
             "id": key_id,
             "api_key": encrypted_key,
-            "org_id": api_key_data.org_id,
+            "org_id": org_id,
         }).execute()
 
         if not result.data:

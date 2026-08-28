@@ -9,6 +9,13 @@ import math
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
+from resource_access import (
+    DEPLOYMENT_NOT_FOUND,
+    WORKFLOW_NOT_FOUND,
+    get_context_assets_for_org,
+    get_deployment_for_org,
+    get_workflow_for_org,
+)
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from datetime import datetime, timezone, timedelta
@@ -320,7 +327,15 @@ async def create_workflow(payload: WorkflowCreate, _user: AuthenticatedUser = De
 @router.put("/workflows/{workflow_id}", response_model=WorkflowResponse)
 async def update_workflow(workflow_id: str, payload: WorkflowUpdate, _user: AuthenticatedUser = Depends(require_org_member)):
     """Update workflow name, slug, graph_json, variables."""
+    # `workflow_id` is a caller-supplied id and the guard says nothing about it:
+    # it proves org membership only. Both queries below used to filter on id
+    # alone, so any member of any org could rewrite any tenant's graph_json —
+    # the whole definition of what their production endpoint runs. Establish
+    # ownership FIRST; a foreign id and an unknown id are one identical 404.
+    caller_org_id = verified_org_id(_user)
     try:
+        existing = get_workflow_for_org(workflow_id, _user, columns=_WF_COLS)
+
         update_data = {}
         if payload.name is not None:
             update_data["name"] = payload.name
@@ -331,13 +346,21 @@ async def update_workflow(workflow_id: str, payload: WorkflowUpdate, _user: Auth
         if payload.variables is not None:
             update_data["variables"] = payload.variables
         if not update_data:
-            result = supabase.table("workflows").select(_WF_COLS).eq("id", workflow_id).single().execute()
-            if not result.data:
-                raise HTTPException(status_code=404, detail="Workflow not found")
-            return _row_to_response(result.data[0])
-        result = supabase.table("workflows").update(update_data).eq("id", workflow_id).execute()
+            # (This branch also used to be dead-wrong: `.single()` returns a
+            # dict, so `result.data[0]` raised and the no-op update answered
+            # 500. It now returns the row the ownership check already fetched.)
+            return _row_to_response(existing)
+        # Doubly scoped: the org filter and the write are one statement, so
+        # there is no check-then-act window.
+        result = (
+            supabase.table("workflows")
+            .update(update_data)
+            .eq("id", workflow_id)
+            .eq("org_id", caller_org_id)
+            .execute()
+        )
         if not result.data:
-            raise HTTPException(status_code=404, detail="Workflow not found")
+            raise HTTPException(status_code=404, detail=WORKFLOW_NOT_FOUND)
         return _row_to_response(result.data[0])
     except HTTPException:
         raise
@@ -521,6 +544,10 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
     - If this workflow already has deployments: reuse existing endpoint_slug; reject different slug with 400.
     - First deploy: use payload endpoint_slug; 409 if slug already used by another workflow in this org.
     - Plan limit: count distinct workflow_id with deployments; 402 if at limit when creating first deploy for a new workflow."""
+    # One org for the whole handler, taken from the guard. Previously every
+    # query and the inserted row read `payload.org_id`; the ownership check
+    # below and the row it writes must not be able to name different orgs.
+    caller_org_id = verified_org_id(_user)
     try:
         client_slug = (payload.endpoint_slug or "").strip() or "workflow"
 
@@ -529,7 +556,7 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
             supabase.table("workflow_deployments")
             .select("version, endpoint_slug")
             .eq("workflow_id", payload.workflow_id)
-            .eq("org_id", payload.org_id)
+            .eq("org_id", caller_org_id)
             .order("version", desc=True)
             .limit(1)
             .execute()
@@ -551,7 +578,7 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
             slug_collision = (
                 supabase.table("workflow_deployments")
                 .select("id")
-                .eq("org_id", payload.org_id)
+                .eq("org_id", caller_org_id)
                 .eq("endpoint_slug", endpoint_slug)
                 .limit(1)
                 .execute()
@@ -566,12 +593,12 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
             all_deployments = (
                 supabase.table("workflow_deployments")
                 .select("workflow_id")
-                .eq("org_id", payload.org_id)
+                .eq("org_id", caller_org_id)
                 .execute()
             )
             workflow_ids = {r.get("workflow_id") for r in (all_deployments.data or []) if r.get("workflow_id")}
             deployed_workflow_count = len(workflow_ids)
-            org_row = supabase.table("organizations").select("plan").eq("id", payload.org_id).single().execute()
+            org_row = supabase.table("organizations").select("plan").eq("id", caller_org_id).single().execute()
             raw_plan = (org_row.data or {}).get("plan") or "free"
             limit = _endpoint_limit_for_plan(raw_plan)
             if deployed_workflow_count >= limit:
@@ -584,12 +611,17 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
         if has_existing and existing_for_workflow.data:
             next_version = int(existing_for_workflow.data[0].get("version") or 0) + 1
 
-        wf_row = supabase.table("workflows").select("project_id, org_id").eq("id", payload.workflow_id).single().execute()
-        project_id = wf_row.data.get("project_id") if wf_row.data else None
+        # Unfiltered by org before: a caller could name another tenant's
+        # workflow_id and inherit that tenant's project_id into their own
+        # deployment row.
+        wf_row = get_workflow_for_org(
+            payload.workflow_id, _user, columns="id, org_id, project_id"
+        )
+        project_id = wf_row.get("project_id")
 
         data = {
             "workflow_id": payload.workflow_id,
-            "org_id": payload.org_id,
+            "org_id": caller_org_id,
             "version": next_version,
             "endpoint_slug": endpoint_slug,
             "graph_json": payload.graph_json if payload.graph_json is not None else {"nodes": [], "edges": []},
@@ -616,10 +648,15 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
                         _asset_ids_to_snapshot.add(_src["assetId"])
         if _asset_ids_to_snapshot:
             try:
-                _assets = supabase.table("context_assets").select("id, content, metadata").in_("id", list(_asset_ids_to_snapshot)).execute()
+                # The asset ids come straight out of caller-supplied
+                # graph_json. Unscoped, this copied ANOTHER tenant's knowledge
+                # base content into the caller's own deployment snapshot, from
+                # where their next production run reads it back. Restricted to
+                # the verified org; foreign ids are silently omitted.
+                _assets = get_context_assets_for_org(_asset_ids_to_snapshot, _user)
                 _snap_rows = [
                     {"asset_id": _a["id"], "deployment_id": deployment_id, "content": _a.get("content") or "", "metadata": _a.get("metadata") or {}}
-                    for _a in (_assets.data or [])
+                    for _a in _assets
                 ]
                 if _snap_rows:
                     supabase.table("context_asset_snapshots").insert(_snap_rows).execute()
@@ -631,14 +668,14 @@ async def create_workflow_deployment(payload: DeploymentCreate, _user: Authentic
             suite_row = (
                 supabase.table("eval_suites")
                 .select("id")
-                .eq("org_id", payload.org_id)
+                .eq("org_id", caller_org_id)
                 .eq("workflow_id", payload.workflow_id)
                 .limit(1)
                 .execute()
             )
             eval_suite_id = suite_row.data[0]["id"] if suite_row.data and len(suite_row.data) > 0 else None
             eval_insert = {
-                "org_id": payload.org_id,
+                "org_id": caller_org_id,
                 "deployment_id": deployment_id,
                 "eval_suite_id": eval_suite_id,
                 "status": "running",
@@ -674,7 +711,13 @@ class PromoteOverridePayload(BaseModel):
 @router.post("/workflow-deployments/{deployment_id}/promote")
 async def promote_deployment_override(deployment_id: str, payload: PromoteOverridePayload, _user: AuthenticatedUser = Depends(require_org_member)):
     """Admin override: promote a deployment despite failed eval. Sets status=promoted, promoted_at=now(), override_reason."""
+    # Was filtered on deployment_id alone: possession of a foreign deployment
+    # UUID changed what ANOTHER tenant's live production endpoint serves.
+    caller_org_id = verified_org_id(_user)
     try:
+        # Authorization before mutation. Fetches id + org_id only — nothing
+        # about the deployment's contents is read before ownership is known.
+        get_deployment_for_org(deployment_id, _user)
         result = (
             supabase.table("workflow_deployments")
             .update({
@@ -684,12 +727,14 @@ async def promote_deployment_override(deployment_id: str, payload: PromoteOverri
                 "override_reason": (payload.override_reason or "").strip() or None,
             })
             .eq("id", deployment_id)
+            .eq("org_id", caller_org_id)
             .execute()
         )
         if not result.data or len(result.data) == 0:
-            raise HTTPException(status_code=404, detail="Deployment not found")
+            raise HTTPException(status_code=404, detail=DEPLOYMENT_NOT_FOUND)
         row = result.data[0]
-        org_id = str(row.get("org_id", ""))
+        # The org comes from the guard, never read back out of the fetched row.
+        org_id = caller_org_id
         endpoint_slug = (row.get("endpoint_slug") or "").strip()
         if org_id and endpoint_slug:
             await asyncio.to_thread(_end_experiments_on_endpoint_sync, org_id, endpoint_slug, "new_deployment")
@@ -714,13 +759,16 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
     Sets the target deployment to status=promoted and demotes any other promoted
     deployment on the same endpoint so only one version is live at a time.
     """
+    # Was `select("*").eq("id", deployment_id)` with the org then taken out of
+    # the fetched row — a full cross-tenant read of the deployment (including
+    # graph_json) followed by a cross-tenant rollback of their live endpoint.
+    caller_org_id = verified_org_id(_user)
     try:
-        # Fetch the target deployment
-        fetch = supabase.table("workflow_deployments").select("*").eq("id", deployment_id).execute()
-        if not fetch.data or len(fetch.data) == 0:
-            raise HTTPException(status_code=404, detail="Deployment not found")
-        target = fetch.data[0]
-        org_id = str(target.get("org_id", ""))
+        # Ownership and disclosure in one statement.
+        target = get_deployment_for_org(
+            deployment_id, _user, columns="id, org_id, endpoint_slug, status, version"
+        )
+        org_id = caller_org_id
         endpoint_slug = (target.get("endpoint_slug") or "").strip()
 
         # Demote all other promoted deployments on the same endpoint
@@ -737,9 +785,15 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
         }
         if payload.rolled_back_from_version is not None:
             update_data["rolled_back_from_version"] = payload.rolled_back_from_version
-        result = supabase.table("workflow_deployments").update(update_data).eq("id", deployment_id).execute()
+        result = (
+            supabase.table("workflow_deployments")
+            .update(update_data)
+            .eq("id", deployment_id)
+            .eq("org_id", caller_org_id)
+            .execute()
+        )
         if not result.data or len(result.data) == 0:
-            raise HTTPException(status_code=404, detail="Deployment not found")
+            raise HTTPException(status_code=404, detail=DEPLOYMENT_NOT_FOUND)
         row = result.data[0]
 
         # End any running experiments on this endpoint
@@ -756,14 +810,20 @@ async def activate_deployment(deployment_id: str, payload: ActivateDeploymentPay
 @router.delete("/workflow-deployments/{deployment_id}")
 async def delete_deployment(deployment_id: str, _user: AuthenticatedUser = Depends(require_org_member)):
     """Delete a deployment version. Cannot delete the currently promoted (live) deployment."""
+    # Was id-only on both the fetch and the DELETE: any org member could
+    # destroy any tenant's non-live deployment version.
+    caller_org_id = verified_org_id(_user)
     try:
-        fetch = supabase.table("workflow_deployments").select("id, status").eq("id", deployment_id).execute()
-        if not fetch.data or len(fetch.data) == 0:
-            raise HTTPException(status_code=404, detail="Deployment not found")
-        row = fetch.data[0]
+        row = get_deployment_for_org(deployment_id, _user, columns="id, org_id, status")
         if row.get("status") == "promoted":
             raise HTTPException(status_code=400, detail="Cannot delete the currently live deployment. Rollback first.")
-        supabase.table("workflow_deployments").delete().eq("id", deployment_id).execute()
+        (
+            supabase.table("workflow_deployments")
+            .delete()
+            .eq("id", deployment_id)
+            .eq("org_id", caller_org_id)
+            .execute()
+        )
         return {"ok": True}
     except HTTPException:
         raise
@@ -796,36 +856,49 @@ async def api_execute_workflow(payload: ExecuteWorkflowPayload, _user: Authentic
     - Draft: graph_json + org_id in body (Studio simulation). Logs execution_mode='draft'. Deployment table not used.
     - Production: no graph_json; workflow_id + optional version. Load graph from workflow_deployments only. Logs execution_mode='production'.
     """
+    # ── CROSS-TENANT SECRET USE, closed here ────────────────────────────────
+    #
+    # `ExecuteWorkflowPayload.org_id` is Optional. Omitting it and sending
+    # `X-Org-Id` for an org you genuinely belong to satisfied the guard, and
+    # the handler then did an UNFILTERED `workflows.select("org_id")
+    # .eq("id", workflow_id)`, took `org_id` back out of the fetched
+    # deployment row, and executed under the VICTIM's org. Downstream,
+    # `workflow_runtime._resolve_secrets` decrypts that org's `org_secrets`
+    # into tool URLs and headers and their provider keys pay for the run — so
+    # an ordinary, well-formed request spent another tenant's credentials and
+    # could exfiltrate them to an attacker-chosen tool endpoint.
+    #
+    # The org is now always the one the guard verified. It is never derived
+    # from, and never read back out of, any row the caller's ids selected.
+    caller_org_id = verified_org_id(_user)
     try:
-        org_id = payload.org_id
+        org_id = caller_org_id
         graph = payload.graph_json
         endpoint_slug = None
         version_num = None
         execution_mode = "draft"
 
+        # Authorization before disclosure: `workflow_id` is a caller-supplied
+        # id, so prove it lives in the verified org before anything is read
+        # from it. Foreign and unknown ids give one identical 404.
+        wf_row = None
+        if (payload.workflow_id or "").strip():
+            wf_row = get_workflow_for_org(
+                payload.workflow_id, _user, columns="id, org_id, variables"
+            )
+
         if graph is not None:
             # Draft: use current canvas
-            if not org_id:
+            if not payload.org_id:
                 raise HTTPException(status_code=400, detail="org_id required when graph_json is provided")
             if not graph.get("nodes"):
                 raise HTTPException(status_code=400, detail="graph_json must contain nodes")
         else:
             # Production: load from workflow_deployments (version or latest)
             workflow_id = payload.workflow_id
-            org_id_from_workflow = None
-            if not org_id:
-                wf_row = (
-                    supabase.table("workflows")
-                    .select("org_id")
-                    .eq("id", workflow_id)
-                    .single()
-                    .execute()
-                )
-                if wf_row.data:
-                    org_id_from_workflow = wf_row.data.get("org_id")
-            lookup_org = org_id or org_id_from_workflow
-            if not lookup_org:
-                raise HTTPException(status_code=400, detail="org_id required when no graph_json (Production)")
+            if wf_row is None:
+                raise HTTPException(status_code=404, detail=WORKFLOW_NOT_FOUND)
+            lookup_org = caller_org_id
 
             version_num = _parse_version(payload.version)
             if version_num is not None:
@@ -851,7 +924,10 @@ async def api_execute_workflow(payload: ExecuteWorkflowPayload, _user: Authentic
             if not dep_row.data or len(dep_row.data) == 0:
                 raise HTTPException(status_code=400, detail="Workflow not published.")
             deployment = dep_row.data[0]
-            org_id = deployment.get("org_id")
+            # NOT `deployment.get("org_id")`. The row was selected by
+            # caller-supplied ids; its org_id is attacker-influenced input, not
+            # an authorization result.
+            org_id = caller_org_id
             graph = deployment.get("graph_json") or {"nodes": [], "edges": []}
             endpoint_slug = (deployment.get("endpoint_slug") or "").strip() or None
             version_num = deployment.get("version")
@@ -863,10 +939,18 @@ async def api_execute_workflow(payload: ExecuteWorkflowPayload, _user: Authentic
         input_text = ""
         variables = payload.variables
         if variables is not None and isinstance(variables, dict):
-            wf = supabase.table("workflows").select("variables").eq("id", payload.workflow_id).single().execute()
-            if wf.data and wf.data.get("variables") and isinstance(wf.data["variables"], list):
+            # Reuses the ownership-checked row above rather than re-reading
+            # `workflows` on id alone (which leaked another tenant's variable
+            # schema).
+            if wf_row is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="workflow_id is required when variables are supplied.",
+                )
+            _wf_vars = wf_row.get("variables")
+            if _wf_vars and isinstance(_wf_vars, list):
                 from workflow_runtime import validate_workflow_variables
-                variables = validate_workflow_variables(wf.data["variables"], variables)
+                variables = validate_workflow_variables(_wf_vars, variables)
             input_text = ""
         else:
             input_text = payload.input or ""
@@ -963,17 +1047,28 @@ async def api_execute_workflow_stream(payload: ExecuteWorkflowPayload, _user: Au
             status_code=400,
             detail="Streaming requires graph_json with nodes (draft mode only).",
         )
-    org_id = payload.org_id
-    if not org_id:
+    if not payload.org_id:
         raise HTTPException(status_code=400, detail="org_id required when graph_json is provided")
+    # Execute as the org the guard verified, never as the body's claim.
+    org_id = verified_org_id(_user)
+
+    # `workflow_id` is caller-supplied and reaches the run log even when no
+    # variables are sent, so prove ownership whenever one is named at all.
+    wf_row = None
+    if (payload.workflow_id or "").strip():
+        wf_row = get_workflow_for_org(
+            payload.workflow_id, _user, columns="id, org_id, variables"
+        )
 
     input_text = ""
     variables = payload.variables
-    if variables is not None and isinstance(variables, dict) and payload.workflow_id:
-        wf = supabase.table("workflows").select("variables").eq("id", payload.workflow_id).single().execute()
-        if wf.data and wf.data.get("variables") and isinstance(wf.data["variables"], list):
+    if variables is not None and isinstance(variables, dict) and wf_row is not None:
+        # Was `workflows.select("variables").eq("id", workflow_id)` with no org
+        # filter — another tenant's variable schema, on a service-role client.
+        _wf_vars = wf_row.get("variables")
+        if _wf_vars and isinstance(_wf_vars, list):
             from workflow_runtime import validate_workflow_variables
-            variables = validate_workflow_variables(wf.data["variables"], variables)
+            variables = validate_workflow_variables(_wf_vars, variables)
     else:
         input_text = payload.input or ""
 

@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from supabase_client import supabase
 from auth_dependency import require_auth, require_org_member, AuthenticatedUser, verified_org_id
+from resource_access import get_provider_credential_for_org
 from utils.encryption import (
     encrypt_api_key,
     decrypt_api_key,
@@ -370,12 +371,17 @@ Return your recommendation as a JSON object with the following structure:
 
 @app.post("/store-key")
 def store_api_key(payload: APIKeyPayload, _user: AuthenticatedUser = Depends(require_org_member)):
+    # Every write here is keyed on the org. Take it from the guard, not the
+    # body: `verified_org_id` is the org membership was actually proven
+    # against, so the row that gets overwritten — another tenant's provider
+    # credential, and their cache entry — cannot be chosen by the request.
+    org_id = verified_org_id(_user)
     try:
         # Encrypt the API key before storing
         encrypted_api_key = encrypt_api_key(payload.api_key)
-        
+
         data = {
-            "org_id": payload.org_id,
+            "org_id": org_id,
             "provider": payload.provider,
             "api_key": encrypted_api_key,
         }
@@ -384,25 +390,29 @@ def store_api_key(payload: APIKeyPayload, _user: AuthenticatedUser = Depends(req
             data["user_id"] = payload.user_id
         if payload.name:
             data["name"] = payload.name
-        
+
         # First check if a key for this org/provider already exists
-        existing = supabase.table("api_keys").select("id, org_id, provider, api_key, name, user_id, created_at").eq("org_id", payload.org_id).eq("provider", payload.provider).execute()
-        
+        existing = supabase.table("api_keys").select("id, org_id, provider, api_key, name, user_id, created_at").eq("org_id", org_id).eq("provider", payload.provider).execute()
+
         if existing.data:
             # Update existing key
-            result = supabase.table("api_keys").update({"api_key": encrypted_api_key}).eq("org_id", payload.org_id).eq("provider", payload.provider).execute()
+            result = supabase.table("api_keys").update({"api_key": encrypted_api_key}).eq("org_id", org_id).eq("provider", payload.provider).execute()
             # Invalidate cached decrypted key so next request picks up the new one
             from api_key_cache import invalidate_provider_key
-            invalidate_provider_key(payload.org_id, payload.provider)
+            invalidate_provider_key(org_id, payload.provider)
             return {"status": "success", "updated": result.data}
         else:
             # Insert new key
             result = supabase.table("api_keys").insert(data).execute()
             return {"status": "success", "inserted": result.data}
-            
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error storing API key: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error storing API key: {str(e)}")
+        # Do not echo the driver error to the caller: it can carry row contents
+        # and identifiers. Same rule as /optimize and /v1/prompt above.
+        logger.exception("Error storing API key: %s", e)
+        raise HTTPException(status_code=500, detail="Error storing API key.")
 
 @app.post("/route-prompt")
 def route_prompt(payload: PromptPayload, _user: AuthenticatedUser = Depends(require_org_member)):
@@ -434,31 +444,28 @@ def test_prompt(payload: PromptPayload, _user: AuthenticatedUser = Depends(requi
     """Test endpoint for playground that doesn't use usage logging"""
     provider = payload.provider.lower()
 
+    # `PromptPayload.org_id` is Optional and was used verbatim to select which
+    # org's provider credential to decrypt and spend. The credential now comes
+    # from the verified org only, so the guard's identity is what is passed on.
     if provider == "openai":
-        return test_openai_call(payload)
+        return test_openai_call(payload, _user)
     elif provider == "anthropic":
-        return test_anthropic_call(payload)
+        return test_anthropic_call(payload, _user)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported provider for testing: {payload.provider}")
 
-def test_openai_call(payload: PromptPayload):
+def test_openai_call(payload: PromptPayload, auth_user: AuthenticatedUser):
     """Test OpenAI call without usage logging"""
     from openai import OpenAI
     from utils.encryption import decrypt_api_key
-    
-    result = supabase.table("api_keys") \
-        .select("id, org_id, provider, api_key, name, user_id, created_at") \
-        .eq("org_id", payload.org_id) \
-        .eq("provider", payload.provider) \
-        .execute()
 
-    keys = result.data
-    if not keys:
-        raise HTTPException(status_code=404, detail="API key not found for org/provider.")
+    # Ownership-checked lookup: org from the guard, 404 identical whether the
+    # org has no such key or the caller named someone else's org.
+    row = get_provider_credential_for_org(payload.provider, auth_user)
 
     # Decrypt the API key
     try:
-        encrypted_api_key = keys[0]["api_key"]
+        encrypted_api_key = row["api_key"]
         api_key = decrypt_api_key(encrypted_api_key)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to decrypt API key: {e}")
@@ -486,23 +493,17 @@ def test_openai_call(payload: PromptPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI test call failed: {e}")
 
-def test_anthropic_call(payload: PromptPayload):
+def test_anthropic_call(payload: PromptPayload, auth_user: AuthenticatedUser):
     """Test Anthropic call without usage logging"""
     from anthropic import Anthropic
     from utils.encryption import decrypt_api_key
-    
-    result = supabase.table("api_keys") \
-        .select("id, org_id, provider, api_key, name, user_id, created_at") \
-        .eq("org_id", payload.org_id) \
-        .eq("provider", payload.provider) \
-        .execute()
-    
-    if not result.data:
-        raise HTTPException(status_code=404, detail="API key not found for org/provider.")
+
+    # Ownership-checked lookup: org from the guard, never from the body.
+    row = get_provider_credential_for_org(payload.provider, auth_user)
 
     # Decrypt the API key
     try:
-        encrypted_api_key = result.data[0]["api_key"]
+        encrypted_api_key = row["api_key"]
         api_key = decrypt_api_key(encrypted_api_key)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to decrypt API key: {e}")
