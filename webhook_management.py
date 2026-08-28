@@ -16,6 +16,8 @@ from supabase_client import supabase
 from auth_dependency import require_org_member, AuthenticatedUser, verified_org_id
 from rate_limiting import check_and_increment_usage
 from plan_enforcement import check_monthly_request_limit, increment_monthly_usage
+from resource_access import get_workflow_for_org
+import audit
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,74 @@ router = APIRouter()
 #: workflows against the org's provider keys, so an unbounded firehose burns
 #: the org's money.
 WEBHOOK_RATE_LIMIT_PER_MINUTE = 60
+
+
+# ─── The receiver's pre-authentication response ──────────────────────────────
+#
+# ENUMERATION, and why there is exactly one failure response below.
+#
+# ``POST /api/webhooks/trigger/{endpoint_path}`` has no auth dependency by
+# design: the sender is an external service and the shared secret IS the
+# credential. But the handler used to answer an *unauthenticated* caller three
+# different ways depending on what the lookup found:
+#
+#     unknown path                    -> 404 "Webhook not found or inactive"
+#     known path, no signature sent   -> 401 "Missing webhook signature..."
+#     known path, no secret on the row-> 503 "This webhook has no signing..."
+#
+# Any one of those, contrasted with the 404, answers "does this endpoint_path
+# exist and is it active?" for an anonymous caller — for EVERY tenant, since the
+# lookup is necessarily global. Endpoint paths are frequently meaningful
+# (``stripe-customer-acme-foo``), so the oracle leaks customer names and vendor
+# relationships, not just row existence.
+#
+# The fix is not to stop looking the webhook up — the receiver cannot work
+# without that — but to make the lookup's RESULT unable to reach the caller
+# before the signature verifies. Every pre-authentication outcome now produces
+# this one response, byte for byte.
+#
+# AFTER a valid signature, normal receiver semantics resume and are deliberately
+# NOT flattened: a handler 500 stays a 500 so the sender retries, a 2xx stays a
+# 2xx. A sender that cannot tell "your handler broke, retry" from "rejected,
+# stop" is worse off than before this change.
+WEBHOOK_AUTH_FAILED_STATUS = 401
+WEBHOOK_AUTH_FAILED_DETAIL = (
+    "Invalid or missing webhook signature. Send X-Webhook-Signature "
+    "(HMAC-SHA256 hex of the raw request body)."
+)
+
+#: A secret generated once per process that no caller can ever hold, used in
+#: place of a real one when the path does not exist or the row has no secret.
+#: It exists so those cases run the SAME hmac computation and the SAME
+#: comparison as a real webhook with a wrong signature, rather than taking a
+#: visibly (and measurably) shorter route to a different status code.
+#: ``token_hex(32)`` is 256 bits of ``secrets``-grade entropy: no signature a
+#: caller can construct will ever verify against it.
+_SYNTHETIC_WEBHOOK_SECRET = secrets_module.token_hex(32)
+
+
+def _webhook_auth_failed() -> HTTPException:
+    """The single pre-authentication failure. Same status, detail and headers
+    for an unknown path, a bad signature, a missing signature and a webhook
+    with no secret configured."""
+    return HTTPException(
+        status_code=WEBHOOK_AUTH_FAILED_STATUS,
+        detail=WEBHOOK_AUTH_FAILED_DETAIL,
+    )
+
+
+def _signature_matches(secret: str, raw_body: bytes, signature: str) -> bool:
+    """Constant-time check of an HMAC-SHA256 hex signature over the raw body.
+
+    Runs identically for a real secret and for ``_SYNTHETIC_WEBHOOK_SECRET``,
+    and for a missing header (which compares against the empty string) — one
+    code path, so the branch taken cannot be read off the response or the clock.
+    Compares BYTES: ``hmac.compare_digest`` rejects non-ASCII ``str`` inputs
+    with a TypeError, and headers arrive latin-1 decoded.
+    """
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    presented = (signature or "").replace("sha256=", "").strip()
+    return hmac.compare_digest(expected.encode("utf-8"), presented.encode("utf-8"))
 
 
 # Pydantic models
@@ -51,6 +121,11 @@ async def list_webhooks(
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
     """List all webhook triggers for an org."""
+    # The guard refuses a request that names two different orgs, so the path
+    # value and the verified value are equal by construction — but read the
+    # verified one anyway, so the filter is trusted first-hand rather than by
+    # an argument about the guard.
+    org_id = verified_org_id(auth_user)
     try:
         result = (
             supabase.table("webhook_triggers")
@@ -82,6 +157,7 @@ async def list_webhooks(
 @router.post("/webhooks")
 async def create_webhook(
     body: WebhookCreate,
+    request: Request,
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
     """Create a new webhook trigger in the caller's verified org."""
@@ -91,17 +167,26 @@ async def create_webhook(
     org_id = verified_org_id(auth_user)
 
     # The workflow this webhook fires must belong to the same org — otherwise a
-    # webhook in org A could be pointed at org B's workflow.
-    wf = (
-        supabase.table("workflows")
-        .select("id")
-        .eq("id", body.workflow_id)
-        .eq("org_id", org_id)
-        .limit(1)
-        .execute()
-    )
-    if not wf.data:
-        raise HTTPException(status_code=404, detail="Workflow not found in this organization")
+    # webhook in org A could be pointed at org B's workflow. `resource_access`
+    # applies the org filter itself and answers "another tenant's workflow" and
+    # "no such workflow" with one opaque 404; the old detail here said "not
+    # found in this organization", which hinted that it might exist elsewhere.
+    try:
+        get_workflow_for_org(body.workflow_id, auth_user)
+    except HTTPException:
+        # Pointing a webhook at a workflow that is not yours is exactly the
+        # attempt the audit trail exists to answer questions about.
+        audit.record(
+            audit.WEBHOOK_CREATE_REFUSED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+            metadata={
+                "workflow_id": body.workflow_id,
+                "reason_code": audit.REASON_NOT_FOUND,
+            },
+            request=request,
+        )
+        raise
 
     # Generate unique endpoint path
     endpoint_path = secrets_module.token_urlsafe(16)
@@ -124,6 +209,17 @@ async def create_webhook(
             .execute()
         )
         row = result.data[0] if result.data else {}
+        # A webhook is a customer-controlled egress path into their systems and
+        # carries a live signing secret. Never the secret or the endpoint path
+        # in the row — only identifiers.
+        audit.record(
+            audit.WEBHOOK_CREATED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+            resource_id=row.get("id"),
+            metadata={"workflow_id": body.workflow_id},
+            request=request,
+        )
         return {
             "id": row.get("id"),
             "org_id": row.get("org_id"),
@@ -146,9 +242,11 @@ async def update_webhook(
     org_id: str,
     webhook_id: str,
     body: WebhookUpdate,
+    request: Request,
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
     """Update a webhook trigger."""
+    org_id = verified_org_id(auth_user)  # see list_webhooks
     patch = {"updated_at": "now()"}
     if body.name is not None:
         patch["name"] = body.name.strip()
@@ -168,8 +266,41 @@ async def update_webhook(
             .execute()
         )
         if not result.data:
+            # The id does not exist, or it belongs to another tenant — one
+            # answer for both, and a recorded attempt either way.
+            audit.record(
+                audit.WEBHOOK_UPDATE_REFUSED,
+                principal=auth_user,
+                resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+                resource_id=webhook_id,
+                metadata={"reason_code": audit.REASON_NOT_FOUND},
+                request=request,
+            )
             raise HTTPException(status_code=404, detail="Webhook not found")
         row = result.data[0]
+
+        _audit_meta = {}
+        if body.is_active is not None:
+            _audit_meta["new_status"] = "active" if body.is_active else "inactive"
+        audit.record(
+            audit.WEBHOOK_UPDATED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+            resource_id=row.get("id"),
+            metadata=_audit_meta,
+            request=request,
+        )
+        if body.secret is not None:
+            # Its own action, because "who last changed this webhook's signing
+            # secret, and when" is a question of its own. The VALUE is never
+            # passed to the writer — only the fact that it was replaced.
+            audit.record(
+                audit.WEBHOOK_SECRET_ROTATED,
+                principal=auth_user,
+                resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+                resource_id=row.get("id"),
+                request=request,
+            )
         return {
             "id": row.get("id"),
             "org_id": row.get("org_id"),
@@ -190,9 +321,11 @@ async def update_webhook(
 async def delete_webhook(
     org_id: str,
     webhook_id: str,
+    request: Request,
     auth_user: AuthenticatedUser = Depends(require_org_member),
 ):
     """Delete a webhook trigger."""
+    org_id = verified_org_id(auth_user)  # see list_webhooks
     try:
         result = (
             supabase.table("webhook_triggers")
@@ -202,7 +335,22 @@ async def delete_webhook(
             .execute()
         )
         if not result.data:
+            audit.record(
+                audit.WEBHOOK_DELETE_REFUSED,
+                principal=auth_user,
+                resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+                resource_id=webhook_id,
+                metadata={"reason_code": audit.REASON_NOT_FOUND},
+                request=request,
+            )
             raise HTTPException(status_code=404, detail="Webhook not found")
+        audit.record(
+            audit.WEBHOOK_DELETED,
+            principal=auth_user,
+            resource_type=audit.RESOURCE_WEBHOOK_TRIGGER,
+            resource_id=webhook_id,
+            request=request,
+        )
         return {"status": "deleted"}
     except HTTPException:
         raise
@@ -219,10 +367,22 @@ async def trigger_webhook(
     request: Request,
 ):
     """
-    Handle incoming webhook. Verifies signature if secret is set,
-    extracts input from payload using template, and executes the workflow.
+    Handle incoming webhook: verify the sender's HMAC signature, extract the
+    workflow input from the payload template, and execute the workflow.
+
+    Every failure BEFORE the signature verifies is the one response built by
+    ``_webhook_auth_failed()`` — see the note beside it. Everything AFTER keeps
+    ordinary receiver semantics so senders' retry logic still works.
     """
-    # Look up webhook trigger
+    # ── 1. Look the webhook up. This still happens, and must: the receiver
+    # cannot verify a signature without the row's secret. What changed is that
+    # nothing below lets the RESULT of this lookup reach the caller before the
+    # signature verifies.
+    #
+    # The lookup is deliberately not org-scoped: `endpoint_path` is the only
+    # locator an external sender has, and the org is derived FROM the row it
+    # finds (never from the request) once the sender has authenticated.
+    trigger = None
     try:
         result = (
             supabase.table("webhook_triggers")
@@ -231,61 +391,64 @@ async def trigger_webhook(
             .eq("is_active", True)
             .execute()
         )
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Webhook not found or inactive")
-        trigger = result.data[0]
-    except HTTPException:
-        raise
+        rows = result.data or []
+        if isinstance(rows, dict):  # a .single()-shaped response, defensively
+            rows = [rows]
+        if rows:
+            trigger = rows[0]
     except Exception as e:
-        logger.error("Failed to look up webhook: %s", e)
+        # An infrastructure failure, not an answer about this path. It fires for
+        # EVERY request while the lookup is broken — existing path or not — so
+        # it cannot separate the cases above, and a 5xx is the honest reply that
+        # keeps a real sender retrying instead of giving up on a 401.
+        logger.error("Webhook lookup failed: %s", type(e).__name__)
         raise HTTPException(status_code=500, detail="Webhook lookup failed")
 
-    # Read request body
+    # ── 2. Read the body unconditionally: it is the signed material, and both
+    # the real and the synthetic verification need it.
+    raw_body = b""
     try:
         raw_body = await request.body()
         body_str = raw_body.decode("utf-8")
     except Exception:
         body_str = ""
 
-    # Verify signature if a secret is configured.
+    # ── 3. Authenticate the SENDER.
     #
-    # This used to be `if signature:` — omitting the header entirely skipped
-    # verification and executed the workflow unauthenticated. When a secret is
-    # configured the signature is REQUIRED.
-    secret = trigger.get("secret")
-    if not secret:
-        # A trigger with no secret has no authentication at all. create_webhook
-        # always generates one, so this only happens for rows written outside
-        # the API. Refuse rather than execute a workflow for an anonymous caller.
+    # `real_secret` is None for an unknown path AND for a row written outside
+    # the API with no secret — a row that can never authenticate anyone, so
+    # refusing it costs no legitimate sender anything. Both substitute the
+    # synthetic secret and run the identical hmac + compare below, so all three
+    # pre-auth failures converge on one response instead of 404 / 401 / 503.
+    real_secret = trigger.get("secret") if trigger else None
+    if trigger is not None and not real_secret:
+        # Operator-side only, and the one place the misconfiguration is visible.
+        # The anonymous caller is told nothing it could not already guess.
         logger.error(
             "Webhook %s has no secret configured — refusing to execute unauthenticated",
             trigger.get("id"),
         )
-        raise HTTPException(
-            status_code=503,
-            detail="This webhook has no signing secret configured. Set one before using it.",
+
+    secret = real_secret or _SYNTHETIC_WEBHOOK_SECRET
+    signature = (
+        request.headers.get("x-webhook-signature")
+        or request.headers.get("x-hub-signature-256")
+        or ""
+    )
+    signature_ok = _signature_matches(secret, raw_body, signature)
+
+    if trigger is None or not real_secret or not signature_ok:
+        # Belt and braces: a synthetic secret can never verify, so the first two
+        # conditions are already implied. They stay explicit so a future edit to
+        # `_signature_matches` cannot turn "no such webhook" into an execution.
+        logger.warning(
+            "Webhook delivery rejected (webhook=%s)",
+            (trigger or {}).get("id") or "unknown",
         )
-    if secret:
-        signature = request.headers.get("x-webhook-signature") or request.headers.get("x-hub-signature-256") or ""
-        if not signature:
-            logger.warning(
-                "Webhook %s rejected: signature header missing but a secret is configured",
-                trigger.get("id"),
-            )
-            raise HTTPException(
-                status_code=401,
-                detail="Missing webhook signature. Send X-Webhook-Signature (HMAC-SHA256 hex of the raw body).",
-            )
-        expected = hmac.new(
-            secret.encode("utf-8"),
-            raw_body,
-            hashlib.sha256,
-        ).hexdigest()
-        # Support "sha256=..." prefix
-        sig_value = signature.replace("sha256=", "").strip()
-        if not hmac.compare_digest(expected, sig_value):
-            logger.warning("Webhook %s rejected: invalid signature", trigger.get("id"))
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        raise _webhook_auth_failed()
+
+    # ── The sender is authenticated from here on. Responses below are ordinary
+    # receiver semantics and are NOT flattened.
 
     # Parse JSON body
     try:
@@ -353,10 +516,13 @@ async def trigger_webhook(
 
         # Update trigger stats
         try:
+            # `org_id` here is the trigger row's own, read by the server —
+            # never from the request. Redundant given the id, and kept so the
+            # statement is scoped on its face.
             supabase.table("webhook_triggers").update({
                 "last_triggered_at": "now()",
                 "trigger_count": trigger.get("trigger_count", 0) + 1,
-            }).eq("id", trigger["id"]).execute()
+            }).eq("id", trigger["id"]).eq("org_id", org_id).execute()
         except Exception:
             pass  # Non-critical
 
