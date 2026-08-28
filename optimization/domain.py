@@ -109,6 +109,62 @@ DIMENSIONS = (
 
 
 # ---------------------------------------------------------------------------
+# Context efficiency — an optimization DIMENSION PAIR, not a new dimension
+# ---------------------------------------------------------------------------
+#
+# Internally: `context_reduction`. Human-facing wording (owned by the frontend)
+# is "context efficiency". It is deliberately NOT called prompt optimization:
+# that name invites rewriting prompts for style and voice, which is a different
+# and far less defensible thing than removing measured, redundant tokens.
+#
+# The claim it makes is narrow and is the whole point:
+#
+#     Same model. Same provider. Same sampling parameters. Same tools. Same
+#     output contract. ONLY the prompt/context representation changes.
+#
+# That claim is expressible with the dimensions the runtime can ALREADY apply —
+# `prompt` (the static instruction text) and `context_length` (the packaging and
+# per-source character budgets in contextConfig). No new dimension is added,
+# because no new runtime mechanism is needed. What was missing was never the
+# mechanism; it was the evidence, and the evidence is a measured per-component
+# token breakdown plus the same paired replay every other candidate faces.
+CONTEXT_REDUCTION_DIMENSIONS = ("prompt", "context_length")
+
+#: How a variant was produced. Ordered cheapest-and-most-defensible first: a
+#: budget change rewrites nothing at all, and a model-authored rewrite is the
+#: weakest of the lot and is treated as a mere proposal — it earns nothing from
+#: having been written by a model, and clears the same paired replay or it is
+#: not a finding.
+CONTEXT_VARIANT_PACKAGING_BUDGET = "packaging_budget"
+CONTEXT_VARIANT_SOURCE_BUDGET = "source_budget"
+CONTEXT_VARIANT_DUPLICATE_BLOCK_REMOVAL = "duplicate_block_removal"
+CONTEXT_VARIANT_WHITESPACE_NORMALIZATION = "whitespace_normalization"
+CONTEXT_VARIANT_PROPOSED_REWRITE = "proposed_rewrite"
+
+CONTEXT_VARIANT_KINDS = (
+    CONTEXT_VARIANT_PACKAGING_BUDGET,
+    CONTEXT_VARIANT_SOURCE_BUDGET,
+    CONTEXT_VARIANT_DUPLICATE_BLOCK_REMOVAL,
+    CONTEXT_VARIANT_WHITESPACE_NORMALIZATION,
+    CONTEXT_VARIANT_PROPOSED_REWRITE,
+)
+
+#: Variant kinds that rewrite no text whatsoever — they only lower a character
+#: budget the runtime already enforces. Nothing about the instructions changes,
+#: which is why these are generated first and why they are the easiest to defend
+#: in front of a customer.
+CONTEXT_VARIANT_KINDS_NO_REWRITE = (
+    CONTEXT_VARIANT_PACKAGING_BUDGET,
+    CONTEXT_VARIANT_SOURCE_BUDGET,
+)
+
+#: Variant kinds whose text was authored by a model. Recorded so that provenance
+#: survives all the way to the audit trail: an LLM may PROPOSE a shorter prompt;
+#: an LLM may never be the EVIDENCE that the shorter prompt works.
+CONTEXT_VARIANT_KINDS_MODEL_AUTHORED = (CONTEXT_VARIANT_PROPOSED_REWRITE,)
+
+
+# ---------------------------------------------------------------------------
 # Evidence: counterfactual strength, not merely presence
 # ---------------------------------------------------------------------------
 
@@ -1024,6 +1080,82 @@ REASON_CODES: dict[str, str] = {
     ),
     "duplicate_strategy": "The candidate is identical to one already considered.",
     "generator_error": "A candidate generator raised while proposing candidates.",
+    # Context reduction — STATIC compatibility checks, run before any provider
+    # request exists.
+    #
+    # Same discipline as the eligibility preflight above: every code here is
+    # emitted only from a check that RAN against real data — the measured token
+    # breakdown from optimization.context_accounting, the placeholders the
+    # runtime actually interpolates, the tool definitions on the node, the
+    # workflow's own eval-suite checks. A candidate carrying one of these was
+    # NOT benchmarked and NOT failed; it was refused before it could spend
+    # money, and each refusal is a finding about a thorough search.
+    #
+    # Reported at CODE grain, not at disposition grain, because seven of these
+    # exit at DISPOSITION_INCOMPATIBLE and collapsing them into one number
+    # would erase which check did the work.
+    "context_reduction_unmeasured": (
+        "The token reduction this variant would produce could not be MEASURED, "
+        "so the variant was not benchmarked. A reduction inferred from "
+        "character counts would be an estimate wearing a measurement's clothes, "
+        "and a candidate that cannot be measured is not a finding."
+    ),
+    "context_reduction_immaterial": (
+        "The MEASURED token reduction is at or below the materiality floor, so "
+        "there is no plausible cost improvement to pay a benchmark for. This is "
+        "a screening decision about how to spend a benchmark budget; it is "
+        "never evidence about quality."
+    ),
+    "context_reduction_variant_not_selected": (
+        "The variant passed every static check and measured a material "
+        "reduction, but a more defensible variant on the same step was "
+        "preferred within the benchmark budget. It was NOT measured and nothing "
+        "is claimed about it — it is recorded so that a capped search reports "
+        "what it set aside instead of discarding it silently."
+    ),
+    "context_placeholder_dropped": (
+        "The reduced prompt no longer contains a placeholder the runtime "
+        "interpolates, so it would execute with different information than the "
+        "baseline. Determined by comparing the placeholder sets, not by "
+        "observing a failure."
+    ),
+    "context_tool_reference_dropped": (
+        "The reduced prompt no longer references a tool the step has bound, so "
+        "the model would be less likely to call it. Determined from the node's "
+        "own tool definitions before dispatch."
+    ),
+    "context_output_contract_dropped": (
+        "The reduced prompt no longer carries an output-schema or output-format "
+        "instruction present in the baseline. The output contract is the one "
+        "thing a shorter prompt must never lose, and this is checked "
+        "statically rather than discovered from malformed output."
+    ),
+    "context_budget_below_requirement": (
+        "The proposed character budget is below the MEASURED size of context "
+        "the workload declares REQUIRED, so the reduction would truncate "
+        "content the workload says it must have."
+    ),
+    "context_reduction_changed_other_dimension": (
+        "The variant changed something other than the prompt text and the "
+        "context budget. Context efficiency is defined as same model, same "
+        "provider, same sampling parameters, same tools and same output "
+        "contract; a variant that moves anything else is a different "
+        "experiment and is refused rather than measured under this name."
+    ),
+    "context_reduction_quality_signal_insufficient": (
+        "The workload has no deterministic, structural or format eval check, so "
+        "the only available quality signal cannot detect the failure mode that "
+        "matters here: a shortened prompt usually still produces plausible "
+        "output and degrades only on the harder tail of inputs. An LLM judge "
+        "would rate the degraded output fine, so context reduction is not "
+        "proposed for this workload at all."
+    ),
+    "context_reduction_case_count_insufficient": (
+        "Fewer recorded cases than the floor at which tail degradation could "
+        "show up. Context reduction fails on the tail, so a case set too small "
+        "to contain one cannot clear it, and proposing the variant would buy a "
+        "measurement that could not detect its own failure mode."
+    ),
     # Materiality
     "improvement_below_materiality": "The measured improvement is below the policy's materiality threshold.",
     # Operational
@@ -1171,8 +1303,42 @@ EXCLUSION_CODE_TO_DISPOSITION = {
     "duplicate_strategy": DISPOSITION_DUPLICATE,
     "strategy_not_applicable": DISPOSITION_INCOMPATIBLE,
     "generator_error": DISPOSITION_GENERATOR_ERROR,
+    # --- Context reduction static checks (optimization.candidates) ----------
+    # All but one exit at INCOMPATIBLE: the variant cannot be compared
+    # like-for-like against the baseline, so running it would measure something
+    # other than the dimension it claims to be measuring.
+    "context_reduction_unmeasured": DISPOSITION_INCOMPATIBLE,
+    "context_placeholder_dropped": DISPOSITION_INCOMPATIBLE,
+    "context_tool_reference_dropped": DISPOSITION_INCOMPATIBLE,
+    "context_output_contract_dropped": DISPOSITION_INCOMPATIBLE,
+    "context_budget_below_requirement": DISPOSITION_INCOMPATIBLE,
+    "context_reduction_changed_other_dimension": DISPOSITION_INCOMPATIBLE,
+    "context_reduction_quality_signal_insufficient": DISPOSITION_INCOMPATIBLE,
+    "context_reduction_case_count_insufficient": DISPOSITION_INCOMPATIBLE,
+    # A variant that measurably does not reduce anything is not incompatible —
+    # it is simply not worth paying to measure, which is exactly what the
+    # economically-dominated disposition means.
+    "context_reduction_immaterial": DISPOSITION_ECONOMICALLY_DOMINATED,
+    "context_reduction_variant_not_selected": DISPOSITION_ECONOMICALLY_DOMINATED,
 }
 EXCLUSION_CODES = tuple(EXCLUSION_CODE_TO_DISPOSITION)
+
+#: The static compatibility checks the context-reduction generator runs BEFORE
+#: any provider request. Named as a set so a caller can render "which checks ran
+#: and what did each find" without hardcoding the list, and so a new check
+#: cannot be added without appearing in the funnel.
+CONTEXT_REDUCTION_EXCLUSION_CODES = (
+    "context_reduction_quality_signal_insufficient",
+    "context_reduction_case_count_insufficient",
+    "context_placeholder_dropped",
+    "context_tool_reference_dropped",
+    "context_output_contract_dropped",
+    "context_budget_below_requirement",
+    "context_reduction_changed_other_dimension",
+    "context_reduction_unmeasured",
+    "context_reduction_immaterial",
+    "context_reduction_variant_not_selected",
+)
 
 #: Exclusion codes nothing emits today. Same `emitted: false` convention as
 #: UNBUILT_DISPOSITIONS: a zero here is "not built", not "we checked".
@@ -1266,6 +1432,30 @@ def stages_reached(disposition: dict) -> set:
     return reached
 
 
+def _authoritative_disposition(d: dict) -> dict:
+    """
+    Make EXCLUSION_CODE_TO_DISPOSITION the single source of truth.
+
+    A candidate that never reached dispatch carries a reason code, and this
+    module already declares which disposition each such code exits at. A caller
+    assembling disposition records may fall back to a default when it does not
+    recognise a code — which is how a code could end up counted under one
+    disposition in `exclusions` and reported under a different one on the
+    candidate itself. Rather than requiring every caller to keep a private copy
+    of the mapping in sync, the mapping is applied here.
+
+    Records that entered replay are never touched: their disposition describes a
+    measured outcome, not a pre-dispatch refusal.
+    """
+    code = d.get("code")
+    if d.get("entered_replay"):
+        return d
+    authoritative = EXCLUSION_CODE_TO_DISPOSITION.get(code)
+    if authoritative is None or d.get("disposition") == authoritative:
+        return d
+    return {**d, "disposition": authoritative}
+
+
 def build_funnel(dispositions: Iterable[dict]) -> dict:
     """
     Turn per-candidate dispositions into the auditable consideration funnel.
@@ -1288,7 +1478,10 @@ def build_funnel(dispositions: Iterable[dict]) -> dict:
     can populate that row yet, so its zero must not be read as "we checked and
     found none". No prose anywhere: the frontend owns the wording.
     """
-    items = [d for d in (dispositions or []) if isinstance(d, dict)]
+    items = [
+        _authoritative_disposition(d)
+        for d in (dispositions or []) if isinstance(d, dict)
+    ]
     reached = [stages_reached(d) for d in items]
 
     counts = {stage: 0 for stage in FUNNEL_STAGES}

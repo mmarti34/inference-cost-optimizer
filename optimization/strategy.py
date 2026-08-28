@@ -48,12 +48,25 @@ NOT applicable ON THIS SURFACE — and deliberately NOT faked:
 
 Attempting to apply an unsupported dimension raises UnsupportedDimension. That
 is the point: a dimension that cannot be applied must never reach a benchmark.
+
+Context efficiency
+------------------
+`prompt` and `context_length` together express one deliberately narrow change:
+the same model, the same provider, the same sampling parameters, the same tools
+and the same output contract, carrying less context. Building such a variant and
+PROVING it is only such a variant are both here — `with_context_budget` /
+`with_prompt_text` construct one, `context_only_change` checks the strategies
+and `graph_diff_outside_context` checks the applied graphs. The graph-level
+check is the load-bearing one: a Strategy cannot express a node's tools or its
+declared output schema at all, so only the graph comparison can say those did
+not move.
 """
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
@@ -174,6 +187,19 @@ def unsupported_dimensions(surface: str = SURFACE_RUNTIME) -> dict[str, str]:
 
 #: Strategy-config keys that carry a dimension value, so `_assert_supported`
 #: can tell "this config sets temperature" from "this config has a node_type".
+#: Strategy-config key holding DERIVED node facts a change must preserve. It is
+#: deliberately absent from `_CONFIG_KEY_DIMENSION` (it configures nothing, so
+#: it can never be refused as an unapplicable dimension), absent from the
+#: fingerprint (it is derived, so it must not make two identical strategies look
+#: different) and never written back by `apply_to_graph`.
+CONFIG_KEY_INVARIANTS = "invariants"
+
+#: Config keys that are DERIVED FROM the graph rather than chosen by a strategy.
+#: Excluded from the fingerprint so that adding a derived fact — as
+#: `invariants` was — cannot silently change the fingerprint of every strategy
+#: in the system and break dedup against strategies recorded before it existed.
+DERIVED_CONFIG_KEYS = (CONFIG_KEY_INVARIANTS,)
+
 _CONFIG_KEY_DIMENSION = {
     "temperature": "temperature",
     "max_tokens": "max_tokens",
@@ -282,6 +308,12 @@ class Strategy:
         """
         Stable hash of the semantically meaningful content, for deduping
         identical candidates produced by different generators.
+
+        DERIVED_CONFIG_KEYS are excluded. A derived fact — the node's tool
+        names, its declared output contract — is read off the graph rather than
+        chosen by the strategy, so hashing it would make two strategies that
+        propose exactly the same change look different, and would have shifted
+        every fingerprint in the system on the day the derived key was added.
         """
         payload = {
             "surface": self.surface,
@@ -292,7 +324,10 @@ class Strategy:
                     "executor_type": s.executor_type,
                     "executor_ref": s.executor_ref,
                     "role": s.role,
-                    "config": s.config,
+                    "config": {
+                        k: v for k, v in (s.config or {}).items()
+                        if k not in DERIVED_CONFIG_KEYS
+                    },
                     "on_failure": s.on_failure,
                 }
                 for s in sorted(self.steps, key=lambda x: (x.order, x.step_id))
@@ -353,12 +388,93 @@ def _context_config_summary(data: dict) -> Optional[dict]:
         return None
     packaging = cfg.get("packaging") or {}
     sources = cfg.get("sources") or []
+    src = [s for s in sources if isinstance(s, dict)]
     return {
         "enabled": True,
         "packaging_max_chars": packaging.get("maxChars"),
         "source_count": len(sources),
-        "source_max_chars": [s.get("maxChars") for s in sources if isinstance(s, dict)],
+        "source_max_chars": [s.get("maxChars") for s in src],
         "mode": cfg.get("mode"),
+        # Labels, types and required-ness are carried so a context-reduction
+        # candidate can check its budget against the sources the workload
+        # declares REQUIRED, using the measured per-source size from
+        # optimization.context_accounting (whose component labels are
+        # 'context_source:<label>'). They are DESCRIPTIVE: `_apply_context`
+        # never writes them, and `diff_dimensions` never reads them, so adding
+        # a source or changing its type can never be mistaken for a
+        # context_length change.
+        "source_labels": [s.get("label") or s.get("type") for s in src],
+        "source_types": [s.get("type") for s in src],
+        "source_required": [bool(s.get("required")) for s in src],
+    }
+
+
+#: Placeholder syntax the runtime actually interpolates. Must stay identical to
+#: `workflow_runtime._apply_variables`, which is a strictly single-pass
+#: `re.sub(r'\{\{(\w+)\}\}', ...)`. A placeholder this regex does not match is
+#: not interpolated by the runtime either, so matching the runtime exactly is
+#: what makes "every placeholder survived" a true statement rather than a
+#: hopeful one.
+_PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def placeholders_in(*texts: Optional[str]) -> set[str]:
+    """
+    Every placeholder the runtime would interpolate in the given text(s).
+
+    Used by the context-reduction static checks: a shorter prompt that has lost
+    `{{input}}` does not execute the same workload, and that is discoverable
+    here, before a provider request exists, rather than from a benchmark whose
+    candidate arm silently ran on different information.
+    """
+    found: set[str] = set()
+    for text in texts:
+        if isinstance(text, str) and text:
+            found.update(_PLACEHOLDER_RE.findall(text))
+    return found
+
+
+def _node_invariants(data: dict) -> dict:
+    """
+    What a strategy change must PRESERVE, read off the node itself.
+
+    These are facts about the node, not choices a strategy makes, so they are
+    excluded from the fingerprint (see `Strategy.fingerprint`) and are never
+    applied back onto a graph. They exist so a candidate generator can prove —
+    statically, against real node data — that a reduced prompt still references
+    every bound tool and still carries the node's declared output contract.
+
+    `tool_names` mirrors `workflow_runtime`'s own construction: a tool without a
+    `name` is not sent to the provider, so it is not an invariant either.
+    """
+    tools = data.get("tools") or []
+    tool_names = [
+        str(t["name"]) for t in tools
+        if isinstance(t, dict) and t.get("name")
+    ]
+
+    # The node's DECLARED output contract, if it declares one. Absent on most
+    # nodes today; absence is recorded as an empty structure rather than as a
+    # claim that the workload has no output contract, because a contract stated
+    # in prose inside the prompt is still a contract — that half is detected
+    # from the prompt text by the generator's own marker extraction.
+    declared: dict[str, Any] = {}
+    for key in ("outputSchema", "output_schema", "responseFormat", "response_format"):
+        value = data.get(key)
+        if value:
+            declared[key] = value
+
+    return {
+        "tool_names": tool_names,
+        "declared_output_contract": declared,
+        "placeholders": sorted(
+            placeholders_in(
+                data.get("taskDescription"),
+                data.get("task"),
+                data.get("systemInstructions"),
+                data.get("system_prefix"),
+            )
+        ),
     }
 
 
@@ -394,6 +510,9 @@ def from_graph_json(graph: dict, *, workflow_id: Optional[str] = None) -> Strate
             ctx = _context_config_summary(data)
             if ctx:
                 config["context"] = ctx
+            # DERIVED, never applied. See `_node_invariants` and the fingerprint
+            # note: these describe the node, they do not configure it.
+            config[CONFIG_KEY_INVARIANTS] = _node_invariants(data)
 
             steps.append(
                 StrategyStep(
@@ -655,6 +774,247 @@ def diff_dimensions(baseline: Strategy, candidate: Strategy) -> list[str]:
 
     # Preserve the canonical dimension ordering.
     return [d for d in domain.DIMENSIONS if d in changed]
+
+
+# ---------------------------------------------------------------------------
+# Context efficiency — building a variant, and PROVING it is only a variant
+# ---------------------------------------------------------------------------
+#
+# The claim "same model, same provider, same sampling parameters, same tools,
+# same output contract — only the context representation changed" is the whole
+# value of this dimension, so it is made checkable in two places rather than
+# asserted in a docstring:
+#
+#   `context_only_change`          at the STRATEGY level: no dimension other
+#                                  than prompt/context_length differs.
+#   `graph_diff_outside_context`   at the GRAPH level, after apply_to_graph:
+#                                  no node field other than the prompt text and
+#                                  the contextConfig budgets differs.
+#
+# The second is the stronger of the two, because it inspects what will actually
+# be sent rather than what the strategy claims.
+
+#: Node-data keys a context-reduction variant is permitted to differ on. Every
+#: other key — modelName, provider, tools, temperature, outputSchema, anything a
+#: future node grows — must be byte-identical between the two graphs.
+CONTEXT_MUTABLE_NODE_KEYS = (
+    "taskDescription",
+    "task",
+    "systemInstructions",
+    "system_prefix",
+    "contextConfig",
+)
+
+#: Within contextConfig, the ONLY paths a context-reduction variant may change.
+#: Sources are never added, removed or retyped: that would change what
+#: information the workload can see, which is a retrieval change wearing a
+#: token-budget costume.
+CONTEXT_MUTABLE_CONFIG_PATHS = (
+    "packaging.maxChars",
+    "sources[].maxChars",
+)
+
+
+def with_context_budget(
+    baseline: "Strategy",
+    step_id: str,
+    *,
+    packaging_max_chars: Optional[int] = None,
+    source_max_chars: Optional[list] = None,
+) -> "Strategy":
+    """
+    Clone the baseline with ONE step's context budget lowered.
+
+    Nothing else is touched — not the model, not the provider, not a single
+    character of the prompt. This is the cheapest and most defensible context
+    variant there is: a pure budget change that the runtime already enforces in
+    `context_runtime._package_context` and `_collect_sources`.
+
+    Raises StrategyApplyError if the step has no enabled context configuration,
+    because a budget change on a step that assembles no context would be a
+    candidate identical to the baseline.
+    """
+    step = baseline.step(step_id)
+    if step is None:
+        raise StrategyApplyError(f"Strategy has no step '{step_id}'.")
+    ctx = (step.config or {}).get("context")
+    if not isinstance(ctx, dict) or not ctx.get("enabled"):
+        raise StrategyApplyError(
+            f"Step '{step_id}' has no enabled context configuration to budget."
+        )
+
+    new_ctx = dict(ctx)
+    if packaging_max_chars is not None:
+        new_ctx["packaging_max_chars"] = int(packaging_max_chars)
+    if source_max_chars is not None:
+        new_ctx["source_max_chars"] = list(source_max_chars)
+
+    return _with_step_config(baseline, step_id, {"context": new_ctx})
+
+
+def with_prompt_text(
+    baseline: "Strategy",
+    step_id: str,
+    *,
+    task_description: Optional[str] = None,
+    system_instructions: Optional[str] = None,
+) -> "Strategy":
+    """
+    Clone the baseline with ONE step's static prompt text replaced.
+
+    `None` means "leave this field exactly as it was" — it is not a way to
+    delete a prompt field, because deleting one is not a reduction, it is a
+    different workload.
+    """
+    if baseline.step(step_id) is None:
+        raise StrategyApplyError(f"Strategy has no step '{step_id}'.")
+    patch: dict[str, Any] = {}
+    if task_description is not None:
+        patch["task_description"] = str(task_description)
+    if system_instructions is not None:
+        patch["system_instructions"] = str(system_instructions)
+    if not patch:
+        raise StrategyApplyError(
+            f"Step '{step_id}': no prompt text supplied, so nothing would change."
+        )
+    return _with_step_config(baseline, step_id, patch)
+
+
+def _with_step_config(baseline: "Strategy", step_id: str, patch: dict) -> "Strategy":
+    """Clone a strategy, merging `patch` into exactly one step's config."""
+    steps: list[StrategyStep] = []
+    for s in baseline.steps:
+        if s.step_id == step_id:
+            steps.append(StrategyStep(
+                step_id=s.step_id,
+                order=s.order,
+                executor_type=s.executor_type,
+                executor_ref=copy.deepcopy(s.executor_ref or {}),
+                executor_id=s.executor_id,
+                role=s.role,
+                config={**copy.deepcopy(s.config or {}), **patch},
+                on_failure=s.on_failure,
+            ))
+        else:
+            steps.append(copy.deepcopy(s))
+    return Strategy(
+        steps=steps,
+        surface=baseline.surface,
+        surface_binding=copy.deepcopy(baseline.surface_binding or {}),
+        dimensions=[],
+    )
+
+
+def context_only_change(baseline: "Strategy", candidate: "Strategy") -> dict:
+    """
+    Is `candidate` a context-efficiency variant of `baseline`, and nothing else?
+
+    Returns {"ok", "changed", "unexpected"}: `changed` is every dimension that
+    differs, `unexpected` is the ones outside CONTEXT_REDUCTION_DIMENSIONS. A
+    candidate with `ok=False` is not a context-reduction candidate — it is a
+    different experiment, and measuring it under this name would attribute a
+    model swap's cost saving to a prompt change.
+
+    `ok=False` also when NOTHING changed: a variant identical to the baseline
+    has nothing to measure.
+    """
+    changed = diff_dimensions(baseline, candidate)
+    unexpected = [d for d in changed if d not in domain.CONTEXT_REDUCTION_DIMENSIONS]
+    return {
+        "ok": bool(changed) and not unexpected,
+        "changed": changed,
+        "unexpected": unexpected,
+        "allowed": list(domain.CONTEXT_REDUCTION_DIMENSIONS),
+    }
+
+
+def _context_config_diff(base_cfg: Any, cand_cfg: Any) -> list[dict]:
+    """Differences inside contextConfig, at path grain, excluding maxChars."""
+    out: list[dict] = []
+    if not isinstance(base_cfg, dict) or not isinstance(cand_cfg, dict):
+        if base_cfg != cand_cfg:
+            out.append({"path": "contextConfig", "kind": "shape_changed"})
+        return out
+
+    base_pack = {k: v for k, v in (base_cfg.get("packaging") or {}).items() if k != "maxChars"}
+    cand_pack = {k: v for k, v in (cand_cfg.get("packaging") or {}).items() if k != "maxChars"}
+    if base_pack != cand_pack:
+        out.append({"path": "contextConfig.packaging", "kind": "changed"})
+
+    for key in set(base_cfg) | set(cand_cfg):
+        if key in ("packaging", "sources"):
+            continue
+        if base_cfg.get(key) != cand_cfg.get(key):
+            out.append({"path": f"contextConfig.{key}", "kind": "changed"})
+
+    base_src = base_cfg.get("sources") or []
+    cand_src = cand_cfg.get("sources") or []
+    if len(base_src) != len(cand_src):
+        out.append({
+            "path": "contextConfig.sources",
+            "kind": "source_count_changed",
+            "baseline": len(base_src),
+            "candidate": len(cand_src),
+        })
+        return out
+    for i, (b, c) in enumerate(zip(base_src, cand_src)):
+        b_rest = {k: v for k, v in (b or {}).items() if k != "maxChars"}
+        c_rest = {k: v for k, v in (c or {}).items() if k != "maxChars"}
+        if b_rest != c_rest:
+            out.append({"path": f"contextConfig.sources[{i}]", "kind": "changed"})
+    return out
+
+
+def graph_diff_outside_context(baseline_graph: dict, candidate_graph: dict) -> list[dict]:
+    """
+    Everything that differs between two graphs OTHER than prompt text and
+    context budgets. An empty list is the proof that a candidate really is a
+    context-efficiency variant.
+
+    This is checked on the applied GRAPHS rather than on the strategies, because
+    the graph is what executes. A strategy cannot express `tools` or a node's
+    declared output schema at all, so a strategy-level comparison would be
+    silent about exactly the fields a customer most needs held constant.
+    """
+    diffs: list[dict] = []
+
+    base_nodes = {str(n.get("id")): n for n in (baseline_graph.get("nodes") or []) if n.get("id")}
+    cand_nodes = {str(n.get("id")): n for n in (candidate_graph.get("nodes") or []) if n.get("id")}
+
+    if set(base_nodes) != set(cand_nodes):
+        diffs.append({
+            "scope": "graph",
+            "field": "nodes",
+            "kind": "node_set_changed",
+            "added": sorted(set(cand_nodes) - set(base_nodes)),
+            "removed": sorted(set(base_nodes) - set(cand_nodes)),
+        })
+
+    if (baseline_graph.get("edges") or []) != (candidate_graph.get("edges") or []):
+        diffs.append({"scope": "graph", "field": "edges", "kind": "changed"})
+
+    for node_id in sorted(set(base_nodes) & set(cand_nodes)):
+        b_node, c_node = base_nodes[node_id], cand_nodes[node_id]
+        if (b_node.get("type") or "") != (c_node.get("type") or ""):
+            diffs.append({
+                "scope": "node", "node_id": node_id, "field": "type", "kind": "changed",
+            })
+        b_data = b_node.get("data") or {}
+        c_data = c_node.get("data") or {}
+        for key in sorted(set(b_data) | set(c_data)):
+            if key == "contextConfig":
+                diffs.extend({
+                    "scope": "node", "node_id": node_id, "field": d["path"], "kind": d["kind"],
+                } for d in _context_config_diff(b_data.get(key), c_data.get(key)))
+                continue
+            if key in CONTEXT_MUTABLE_NODE_KEYS:
+                continue
+            if b_data.get(key) != c_data.get(key):
+                diffs.append({
+                    "scope": "node", "node_id": node_id, "field": key, "kind": "changed",
+                })
+
+    return diffs
 
 
 def unapplicable_dimensions(
