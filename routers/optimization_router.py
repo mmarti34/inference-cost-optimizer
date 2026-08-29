@@ -52,6 +52,9 @@ Routes:
   GET  /api/optimization/{org_id}/outcomes
   POST /api/optimization/{org_id}/outcomes
   POST /api/optimization/{org_id}/outcomes/{outcome_id}/correct
+  GET  /api/optimization/{org_id}/workloads/{workload_id}/evidence
+  GET  /api/optimization/{org_id}/workloads/{workload_id}/evidence/queue
+  POST /api/optimization/{org_id}/evidence/{candidate_id}/review
   POST /v1/outcomes                        (customer-facing, server API key)
 """
 from __future__ import annotations
@@ -66,11 +69,13 @@ from pydantic import BaseModel
 import audit
 from api_key_validation import validate_api_key
 from auth_dependency import AuthenticatedUser, require_org_member
+from resource_access import get_evidence_candidate_for_org
 from supabase_client import supabase
 
 from optimization import (
     allocation,
     benchmark as benchmark_mod,
+    curation as curation_mod,
     domain,
     evidence as evidence_mod,
     executors as executors_mod,
@@ -1443,3 +1448,228 @@ def _count_by(rows: list[dict], key: str) -> dict[str, int]:
         v = r.get(key) or "unknown"
         out[v] = out.get(v, 0) + 1
     return out
+
+
+# ---------------------------------------------------------------------------
+# Evidence curation
+#
+# THE BRIDGE that was missing: production traffic -> deduplicated candidates ->
+# a human decision -> replay evidence. Customers were expected to arrive with a
+# golden dataset and essentially nobody does, so OptiML could observe, capture,
+# prove and optimize but could not CURATE.
+#
+# THE RULE THESE THREE ENDPOINTS EXIST TO ENFORCE: a production output is a
+# PROPOSED label, never an automatic golden answer. A candidate lives in
+# `evidence_candidates` until a human decides, and only the review endpoint
+# writes `golden_inputs` — so "everything in golden_inputs is human-approved"
+# stays true by construction rather than by convention, and the ten existing
+# readers of that table are untouched. See optimization/curation.py and
+# migration_optimization_v14_evidence_candidates.sql.
+#
+# NOTHING HERE TRIGGERS OPTIMIZATION. `readiness.ready` is a report, not a
+# start button; the spend-triggering action remains POST .../optimize.
+#
+# CODES AND FACTS, never prose — same contract as the rest of this router.
+# ---------------------------------------------------------------------------
+
+class EvidenceReviewPayload(BaseModel):
+    #: approve | edit | reject | not_useful
+    decision: str
+    #: Required for `edit`, ignored otherwise. On `approve` the expected output
+    #: is the PROPOSAL the reviewer was shown, taken from the row — never from
+    #: the request body, so approving cannot smuggle in a different answer than
+    #: the one on screen.
+    expected_output: Optional[str] = None
+    #: Explicit human acknowledgement that a candidate whose replay gate said
+    #: `redacted_input_requires_review` or `capture_provenance_unavailable` may
+    #: still become a case. Defaults False, so redaction can never SILENTLY
+    #: produce evidence that claims to reproduce production.
+    acknowledge_redaction: bool = False
+
+    class Config:
+        extra = "ignore"
+
+
+def _evidence_workload(org_id: str, workload_id: str) -> dict:
+    """The workload, or the same opaque 404 every other workload route returns."""
+    workload = workloads_mod.get_workload(org_id, workload_id)
+    if workload is None:
+        raise HTTPException(status_code=404, detail="Workload not found.")
+    return workload
+
+
+@router.get("/{org_id}/workloads/{workload_id}/evidence")
+async def workload_evidence(
+    org_id: str,
+    workload_id: str,
+    lookback_days: int = 30,
+    user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Counters, readiness, quality signal and diversity buckets for one workload.
+
+    THE FOUR COUNTERS ARE NOT INTERCHANGEABLE, and collapsing them is the bug
+    this endpoint exists to prevent. `distinct_captured` is what dedup found;
+    `reviewed` is what a human looked at; `approved` is what may be replayed;
+    `required` is the floor. "39/30 cases" is a lie when captured is not the
+    same as trustworthy, so only reviewed-and-approved counts toward
+    benchmarkability, and `runs_observed` is NULL — never 0 — when the scan
+    could not run.
+
+    This GET refreshes the candidate set from `workflow_runs` before answering.
+    That is a materialised read, not a mutation: derivation is a pure function
+    of production traffic, idempotent under the fingerprint UNIQUE index,
+    cannot change any candidate's state and never writes `golden_inputs`.
+    """
+    org_id = _verified_org(user, org_id)
+    workload = _evidence_workload(org_id, workload_id)
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: curation_mod.evidence_overview(
+            org_id, workload, lookback_days=lookback_days
+        ),
+    )
+
+
+@router.get("/{org_id}/workloads/{workload_id}/evidence/queue")
+async def workload_evidence_queue(
+    org_id: str,
+    workload_id: str,
+    limit: int = 25,
+    user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    The review work list: unreviewed candidates only, highest-signal first.
+
+    A candidate whose capture was redacted, or whose provenance could not be
+    established, IS RETURNED HERE. It is never hidden — hiding it would leave a
+    reviewer wondering where their traffic went — but its `capture` block
+    carries `replay_eligible: false` and the structured reason codes, and the
+    review endpoint refuses to approve it without an explicit acknowledgement.
+    Visible, and never silently replayable.
+
+    Read-only: unlike the summary endpoint above, this derives nothing.
+    """
+    org_id = _verified_org(user, org_id)
+    _evidence_workload(org_id, workload_id)
+    return await asyncio.get_event_loop().run_in_executor(
+        None, lambda: curation_mod.queue(org_id, workload_id, limit=limit)
+    )
+
+
+@router.post("/{org_id}/evidence/{candidate_id}/review")
+async def review_evidence_candidate(
+    org_id: str,
+    candidate_id: str,
+    payload: EvidenceReviewPayload,
+    request: Request,
+    user: AuthenticatedUser = Depends(require_org_member),
+):
+    """
+    Record one human decision — and, on approval, create exactly one case.
+
+    OWNERSHIP IS RESOLVED BEFORE DISCLOSURE. `candidate_id` is a
+    caller-supplied identifier that `require_org_member` says nothing about, so
+    the row is fetched through `resource_access.get_evidence_candidate_for_org`,
+    which derives the org from the verified principal and has no parameter to
+    pass one in. "Not yours" and "does not exist" return the SAME opaque 404,
+    or this endpoint becomes an existence oracle for another tenant's candidate
+    ids. Every write in curation.review carries the org filter as well, so a
+    foreign mutation has zero side effects rather than a narrow race.
+
+    APPROVAL IS THE ONLY PATH TO A `golden_input`, and it copies the human's
+    expected output, never the production output. Approving twice creates one
+    case: the lifecycle claim is a conditional UPDATE on the unreviewed states,
+    and a UNIQUE index refuses a second golden input beneath it.
+
+    Reviewing changes what a benchmark will conclude about this workload, so
+    the decision is written to `audit_log` — including the refusal to approve
+    unacknowledged redacted evidence, which is the exact moment unfaithful
+    evidence would have entered the case set.
+    """
+    org_id = _verified_org(user, org_id)
+    candidate = get_evidence_candidate_for_org(
+        candidate_id, user, columns=curation_mod.CANDIDATE_COLS
+    )
+
+    def _run():
+        return curation_mod.review(
+            org_id,
+            candidate,
+            decision=payload.decision,
+            expected_output=payload.expected_output,
+            acknowledge_redaction=payload.acknowledge_redaction,
+            reviewer_id=user.user_id,
+        )
+
+    try:
+        outcome = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except curation_mod.CurationRefused as refused:
+        detail = refused.detail
+        if detail.get("code") == curation_mod.REFUSE_REDACTION_UNACKNOWLEDGED:
+            audit.record(
+                audit.EVIDENCE_APPROVE_REFUSED,
+                principal=user,
+                resource_type=audit.RESOURCE_EVIDENCE_CANDIDATE,
+                resource_id=candidate_id,
+                metadata={
+                    "workload_id": str(candidate.get("workload_id") or "") or None,
+                    "replay_eligible": bool(candidate.get("replay_eligible")),
+                    "acknowledged_redaction": False,
+                },
+                request=request,
+            )
+            raise HTTPException(status_code=409, detail=detail)
+        if detail.get("code") == curation_mod.REFUSE_ALREADY_REVIEWED:
+            raise HTTPException(status_code=409, detail=detail)
+        if detail.get("code") == curation_mod.REFUSE_STORAGE_UNAVAILABLE:
+            raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=400, detail=detail)
+
+    row = outcome["candidate"]
+    if outcome.get("decision_recorded"):
+        action = {
+            curation_mod.DECISION_APPROVE: audit.EVIDENCE_APPROVED,
+            curation_mod.DECISION_EDIT: audit.EVIDENCE_EDITED,
+            curation_mod.DECISION_REJECT: audit.EVIDENCE_REJECTED,
+            curation_mod.DECISION_NOT_USEFUL: audit.EVIDENCE_NOT_USEFUL,
+        }[payload.decision]
+        audit.record(
+            action,
+            principal=user,
+            resource_type=audit.RESOURCE_EVIDENCE_CANDIDATE,
+            resource_id=candidate_id,
+            # Identifiers and codes only. The input, the production output and
+            # the expected output a reviewer typed are never handed to audit.
+            metadata={
+                "workload_id": str(row.get("workload_id") or "") or None,
+                "workflow_id": str(row.get("workflow_id") or "") or None,
+                "golden_input_id": outcome.get("golden_input_id"),
+                "bucket": row.get("bucket"),
+                "prior_status": curation_mod.STATE_CAPTURED,
+                "new_status": row.get("state"),
+                "replay_eligible": bool(row.get("replay_eligible")),
+                "acknowledged_redaction": bool(row.get("review_acknowledged_redaction")),
+            },
+            request=request,
+        )
+
+    workload_id = str(row.get("workload_id") or candidate.get("workload_id") or "")
+    workload = workloads_mod.get_workload(org_id, workload_id) if workload_id else None
+
+    # Derivation is NOT re-run here: a review is not the moment to rescan
+    # production traffic, and the counters the caller needs are about the
+    # decision they just made.
+    counters = (
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: curation_mod.counters_for(org_id, workload_id)
+        )
+        if workload is not None
+        else None
+    )
+
+    return {
+        "candidate": curation_mod.candidate_row_to_response(row),
+        "golden_input_id": outcome.get("golden_input_id"),
+        "counters": counters,
+    }

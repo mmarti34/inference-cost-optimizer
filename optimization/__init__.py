@@ -48,6 +48,13 @@ EMPIRICAL EVIDENCE:
     allocation.py   Records which strategy was chosen and why.
     service.py      Recommendation CRUD + lifecycle transitions + audit trail.
     workloads.py    Workload discovery.
+    curation.py     EVIDENCE CURATION. Turns captured production traffic into
+                    deduplicated review candidates, and records the human
+                    decision that — and only that — creates a `golden_input`.
+                    A production output is a PROPOSED label here, never an
+                    automatic golden answer, which is why candidates live in
+                    their own table and `golden_inputs` keeps meaning
+                    "human-approved" by construction.
 
 This package's __init__ is deliberately import-light: workflow_runtime imports
 optimization.evidence, and optimization.benchmark imports workflow_runtime.
@@ -71,4 +78,5 @@ __all__ = [
     "allocation",
     "service",
     "workloads",
+    "curation",
 ]

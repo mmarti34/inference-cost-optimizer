@@ -69,6 +69,7 @@ WORKFLOW_NOT_FOUND = "Workflow not found"
 DEPLOYMENT_NOT_FOUND = "Deployment not found"
 PROJECT_NOT_FOUND = "Project not found"
 PROVIDER_CREDENTIAL_NOT_FOUND = "API key not found for org/provider."
+EVIDENCE_CANDIDATE_NOT_FOUND = "Evidence candidate not found"
 
 _LOOKUP_FAILED = "Error verifying resource access."
 
@@ -211,6 +212,27 @@ def get_provider_credential_for_org(
     if not rows:
         raise HTTPException(status_code=404, detail=PROVIDER_CREDENTIAL_NOT_FOUND)
     return rows[0]
+
+
+def get_evidence_candidate_for_org(
+    candidate_id: Optional[str],
+    auth_user: AuthenticatedUser,
+    columns: str = "id, org_id",
+) -> dict:
+    """The evidence candidate, if it belongs to the caller's verified org. Else 404.
+
+    Reviewing a candidate is the act that turns captured production traffic
+    into replay evidence, so this lookup guards both a DISCLOSURE (the queue
+    row carries the customer's own request and response content) and a
+    MUTATION whose side effect is a new `golden_inputs` row. The mutation must
+    ALSO carry the org filter — this helper authorizes, it does not write —
+    so the update and the insert are each one atomic org-scoped statement
+    rather than a check-then-act window.
+    """
+    return fetch_owned_row(
+        "evidence_candidates", candidate_id, auth_user, columns,
+        EVIDENCE_CANDIDATE_NOT_FOUND,
+    )
 
 
 def get_context_assets_for_org(

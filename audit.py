@@ -149,6 +149,30 @@ ORGANIZATION_UPDATED = "organization.updated"
 RECOMMENDATION_ACCEPTED = "optimization_recommendation.accepted"
 RECOMMENDATION_REJECTED = "optimization_recommendation.rejected"
 
+# Evidence curation. Approving a captured production input as a replay case
+# changes WHAT A BENCHMARK WILL CONCLUDE about this workload — and a benchmark
+# conclusion is what justifies a recommendation that can reach production. So
+# these belong in the same table as the recommendation decisions they feed,
+# for the same reason: "who decided this, and when" must be answerable after
+# the fact, by someone who was not there.
+#
+# EVIDENCE_APPROVED and EVIDENCE_EDITED are separate actions rather than one
+# action with a metadata flag, because they are different claims. Approved
+# says "production was right". Edited says "production was wrong and here is
+# the right answer" — which is a finding about the workload, and a query that
+# cannot count them separately cannot surface it.
+#
+# EVIDENCE_APPROVE_REFUSED records the one refusal that matters: an attempt to
+# approve a candidate whose replay gate said the content was redacted or its
+# provenance unknown, without the explicit acknowledgement. That is the exact
+# moment at which unfaithful evidence would have entered the case set, and it
+# must leave a trace whether or not it succeeded.
+EVIDENCE_APPROVED = "evidence_candidate.approved"
+EVIDENCE_EDITED = "evidence_candidate.edited"
+EVIDENCE_REJECTED = "evidence_candidate.rejected"
+EVIDENCE_NOT_USEFUL = "evidence_candidate.not_useful"
+EVIDENCE_APPROVE_REFUSED = "evidence_candidate.approve.refused"
+
 # Webhook triggers (a customer-controlled egress path into their own systems,
 # authenticated by a signing secret this table stores). Creating one opens that
 # path; rotating the secret changes who can drive it; deleting one closes it.
@@ -195,6 +219,11 @@ ACTIONS = frozenset({
     ORGANIZATION_UPDATED,
     RECOMMENDATION_ACCEPTED,
     RECOMMENDATION_REJECTED,
+    EVIDENCE_APPROVED,
+    EVIDENCE_EDITED,
+    EVIDENCE_REJECTED,
+    EVIDENCE_NOT_USEFUL,
+    EVIDENCE_APPROVE_REFUSED,
     DEPLOYMENT_PROMOTED,
     DEPLOYMENT_ACTIVATED,
     DEPLOYMENT_ROLLED_BACK,
@@ -218,6 +247,7 @@ REFUSAL_ACTIONS = frozenset({
     ORG_SECRET_UPDATE_REFUSED,
     ORG_SECRET_DELETE_REFUSED,
     MEMBER_REMOVE_REFUSED,
+    EVIDENCE_APPROVE_REFUSED,
     WEBHOOK_CREATE_REFUSED,
     WEBHOOK_UPDATE_REFUSED,
     WEBHOOK_DELETE_REFUSED,
@@ -233,6 +263,7 @@ RESOURCE_ORG_SECRET = "org_secret"
 RESOURCE_ORG_MEMBER = "organization_member"
 RESOURCE_ORGANIZATION = "organization"
 RESOURCE_RECOMMENDATION = "optimization_recommendation"
+RESOURCE_EVIDENCE_CANDIDATE = "evidence_candidate"
 RESOURCE_DEPLOYMENT = "workflow_deployment"
 RESOURCE_WEBHOOK_TRIGGER = "webhook_trigger"
 
@@ -286,6 +317,19 @@ _ALLOWED_METADATA_KEYS = frozenset({
     "workload_id",
     "recommendation_id",
     "version",
+    # Evidence curation. All four are server-derived enums, booleans or
+    # identifiers, and none of them is or can contain customer content:
+    #   golden_input_id         a uuid; WHICH replay case the approval created
+    #   bucket                  a closed diversity-bucket code ("failure")
+    #   replay_eligible         the replay_gate verdict at the moment of review
+    #   acknowledged_redaction  whether the reviewer overrode that verdict
+    # Deliberately NOT here: the input, the production output, the expected
+    # output a reviewer typed, or any count derived from them. The candidate
+    # itself is identified by `resource_id`, which is where it belongs.
+    "golden_input_id",
+    "bucket",
+    "replay_eligible",
+    "acknowledged_redaction",
 })
 
 #: Scalars only. A dict or list is a container for content we did not inspect.

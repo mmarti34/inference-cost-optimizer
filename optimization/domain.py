@@ -1156,6 +1156,28 @@ REASON_CODES: dict[str, str] = {
         "to contain one cannot clear it, and proposing the variant would buy a "
         "measurement that could not detect its own failure mode."
     ),
+    # Evidence CURATION — why a workload is not yet optimization-ready.
+    #
+    # These describe the CASE SET, not a benchmark that ran. A workload
+    # carrying one of these was never benchmarked, and that is the point: the
+    # alternative is spending a customer's provider budget to discover that
+    # their evidence could not have supported a conclusion.
+    "evidence_awaiting_review": (
+        "Distinct production inputs have been captured for this workload but "
+        "nobody has reviewed them yet. A captured input is not evidence: the "
+        "production output travelling with it is a PROPOSED label, and only a "
+        "human decision turns the pair into a replay case. This is the one "
+        "reason code that names an action the customer can take immediately."
+    ),
+    "evidence_quality_check_absent": (
+        "The workload has no enabled deterministic, structural or format eval "
+        "check, so replaying an approved case would produce no quality verdict "
+        "at all. Approved cases alone do not make a workload optimization-ready: "
+        "without a measurable quality signal every benchmark can only conclude "
+        "`insufficient_evidence`. An LLM judge does not satisfy this and never "
+        "will — see benchmark._run_quality_checks, where `model_graded` is "
+        "excluded from the quality signal by construction."
+    ),
     # Materiality
     "improvement_below_materiality": "The measured improvement is below the policy's materiality threshold.",
     # Operational
